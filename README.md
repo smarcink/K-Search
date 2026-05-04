@@ -28,7 +28,6 @@
   - [**FlashInfer-Bench**](https://bench.flashinfer.ai/) — MLA decode, GQA decode, MLA prefill, MoE kernels with full workload suites
   - [**GPUMode**](https://www.gpumode.com/home) — Competition tasks (e.g., TriMul) with leaderboard evaluation
   - [**KernelBench**](https://github.com/ScalingIntelligence/KernelBench) — PyTorch kernel optimization with 4 difficulty levels and 200+ problems
-  - **MLX (Apple Silicon)** — A local MLX task backend with latency, unified memory pressure, and Apple-specific throughput proxies
 
 - 📊 **W&B Integration** — Full Weights & Biases logging with per-round score tracking, generated code artifacts, and world model snapshots.
 
@@ -180,29 +179,15 @@ This script can be used with any of the kernels in the [KernelBench dataset](htt
 - **Local**: Runs evaluation on your local GPU (requires CUDA-capable GPU)
 - **Modal**: Runs evaluation on cloud GPUs via [Modal](https://modal.com/) (requires Modal account)
 
-### MLX (Apple Silicon)
-
-On Apple Silicon, install MLX:
-
-```bash
-python3 -m pip install -U mlx
-```
-
-Then run the MLX Mamba selective scan forward task:
-
-```bash
-bash scripts/mlx_mamba_wm.sh
-```
-
 ## CLI Reference
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--task-source` | Task backend (`flashinfer`, `gpumode`, `kernelbench`, or `mlx`) | `flashinfer` |
+| `--task-source` | Task backend (`flashinfer`, `gpumode`, or `kernelbench`) | `flashinfer` |
 | `--definition` | Target kernel definition name | — |
 | `--model-name` | LLM model identifier | *required* |
 | `--base-url` | OpenAI-compatible API base URL | OpenAI default |
-| `--language` | Target language (`triton`, `python`, `cuda`, `mlx`) | `triton` |
+| `--language` | Target language (`triton`, `cuda`) | `triton` |
 | `--target-gpu` | Target GPU architecture hint | `H100` |
 | `--max-opt-rounds` | Maximum optimization rounds | `5` |
 | `--world-model` | Enable co-evolving world model | off |

@@ -34,12 +34,13 @@ class KernelBenchTaskConfig:
     eval_mode: str = "local"  # local or modal
     gpu: str = "H100"
     num_correct_trials: int = 5
-    num_perf_trials: int = 100
+    num_perf_trials: int = 1000
     timeout: int = 300
     dataset_src: str = "huggingface"
     dataset_name: str = "ScalingIntelligence/KernelBench"
     max_failure_excerpt_chars: int = 4000
     backend: str = "cuda"  # Backend for kernelbench evaluation (triton, cuda, python)
+    precision: str = "fp32"  # fp32, fp16, bf16 -- controls the dtype the eval framework casts model + inputs to and the allclose tolerance
 
 
 class KernelBenchTask:
@@ -53,13 +54,15 @@ class KernelBenchTask:
         eval_mode: str = "local",
         gpu: str = "H100",
         num_correct_trials: int = 5,
-        num_perf_trials: int = 100,
+        num_perf_trials: int = 1000,
         timeout: int = 300,
         dataset_src: str = "huggingface",
         dataset_name: str = "ScalingIntelligence/KernelBench",
         artifacts_dir: str | None = None,
         name: str | None = None,
         backend: str = "cuda",
+        precision: str = "fp32",
+        local_ref_path: str | None = None,
     ) -> None:
         """Initialize KernelBench task.
         
@@ -76,7 +79,10 @@ class KernelBenchTask:
             artifacts_dir: Directory for K-Search artifacts
             name: Task name (defaults to kernelbench_l{level}_p{problem_id})
             backend: Backend for kernel evaluation (triton, cuda, or python)
+            local_ref_path: Path to a local .py file with a Model class to optimize
+                (bypasses HuggingFace dataset; must define Model, get_inputs, get_init_inputs)
         """
+        self._local_ref_path = str(Path(local_ref_path).resolve()) if local_ref_path else None
         self._cfg = KernelBenchTaskConfig(
             level=int(level),
             problem_id=int(problem_id),
@@ -88,6 +94,7 @@ class KernelBenchTask:
             dataset_src=str(dataset_src),
             dataset_name=str(dataset_name),
             backend=str(backend),
+            precision=str(precision),
         )
         self._name = str(name or f"kernelbench_l{level}_p{problem_id}")
         self._ksearch_artifacts_dir = str(artifacts_dir) if artifacts_dir else None
@@ -105,7 +112,17 @@ class KernelBenchTask:
         self._load_reference_problem()
 
     def _load_reference_problem(self) -> None:
-        """Load the reference problem from KernelBench dataset."""
+        """Load the reference problem from KernelBench dataset or local file."""
+        if self._local_ref_path:
+            # Load from local file
+            ref_path = Path(self._local_ref_path)
+            if not ref_path.exists():
+                raise FileNotFoundError(f"Local reference file not found: {self._local_ref_path}")
+            self._ref_code = ref_path.read_text()
+            self._problem_name = ref_path.stem
+            print(f"[{self._name}] Loaded local reference: {self._local_ref_path}")
+            return
+
         try:
             # Add src to path for imports
             repo_root = Path(__file__).parent.parent.parent.parent
@@ -336,21 +353,39 @@ Then implement your optimized version.
                         break
                     repo_root = repo_root.parent
             
-            cmd = [
-                sys.executable,
-                "k_search/tasks/kernelbench/run_and_check.py",
-                "ref_origin=kernelbench",
-                f"level={self._cfg.level}",
-                f"problem_id={self._cfg.problem_id}",
-                f"kernel_src_path={kernel_src_path}",
-                f"eval_mode={self._cfg.eval_mode}",
-                f"gpu={self._cfg.gpu}",
-                f"num_correct_trials={self._cfg.num_correct_trials}",
-                f"num_perf_trials={self._cfg.num_perf_trials}",
-                f"timeout={self._cfg.timeout}",
-                f"backend={self._cfg.backend}",
-                "check_kernel=False",
-            ]
+            if self._local_ref_path:
+                cmd = [
+                    sys.executable,
+                    "k_search/tasks/kernelbench/run_and_check.py",
+                    "ref_origin=local",
+                    f"ref_arch_src_path={self._local_ref_path}",
+                    f"kernel_src_path={kernel_src_path}",
+                    f"eval_mode={self._cfg.eval_mode}",
+                    f"gpu={self._cfg.gpu}",
+                    f"num_correct_trials={self._cfg.num_correct_trials}",
+                    f"num_perf_trials={self._cfg.num_perf_trials}",
+                    f"timeout={self._cfg.timeout}",
+                    f"backend={self._cfg.backend}",
+                    f"precision={self._cfg.precision}",
+                    "check_kernel=False",
+                ]
+            else:
+                cmd = [
+                    sys.executable,
+                    "k_search/tasks/kernelbench/run_and_check.py",
+                    "ref_origin=kernelbench",
+                    f"level={self._cfg.level}",
+                    f"problem_id={self._cfg.problem_id}",
+                    f"kernel_src_path={kernel_src_path}",
+                    f"eval_mode={self._cfg.eval_mode}",
+                    f"gpu={self._cfg.gpu}",
+                    f"num_correct_trials={self._cfg.num_correct_trials}",
+                    f"num_perf_trials={self._cfg.num_perf_trials}",
+                    f"timeout={self._cfg.timeout}",
+                    f"backend={self._cfg.backend}",
+                    f"precision={self._cfg.precision}",
+                    "check_kernel=False",
+                ]
             
             env = os.environ.copy()
             src_path = str(repo_root)

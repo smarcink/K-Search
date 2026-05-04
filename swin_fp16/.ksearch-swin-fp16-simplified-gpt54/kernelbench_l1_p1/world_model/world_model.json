@@ -1,0 +1,526 @@
+{
+  "computed_signals": {
+    "round_index": 28,
+    "trace": {
+      "latency_ms": 0.571,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 11.3,
+      "speedup_factor": 19.79,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "tsplit_reify_stage_boundary_y1_compact",
+    "nodes": [
+      {
+        "action": {
+          "description": "Initial analysis node capturing the shared world model for the optimization task.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "This is a dummy root; real implementation choices start in child nodes.",
+          "score_0_to_1": 0.5,
+          "title": "World-model root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.68,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090-class tensor cores should like C=32, hidden=128, N=16; many independent windows provide abundant parallelism.",
+            "notes": "The workload is a mixed dense-transformer microkernel with fixed 4x4 windows and small reductions. Shapes are favorable for tensor-core-backed dots, but tiny persistent kernels can lose occupancy if live state is too large.",
+            "rating_0_to_10": 8.0,
+            "risk": "Compiler/codegen may not map all tiny GEMMs efficiently if the kernel is over-fused."
+          },
+          "memory_bandwidth": {
+            "notes": "Input/output traffic per window is small relative to math, and weights are heavily reused across 57,600 windows for the default shape, so L2 reuse should be strong.",
+            "rating_0_to_10": 7.0,
+            "risk": "Any register spill or unnecessary intermediate materialization can quickly convert the kernel into a bandwidth problem."
+          },
+          "register_pressure": {
+            "notes": "A naive one-program-per-window implementation can easily try to hold x, q/k/v, attention logits/probabilities, post-proj activations, LN stats, and hidden MLP tiles at once.",
+            "rating_0_to_10": 4.0,
+            "risk": "High spill risk is the main threat to the ideal single-kernel design."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "- 1) Classification: mixed dense transformer block per 4x4 window; outputs are dense NHWC values; reductions are LN over C, qk over C, softmax over N=16, av over N=16, and fc2 over hidden=4C. Access is dense with a small fixed indirect RPE lookup already pre-gathered.\n- 2) Canonical math: for each window X in R^{16xC}, compute Y = X + Proj(Softmax((LN1(X)Wq * C^-0.5)(LN1(X)Wk)^T + RPE) LN1(X)Wv); then Z = Y + Fc2(GELU(Fc1(LN2(Y)))). Windows are independent; stable row-wise softmax and fp32 accumulations are required.\n- 3) Layout/access: input is effectively contiguous NHWC with stride-1 on C; window partition is a regular gather from H/W tiles; weights are small shared matrices reused across all windows; RPE is tiny. Dominant global reads are input plus streamed weights; dominant write is final output. Intermediate tensors are best kept on-chip if possible.\n- 4) Regimes: (a) few windows/small images -> launch and Python overhead dominate; (b) default large image, C=32 -> compute-rich tiny-GEMM regime where fc1/fc2 and qkv/proj dominate and weight reuse is high; (c) over-fused persistent path -> register pressure/occupancy limit dominates even if arithmetic intensity is good.\n- 5) Knobs: kernel family (single-kernel vs split), program mapping (per window or grouped windows), C/hidden tile sizes, whether qkv/hidden are materialized or streamed, accumulation dtype, softmax staging strategy, and output writeback boundary.\n- 6) Skeleton: load one window, LN1 in fp32, compute q/k/v, qk+RPE, row-softmax, attn*v, proj, residual, LN2, fc1 in hidden tiles with GELU, fc2 reduction, residual store. Keep window activations and row statistics in registers; stream weights from global/L2; no inter-program sync required.\n- 7) Candidate families: whole-block per-window streaming (max fusion, highest spill risk); two-stage split at residual boundary (less fusion, safer occupancy); partial replacement focusing on one dominant sub-block for fast validation.\n- Bottleneck hypothesis: arithmetic work per window is substantial relative to I/O, so the winning path is likely limited by register pressure / compiler scheduling before raw DRAM bandwidth.\n- Important constraint reminders: fp16 inputs throughout, fp32 accumulators in tl.dot, no input_precision='ieee', no shift/padding/dropout, num_heads=1, window size fixed at 4x4.\n- Likely first implementation target: split fusion is the safest path to beat eager quickly; full single-kernel path is the long-term upside target.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement one Triton program per 4x4 window for the full block, but stream hidden-dimension work so the MLP does not require full 16x128 materialization.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.08,
+          "rationale": "This matches the stated optimization target most closely and offers the highest ceiling by removing all intermediate global traffic.",
+          "score_0_to_1": 0.38,
+          "title": "Prototype whole-block per-window streaming"
+        },
+        "choice": "whole_block_window_local",
+        "confidence_0_to_1": 0.67,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "C=32 and hidden=128 are tensor-core-friendly, and N=16 is fixed, enabling specialized tiny-matrix scheduling on RTX5090.",
+            "notes": "Any extra fusion beyond the current per-window monolith must earn back substantial pressure costs; this is now less plausible on RTX5090 than before.",
+            "rating_0_to_10": 4.6,
+            "risk": "medium_to_high"
+          },
+          "memory_bandwidth": {
+            "notes": "A full-window-stream ownership plan is attractive on traffic minimization grounds.",
+            "rating_0_to_10": 8.4,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Recent monolithic evidence suggests that pushing more ownership into one kernel is likely to amplify the same occupancy limits rather than remove them.",
+            "rating_0_to_10": 2.8,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_full_window_stream",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This open family aims for a single ownership plan that streams a larger window-local block with minimal rematerialization across attention and MLP.\n- bottleneck: register pressure and scheduler/latency limits, not pure bandwidth.\nFOLLOW_THROUGH:\n- aligned_with_intent: no\n- if_no: Expected intent was a larger-grain whole-block ownership plan with reuse across stages. What was actually implemented and measured is a per-window monolith, which already exposes the likely pressure problem for this family.\nUPDATE_BELIEF:\n- what changed after eval_result? The successful monolithic kernel weakens this family's prior because it captures much of the same fuse-for-locality instinct but still loses to the best split path.\n- next bet: De-prioritize this root family until the split path is exhausted; only revisit if a block-streaming design can prove a fundamentally different live-state profile than the tested monolith.\nSELF_CHECK: Mutually exclusive with family_two_stage_split because ownership either stays within one streaming kernel plan or is explicitly handed off across stage boundaries.",
+        "overall_rating_0_to_10": 5.8,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement two fused Triton kernels: kernel A for LN1 + window attention + out proj + residual, and kernel B for LN2 + MLP + residual.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.24,
+          "rationale": "This keeps most fusion benefits while sharply reducing live state, making correctness and occupancy much easier to achieve in the first iteration.",
+          "score_0_to_1": 0.93,
+          "title": "Prototype two-stage split at residual boundary"
+        },
+        "choice": "two_stage_block",
+        "confidence_0_to_1": 0.96,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Both stages still use the same favorable tiny dense dimensions, but each kernel has a simpler schedule and better chance to sustain occupancy.",
+            "notes": "This family continues to fit the small-window attention+MLP shape well; latest child evidence increases belief that the simpler split schedule is near the local optimum.",
+            "rating_0_to_10": 8.0,
+            "risk": "low_medium"
+          },
+          "memory_bandwidth": {
+            "notes": "True two-stage ownership still pays a y1 write/read, but the observed best latency suggests this traffic is not yet the dominant limiter on RTX5090 for C=32, WS=4.",
+            "rating_0_to_10": 7.2,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Keeping the residual boundary lowers live-state pressure relative to the fused child attempt and likely helps occupancy/scheduler freedom.",
+            "rating_0_to_10": 6.4,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_two_stage_split",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This family keeps attention and MLP as separate stages around the residual boundary and remains the best recorded end-to-end mapping in the tree.\n- bottleneck: balanced, with some y1 traffic cost, but not obviously bandwidth-dominated.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\nUPDATE_BELIEF:\n- what changed after eval_result? The attempted child refinement did not beat the family parent, so confidence increases that the basic two-stage split is still the strongest known plan. The gap also suggests that merely removing or retiming the y1 handoff is less valuable than expected unless the split is preserved carefully.\n- next bet: Keep the stage boundary and attack the y1 staging/layout directly, or grouped launch order across windows, instead of collapsing into a monolithic fused kernel.",
+        "overall_rating_0_to_10": 9.1,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.517,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.517,
+              "ref_eager_time_ms": 10.4,
+              "score": 20.12,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 8.12,
+              "speedup_over_eager": 20.12
+            },
+            "reference_latency_ms": 10.4,
+            "speedup_factor": 20.12,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "ca545ba0bced3cb988996d86a164df70fa81b601"
+        }
+      },
+      {
+        "action": {
+          "description": "Keep attention path in PyTorch and replace only LN2 + fc1 + GELU + fc2 + residual with a Triton kernel operating directly on NHWC tiles/windows.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.09,
+          "rationale": "The MLP is the largest math block and is easier than softmax-heavy attention, so this offers a low-risk validation path for custom kernels.",
+          "score_0_to_1": 0.58,
+          "title": "Prototype MLP-side fusion only"
+        },
+        "choice": "mlp_only_path",
+        "confidence_0_to_1": 0.66,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "The 32->128->32 dense path aligns well with tensor-core fragments and has no softmax or window-indexing complexity.",
+            "notes": "The FC-heavy MLP path maps cleanly to tensor-core friendly GEMM-style work and is less sensitive to attention scheduling details.",
+            "rating_0_to_10": 7.4,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Still moves activation tensors through memory, but avoids the extra attention-side fusion complexity and intermediate handoff issues.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Much lower live-state pressure than full-block fusion, which makes it a safer branch to realize.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_mlp_only",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: Open family that optimizes LN2 plus MLP first while keeping attention closer to baseline handling.\n- bottleneck: compute throughput in the FC layers with some bandwidth pressure, but lower synchronization and lower scheduling risk than end-to-end fusion.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\nUPDATE_BELIEF:\n- what changed after eval_result? Since the residual-boundary split did not beat the monolithic family best, a narrower low-risk optimization path becomes relatively more attractive. This family remains a cleaner alternative rather than a redundant version of the current best plan.\n- next bet: Use this branch if we want a fast validation path with lower implementation risk and potentially better portability across shapes.\nSELF_CHECK: This root family excludes the whole-block ownership plans because it intentionally leaves attention less fused and focuses only on the MLP side first.",
+        "overall_rating_0_to_10": 6.8,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.95,
+          "rationale": "",
+          "score_0_to_1": 0.58,
+          "title": "Implement the intended two-kernel residual-boundary split and compare against the accidental monolith"
+        },
+        "choice": "true_residual_boundary_split",
+        "confidence_0_to_1": 0.82,
+        "decision": "next_step",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Both kernels are structurally simple and map cleanly, so the loss is more about handoff cost than raw math throughput.",
+            "rating_0_to_10": 7.8,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "The implementation writes the full y1 tensor to global memory and reloads it in the MLP kernel; this is the main suspected cause of the regression versus the branch best.",
+            "rating_0_to_10": 5.8,
+            "risk": "high"
+          },
+          "register_pressure": {
+            "notes": "The split lowers live-state pressure versus a monolith and likely improves occupancy stability.",
+            "rating_0_to_10": 7.6,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "tsplit_make_split_real",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This node now truly implements the intended two-kernel residual-boundary split: one Triton kernel computes LN1+QKV+attention+proj+residual into y, and a second Triton kernel computes LN2+MLP+residual from that y buffer.\n- bottleneck: memory bandwidth\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\nUPDATE_BELIEF:\n- what changed after eval_result? The real split is viable and still delivers 18.83x over eager, but it is slower than the earlier branch best, so the explicit y1 materialization cost is real.\n- next bet: Either optimize the y1 handoff directly or revisit the monolithic variant that likely kept more data on-chip.\nSELF_CHECK: Exclusive with a monolithic-default sibling because this node commits to explicit residual-boundary materialization between attention and MLP.",
+        "overall_rating_0_to_10": 7.1,
+        "parent_id": "family_two_stage_split",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.523,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.523,
+              "ref_eager_time_ms": 9.85,
+              "score": 18.83,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 8.39,
+              "speedup_over_eager": 18.83
+            },
+            "reference_latency_ms": 9.85,
+            "speedup_factor": 18.83,
+            "status": "passed"
+          },
+          "parent_solution_id": "ca545ba0bced3cb988996d86a164df70fa81b601",
+          "solution_id": "8ab105731b9a4303c473c6278cac83a81b006481"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.04,
+          "rationale": "",
+          "score_0_to_1": 0.74,
+          "title": "Make the split path the actual measured default and reduce y1 round-trip cost"
+        },
+        "choice": "split_default_optimize_y1_handoff",
+        "confidence_0_to_1": 0.69,
+        "decision": "next_step",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "The kernel math already fits well; most remaining upside is from pipeline and memory behavior rather than more arithmetic fusion.",
+            "rating_0_to_10": 7.2,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "This is the highest-leverage knob now: reduce the cost of storing and reloading y1, ideally with more efficient vectorized IO and layout assumptions.",
+            "rating_0_to_10": 8.7,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Handoff tuning should avoid collapsing back into a register-heavy monolith unless that is done deliberately as a separate branch.",
+            "rating_0_to_10": 6.4,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "tsplit_split_default_y1_handoff",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The current code already makes the split path the actual default, with y1 produced by the attention kernel and consumed by the MLP kernel from a contiguous global buffer.\n- bottleneck: memory bandwidth\nFOLLOW_THROUGH:\n- aligned_with_intent: no\n- if_no: Expected intent was to specifically tune the y1 intermediate handoff after making the split real default. What was actually implemented was the real default split with a plain global-memory handoff, but without handoff-specific packing or scheduling refinement.\nUPDATE_BELIEF:\n- what changed after eval_result? The split path is confirmed fast enough to keep investing in, but the lost performance versus the family best points directly at the y1 exchange as the next limiter.\n- next bet: Tune the handoff first\u2014vectorized loads/stores, stricter contiguity assumptions, and schedule choices in the MLP kernel\u2014because that is the most composable way to recover the regression without changing the ownership plan.",
+        "overall_rating_0_to_10": 6.6,
+        "parent_id": "tsplit_make_split_real",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.83,
+          "rationale": "",
+          "score_0_to_1": 0.34,
+          "title": "Re-open the accidental monolith as a deliberate default and tune its inner schedule"
+        },
+        "choice": "reopen_monolith_default_and_tune_inner_schedule",
+        "confidence_0_to_1": 0.9,
+        "decision": "next_step",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "The math shape still fits the GPU well, but the realized schedule leaves performance on the table due to data movement rather than raw flops.",
+            "rating_0_to_10": 7.1,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "The explicit mid tensor creates a large whole-image store/load path that likely dominates the shortfall versus the best split result.",
+            "rating_0_to_10": 5.5,
+            "risk": "high"
+          },
+          "register_pressure": {
+            "notes": "Current kernels are not overly register-bound, which also suggests bandwidth/launch effects are the primary limiter.",
+            "rating_0_to_10": 6.2,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "tsplit_monolith_default_reopen",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The current code is not a true monolith; it is a deliberate two-kernel implementation where attention+residual writes a mid tensor and a second kernel runs LN2+MLP+residual.\n- bottleneck: memory bandwidth and relaunch overhead, especially the full-frame mid write/read plus repeated per-window weight loads.\nFOLLOW_THROUGH:\n- aligned_with_intent: no\n- if_no: Expected intent was to make a monolithic default and tune its inner schedule to exploit more on-chip reuse. What was actually implemented is a clean residual-boundary split with a materialized y1 tensor.\nUPDATE_BELIEF:\n- what changed after eval_result? The branch is validated as correct and fast versus eager, but it underperforms the family's best result and no longer supports the original monolith hypothesis. The label is now misleading: the measured behavior is better interpreted as a weaker split schedule, not a successful monolith reopening.\n- next bet: De-prioritize this as the default direction and focus follow-up effort on explicit split-family locality tuning or a genuinely persistent split schedule.\nPERF_GAP:\n- expected: about 0.88x of the family baseline\n- observed: about 0.83x of the family baseline (16.6x vs 20.12x)\n- hypothesized_reason: the implementation drifted away from monolithic reuse and paid a visible y1 handoff + weight-reload cost without compensating on-chip savings.",
+        "overall_rating_0_to_10": 5.3,
+        "parent_id": "family_two_stage_split",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.524,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.524,
+              "ref_eager_time_ms": 8.7,
+              "score": 16.6,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 8.19,
+              "speedup_over_eager": 16.6
+            },
+            "reference_latency_ms": 8.7,
+            "speedup_factor": 16.6,
+            "status": "passed"
+          },
+          "parent_solution_id": "ca545ba0bced3cb988996d86a164df70fa81b601",
+          "solution_id": "19346aef98ce272346b31f9ceab1bbef89b85795"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.84,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Although arithmetic density is decent, mixing attention softmax with chunked MLP in a single tiny-window kernel creates latency-heavy execution that likely underuses peak tensor throughput.",
+            "rating_0_to_10": 5.2,
+            "risk": "medium_to_high"
+          },
+          "memory_bandwidth": {
+            "notes": "The monolith avoids an intermediate y1 write/read and keeps window-local data movement tight.",
+            "rating_0_to_10": 8.2,
+            "risk": "low_to_medium"
+          },
+          "register_pressure": {
+            "notes": "One kernel holds LN stats, Q/K/V/proj intermediates, attention probabilities/context, and chunked MLP accumulators together; this is the leading candidate for occupancy loss on RTX5090.",
+            "rating_0_to_10": 3.1,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 23,
+        "node_id": "node_kernelbench_l1_p1_r23_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 6.6,
+        "parent_id": "tsplit_monolith_default_reopen",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "19346aef98ce272346b31f9ceab1bbef89b85795",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.49,
+          "title": "Keep the split boundary, but retile launch order and buffer layout for cheaper y1 handoff"
+        },
+        "choice": "split_handoff_locality_retile",
+        "confidence_0_to_1": 0.82,
+        "decision": "next_step",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "The fused per-window kernel is still fast, but the small shape does not clearly benefit from this much fusion versus the simpler family parent.",
+            "rating_0_to_10": 6.9,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "The implemented kernel avoids an explicit inter-kernel y1 handoff, so raw bandwidth pressure is lower than the intended split path.",
+            "rating_0_to_10": 6.5,
+            "risk": "low_medium"
+          },
+          "register_pressure": {
+            "notes": "Fusing LN1, QKV, attention, proj, residual, LN2, and chunked MLP into one kernel materially raises live-state pressure and likely hurts occupancy.",
+            "rating_0_to_10": 8.8,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "tsplit_handoff_locality_retile",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The current code uses a single Triton per-window kernel that performs LN1 -> QKV/attention/proj -> residual -> LN2 -> GELU-MLP -> residual for 4x4 windows, with packed transposed weights and inline RPE.\n- bottleneck: register pressure / latency balance more than y1-handoff bandwidth.\nFOLLOW_THROUGH:\n- aligned_with_intent: no\n- if_no: Expected intent was to keep the two-stage split boundary and retile launch order/buffer layout for a cheaper y1 producer-consumer handoff. Actually implemented was a monolithic fused kernel that removes the split boundary instead of optimizing locality within it.\nUPDATE_BELIEF:\n- what changed after eval_result? The result is still strong, but it trails the parent family best, so this branch no longer looks like the right refinement of the split design. The evidence points to fusion/register costs offsetting the benefit of removing the explicit y1 handoff.\n- next bet: Reify a true split again and optimize the y1 staging layout/order explicitly, because that tests the original hypothesis without inheriting the monolithic kernel's pressure costs.",
+        "overall_rating_0_to_10": 5.8,
+        "parent_id": "family_two_stage_split",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.571,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.571,
+              "ref_eager_time_ms": 11.3,
+              "score": 19.79,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 7.62,
+              "speedup_over_eager": 19.79
+            },
+            "reference_latency_ms": 11.3,
+            "speedup_factor": 19.79,
+            "status": "passed"
+          },
+          "parent_solution_id": "ca545ba0bced3cb988996d86a164df70fa81b601",
+          "solution_id": "8c250471b6644e0345239d294f15babe618ef6b4"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.03,
+          "rationale": "",
+          "score_0_to_1": 0.72,
+          "title": "Reify true split with contiguous y1 staging and grouped window launch"
+        },
+        "choice": "reify_split_y1_stage",
+        "confidence_0_to_1": 0.63,
+        "decision": "next_step",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Separate kernels may map better to the small C=32, N=16 workload while preserving high locality through launch ordering.",
+            "rating_0_to_10": 7.5,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "This brings back explicit y1 traffic, but makes it compact/coalesced and easier for L2 to reuse between producer and consumer.",
+            "rating_0_to_10": 7.8,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Splitting stages should materially reduce live-state pressure versus the current monolithic kernel.",
+            "rating_0_to_10": 7.1,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "tsplit_reify_stage_boundary_y1_compact",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: Proposed follow-up restores a real attention->y1->LN2/MLP boundary, stages y1 in a compact contiguous layout, and launches the consumer in matching window order.\n- bottleneck: likely y1 memory/L2 traffic rather than pure compute.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\nUPDATE_BELIEF:\n- what changed after eval_result? The latest measurement says full fusion is not the right proxy for the original locality idea. A cleaner test is needed that preserves the split while making the handoff cheaper.\n- next bet: Pack y1 as a window-major tensor (e.g. [B,nH,nW,16,32]) and use grouped producer/consumer launch order so the second stage reads recently produced tiles from L2.",
+        "overall_rating_0_to_10": 6.9,
+        "parent_id": "tsplit_handoff_locality_retile",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": "(unknown)",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This is a mixed dense-transformer microkernel specialized to fixed 4x4 windows (N=16), single head, fp16 NHWC activations, and likely C=32/hidden=128, with independent per-window work consisting of LN1, small QKV/proj GEMMs, row-wise softmax attention with tiny relative-position bias, residual, LN2, and an MLP. The main performance hypothesis on RTX5090 is that default-size inputs are not DRAM-bound but limited by how well Triton can keep window-local state on-chip without spilling; full fusion has the highest ceiling because weights are tiny and highly reusable, but register pressure is the central risk, making a two-stage split the safest initial path.",
+  "open_questions": [
+    "Is evaluation fixed to dim=32, or must the Triton path support multiple dim values at runtime?",
+    "Will benchmark inputs always be contiguous NHWC tensors with stride-1 on C, or do we need to handle arbitrary non-contiguous views?",
+    "Is a two-kernel split acceptable for scoring, or is a strict single persistent kernel required beyond the optimization hint?",
+    "What numerical tolerance is used for fp16 outputs given fp32 LayerNorm/softmax accumulations and GELU approximation details?",
+    "Will rpe_bias always be resident as fp16 after half(), or can checkpoint remapping leave it as fp32 and require mixed-type loads?",
+    "How strong is the torch.compile baseline on this exact shape; does it already fuse LN/MLP enough that only attention-side fusion moves the needle materially?",
+    "Does the runtime environment favor large enough warmup/repetition that weight reuse from L2 across windows is realized, or are cold-cache effects important?"
+  ]
+}

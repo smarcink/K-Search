@@ -29,33 +29,12 @@ def _persist_ksearch_solution(
         out_dir = root / "solutions" / str(definition_name or "__unknown__")
         out_dir.mkdir(parents=True, exist_ok=True)
         name = str(getattr(solution, "name", "") or "solution")
-        # Sanitize the filename so model names like "org/model" don't become directories.
-        safe_name = "".join([c if (c.isalnum() or c in ("-", "_", ".")) else "_" for c in name]).strip("_")
-        if not safe_name:
-            safe_name = "solution"
-        dest = out_dir / f"{safe_name}.json"
+        dest = out_dir / f"{name}.json"
         if KSearchSolution is not None and isinstance(solution, KSearchSolution):
             obj = solution.to_dict()
         else:
             obj = solution.__dict__ if hasattr(solution, "__dict__") else {"solution": str(solution)}
-
-        payload = json.dumps(obj, ensure_ascii=False, indent=2)
-        dest.write_text(payload, encoding="utf-8")
-
-        # Backward-compatibility: also persist under the original unsanitized
-        # solution name so loaders that resolve by "<solution_ref>.json" keep
-        # working for names that contain characters sanitized above.
-        if name != safe_name:
-            legacy_dest = (out_dir / f"{name}.json")
-            legacy_dest_resolved = legacy_dest.resolve()
-            try:
-                legacy_dest_resolved.relative_to(out_dir.resolve())
-            except ValueError:
-                legacy_dest_resolved = None
-
-            if legacy_dest_resolved is not None and legacy_dest_resolved != dest.resolve():
-                legacy_dest_resolved.parent.mkdir(parents=True, exist_ok=True)
-                legacy_dest_resolved.write_text(payload, encoding="utf-8")
+        dest.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
         return dest
     except Exception as e:
         print(f"Error saving k-search solution: {e}")
@@ -264,25 +243,21 @@ def main():
     parser.add_argument("--local", required=False, default=None, help="Path to flashinfer-trace dataset root (flashinfer only)")
     parser.add_argument(
         "--task-source",
-        choices=["flashinfer", "gpumode", "kernelbench", "mlx"],
+        choices=["flashinfer", "gpumode", "kernelbench"],
         default="flashinfer",
         help="Task backend to use.",
     )
     parser.add_argument(
         "--task-path",
         default=None,
-        help="Task source path/identifier. For --task-source=flashinfer, this is the dataset root path (defaults to --local).",
+        help="Task source path/identifier. For --task-source=flashinfer, this is the dataset root path. "
+             "For --task-source=kernelbench, this is a local .py file with Model class to optimize (bypasses HuggingFace dataset).",
     )
     parser.add_argument("--definition", default=None, help="Single definition name to target (required)")
-    parser.add_argument("--model-name", required=True, help="LLM model name (e.g., gpt-4.1, gpt-5, gemini-2.5-pro via compatible endpoint)")
-    parser.add_argument("--base-url", default=None, help="OpenAI-compatible base URL for non-OpenAI providers (e.g. Gemini proxy)")
+    parser.add_argument("--model-name", required=True, help="LLM model name (e.g., gpt-4.1, gpt-5, gemini-2.5-pro via OpenAI-compatible endpoint, or claude-opus-4-6/claude-4-6-opus via Anthropic-compatible endpoint)")
+    parser.add_argument("--base-url", default=None, help="Provider base URL. For Claude/Anthropic models a GNAI OpenAI URL is auto-rewritten to the /providers/anthropic path; or pass it directly (e.g. https://gnai.intel.com/api/providers/anthropic)")
     parser.add_argument("--api-key", default=None, help="API key; if omitted, uses LLM_API_KEY env var")
-    parser.add_argument(
-        "--language",
-        default="triton",
-        choices=["triton", "python", "cuda", "mlx"],
-        help="Target language for generated kernel",
-    )
+    parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel")
     parser.add_argument("--target-gpu", default="H100", help="Target GPU architecture hint for prompts")
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
 
@@ -362,23 +337,15 @@ def main():
     parser.add_argument("--kernelbench-problem-id", type=int, default=1, help="Problem ID within the level")
     parser.add_argument("--kernelbench-eval-mode", default="local", choices=["local", "modal"], help="Evaluation mode")
     parser.add_argument("--kernelbench-num-correct-trials", type=int, default=5, help="Number of correctness trials")
-    parser.add_argument("--kernelbench-num-perf-trials", type=int, default=100, help="Number of performance trials")
+    parser.add_argument("--kernelbench-num-perf-trials", type=int, default=1000, help="Number of performance trials")
+    parser.add_argument(
+        "--kernelbench-precision",
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="dtype for KernelBench eval (model+inputs are cast to this; allclose tolerance is 1e-4 for fp32, 1e-2 for fp16/bf16)",
+    )
 
     args = parser.parse_args()
-
-    # MLX runs on Apple Silicon; the CUDA-style --target-gpu hint is not meaningful.
-    # If Metal is available, replace it with an auto-detected device name
-    if str(getattr(args, "task_source", "")).strip().lower() == "mlx":
-        try:
-            from k_search.utils.metal_gpu_info import get_metal_device_name
-
-            detected = get_metal_device_name().strip()
-            if detected:
-                args.target_gpu = detected
-            else:
-                args.target_gpu = "AppleSilicon"
-        except Exception:
-            args.target_gpu = "AppleSilicon"
 
     api_key = args.api_key or os.getenv("LLM_API_KEY")
     if not api_key:
@@ -388,9 +355,6 @@ def main():
     task_path = str(args.task_path or (args.local or ""))
     if task_source == "flashinfer":
         from k_search.tasks.flashinfer_bench_task import FlashInferBenchTask
-
-        if str(args.language).strip().lower() == "mlx":
-            raise ValueError("--language mlx is only supported with --task-source=mlx")
 
         if not task_path:
             raise ValueError("--local or --task-path is required for --task-source=flashinfer")
@@ -418,9 +382,6 @@ def main():
     elif task_source == "gpumode":
         from k_search.tasks.gpu_mode_task import GpuModeTriMulTask
 
-        if str(args.language).strip().lower() == "mlx":
-            raise ValueError("--language mlx is only supported with --task-source=mlx")
-
         task = GpuModeTriMulTask(
             mode=str(args.gpumode_mode or "benchmark"),
             keep_tmp=bool(args.gpumode_keep_tmp),
@@ -429,9 +390,6 @@ def main():
         )
     elif task_source == "kernelbench":
         from k_search.tasks.kernelbench_task import KernelBenchTask
-
-        if str(args.language).strip().lower() == "mlx":
-            raise ValueError("--language mlx is only supported with --task-source=mlx")
 
         task = KernelBenchTask(
             level=args.kernelbench_level,
@@ -442,31 +400,9 @@ def main():
             num_perf_trials=args.kernelbench_num_perf_trials,
             artifacts_dir=args.artifacts_dir,
             backend=args.language,  # Pass language as KernelBench evaluation backend
+            precision=args.kernelbench_precision,
+            local_ref_path=args.task_path,
         )
-    elif task_source == "mlx":
-        # MLX task selector.
-        def_name = str(args.definition or "mlx_mamba_selective_scan_fwd").strip()
-        if def_name in (
-            "mlx_mamba",
-            "mlx_mamba_selective_scan_fwd",
-        ):
-            from k_search.tasks.mlx_mamba_task import MlxMambaSelectiveScanFwdTask
-
-            task = MlxMambaSelectiveScanFwdTask(
-                warmup_runs=args.warmup_runs,
-                iterations=args.iterations,
-                rtol=args.rtol,
-                atol=args.atol,
-                timeout_seconds=300,
-                artifacts_dir=args.artifacts_dir,
-                name="mlx_mamba_selective_scan_fwd",
-            )
-        else:
-            raise ValueError(
-                "Unknown MLX definition. Use --definition one of: "
-                "mlx_mamba_selective_scan_fwd. "
-                f"Got {def_name!r}."
-            )
     else:
         raise ValueError(f"Unsupported task_source: {task_source}")
 

@@ -1,0 +1,1116 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 10.7,
+      "reference_latency_ms": 8.58,
+      "speedup_factor": 0.8,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "register_pressure_validation",
+    "nodes": [
+      {
+        "action": {
+          "description": "Root node for decision tree. No action taken here.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "Placeholder for tree initialization.",
+          "score_0_to_1": 0.0,
+          "title": "DUMMY_ROOT"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.1,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "N/A",
+            "notes": "N/A at root.",
+            "rating_0_to_10": 0.0,
+            "risk": "N/A"
+          },
+          "memory_bandwidth": {
+            "notes": "N/A at root.",
+            "rating_0_to_10": 0.0,
+            "risk": "N/A"
+          },
+          "register_pressure": {
+            "notes": "N/A at root.",
+            "rating_0_to_10": 0.0,
+            "risk": "N/A"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "WORLD MODEL ROOT: Swin block is a composite of (1) attention with window ops, masking, and relative bias; (2) MLP with dropout; (3) stochastic depth and layer norms. PRIMARY DESIGN AXES: (A) Coarse fusion strategy (monolithic vs. modular kernels); (B) Attention kernel specialization (shifted-window masking, relative bias application, softmax stability); (C) Memory layout optimization (minimize reshape/permute overhead); (D) Numeric strategy (fp16 vs. mixed-precision). LIKELY BOTTLENECKS by input regime: small-batch large-spatial (B=1, H\u00d7W large)\u2014memory bandwidth in proj/reshape; large-window (window \u2265 8)\u2014compute saturation in matmul; small-window with many shifts\u2014reshape/mask overhead. RTX5090 context: ~1500 TFLOPS fp16 matmul, ~936 GB/s memory, high L2 cache\u2014favors compute-dense ops and reduces reshape/sync overhead.",
+        "overall_rating_0_to_10": 1.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement separate, composable Triton kernels: (1) fused shifted-window attention + relative bias + softmax in one kernel, (2) fused MLP (linear + GELU + dropout) in another. Use PyTorch's amp/autocast for fp16 consistency. Minimize intermediate reshapes by fusing normalization into the attention input.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.15,
+          "rationale": "Reduces complexity compared to monolithic kernel, maintains numerical stability via mixed-precision, and leverages Triton's strength in per-operation fusion. Allows profiling and tweaking each path independently.",
+          "score_0_to_1": 0.65,
+          "title": "Modular Triton Kernels for Attention and MLP"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "Should attention and MLP be fused into a single kernel or kept separate with explicit PyTorch/Triton modularity?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090: tensor cores prefer >=64\u00d764 matmul. Window-based attention on 4\u00d74 windows is well below this; mitigated by processing multiple windows in parallel (B*num_windows threads).",
+            "notes": "Attention matmul has moderate compute intensity (window-size\u00b2 operations per output element). MLP has low compute intensity (2 sequential linear layers + activation). Triton can exploit both via tensor cores (RTX5090) with proper tiling.",
+            "rating_0_to_10": 6.0,
+            "risk": "Small window size (4\u00d74) means small matmul (16\u00d716), which under-utilizes tensor cores. May be latency-bound rather than compute-bound."
+          },
+          "memory_bandwidth": {
+            "notes": "Modular approach keeps intermediate activations in GPU memory; no extra device-to-host round trips. Attention reads/writes via window ops; MLP has straightforward linear projection. Overall bandwidth usage is similar to eager PyTorch but with better kernel-level optimization.",
+            "rating_0_to_10": 6.0,
+            "risk": "If intermediate activations are large (e.g., unpadded spatial dims), memory footprint could exceed L2 cache, forcing HBM stalls."
+          },
+          "register_pressure": {
+            "notes": "Separate kernels allow each to manage registers independently. Attention kernel will have moderate pressure from QKV, relative bias indices, and softmax accumulation. MLP kernel is simpler. Total register count is lower than a monolithic kernel.",
+            "rating_0_to_10": 4.0,
+            "risk": "Attention kernel with many heads and large window size (e.g., num_heads=8, window=8\u00d78) could spill to shared memory or local memory, slowing down."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "attention_vs_mlp_fusion",
+        "node_type": "decision",
+        "notes": "DECISION: Attention + residual + norm + MLP + residual could theoretically be one kernel, but practical constraints favor separation. Attention involves complex window ops (reshape, roll, masking), while MLP is a straightforward two-layer linear + GELU + dropout. Fusing increases register pressure and complicates control flow. ANALYSIS: Monolithic kernel would save intermediate activations but increase compiler complexity and ILP. Modular approach (separate Triton kernels for attention and MLP) is more maintainable and allows intermediate optimizations. Given that stochastic depth and layer norms sit between them, fusion opportunity is limited anyway.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel that (1) reads Q, K, V (already projected in PyTorch), (2) computes attention logits (Q @ K^T scaled), (3) applies relative position bias and window mask, (4) applies softmax with masking, (5) performs attention dropout and output matmul (attn @ V). Keep window reshape/permute in PyTorch. This fuses the most expensive operation (softmax + masking) and the memory-intensive attention-value matmul.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.25,
+          "rationale": "Softmax over large matrices is a hotspot; fusing it with masking and matmul reduces global memory round trips. Attention matmul has good compute intensity; Triton tiling can exploit it. Window reshape is best left to PyTorch's optimized kernels.",
+          "score_0_to_1": 0.7,
+          "title": "Fused Masked-Softmax + Attention-Matmul Triton Kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "For shifted-window attention, should we (A) implement custom Triton kernel for the full W-MSA pipeline, or (B) use PyTorch ops (F.linear, matmul, softmax) with manual fusion of masking, or (C) hybrid: fuse only hotspot (e.g., masked softmax)?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 tensor cores: optimal for \u226564\u00d764 matmul. 4\u00d74 windows per head (0.25KB) is far below ideal. Mitigation: (A) process multiple windows per block, or (B) accept latency bottleneck and optimize softmax path for low-precision arithmetic.",
+            "notes": "Attention matmul per window: (window_size\u00b2 / num_heads) \u00d7 (window_size\u00b2 / num_heads) ops per thread group. With window=4\u00d74, num_heads=8, this is 2\u00d72 per head, totaling ~16 matmul ops per output token. Compute intensity is low (~0.5 FLOPs/byte in isolation) but amortizable over batch/num_windows parallelism.",
+            "rating_0_to_10": 5.0,
+            "risk": "Small window size = small matmuls, which are latency-bound. Softmax is compute-light; matmul dominates. Tensor core utilization is suboptimal for tiny windows."
+          },
+          "memory_bandwidth": {
+            "notes": "Fused kernel reads Q, K, V once and computes attention in-place. Masking is applied on-the-fly (register-local). Output is written once. Compared to eager PyTorch (which materializes intermediate attention logits), this reduces global memory pressure significantly.",
+            "rating_0_to_10": 7.0,
+            "risk": "Q, K, V are read from global memory (not L2-cached if earlier kernel output). Large num_windows (H\u00d7W / window_size\u00b2) could cause cache misses. Mitigation: ensure window partitioning leaves data in L2."
+          },
+          "register_pressure": {
+            "notes": "Each thread processes a tile of attention (e.g., 16\u00d716 or 8\u00d78 for 4\u00d74 windows, scaled by num_heads). Registers needed: Q_tile, K_tile, V_tile, logits, softmax_state. For fp16, this is ~200\u2013400 registers per thread, manageable on RTX5090.",
+            "rating_0_to_10": 5.0,
+            "risk": "Deep pipelines (many iteration unrolls for softmax stability) could exceed register limits. Keep softmax state compact; use online softmax (one-pass stable reduction)."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "attn_window_op_strategy",
+        "node_type": "decision",
+        "notes": "DECISION: Full Triton W-MSA kernel is complex (reshape, roll, window partitioning, masking, attention compute, restitching). PyTorch eager mode is slow but correct. Hybrid (masked softmax + attention matmul in one Triton kernel) balances correctness and speedup. ANALYSIS: The critical path in attention is (1) QKV proj (matmul, already fast), (2) scaled dot-product (matmul + softmax), (3) attention \u00d7 value (matmul), (4) output proj (matmul). The masking (shifted-window attn_mask) is applied before softmax and can be fused. Window partitioning (reshape/permute) is overhead but hard to fuse without a monolithic kernel.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "attention_vs_mlp_fusion",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "In the fused attention kernel, read logits in fp16, upcasting to fp32 for softmax computation (online/stable algorithm), write output in fp16. Similarly, ensure LayerNorm uses fp32 accumulation internally (this is default in PyTorch; Triton kernels should replicate it). Do not attempt pure fp16 softmax.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "Matches PyTorch's behavior exactly, avoids numerical instability, and aligns with RTX5090's high fp32 throughput. The latency cost of upcasting is negligible because softmax is memory-bound, not compute-bound.",
+          "score_0_to_1": 0.85,
+          "title": "Mixed-Precision Softmax (fp32 accumulation, fp16 I/O)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "Should attention softmax and layer norm be computed in fp32 (numerically stable) or fp16 (faster but risky)?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Softmax is typically compute-light (exp, sum, div operations), even in fp32. The latency cost of fp32 ops is not significantly higher than fp16 on RTX5090 (both have high fp32 throughput). Memory bandwidth is the limiting factor.",
+            "rating_0_to_10": 8.0,
+            "risk": "None. fp32 softmax is a standard practice and well-supported on RTX5090."
+          },
+          "memory_bandwidth": {
+            "notes": "Upcasting logits to fp32 for softmax means temporary fp32 registers, but no extra global memory I/O. Softmax output is converted back to fp16 before writing. Negligible bandwidth change.",
+            "rating_0_to_10": 8.0,
+            "risk": "Minimal. Casting is free in registers; bandwidth is dominated by reading logits and writing softmax output."
+          },
+          "register_pressure": {
+            "notes": "fp32 softmax state (max, sum) requires a few extra registers (e.g., 4 registers for max and sum, vs. 2 for fp16). Total impact is small, ~10 registers per thread.",
+            "rating_0_to_10": 2.0,
+            "risk": "Negligible. RTX5090 has ~255K registers per SM; a few extra registers per thread are inconsequential."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "numeric_strategy",
+        "node_type": "decision",
+        "notes": "DECISION: PyTorch LayerNorm internally accumulates in fp32 even if input is fp16; reference model does this via .half(). Attention softmax should also be stable. Triton kernels should mirror this: compute softmax in fp32, read/write in fp16. This maintains numerical parity with reference. Pure fp16 softmax is risky (overflow/underflow in exp/sum), and gains are marginal because softmax is memory-bound, not compute-bound.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "attn_window_op_strategy",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel that combines the first linear layer (dim -> 4*dim) + GELU activation + dropout into a single kernel. The output is then fed to the second linear layer (4*dim -> dim) via a separate kernel or PyTorch op. This captures the dense matmul \u2192 activation fusion opportunity. Use a fast GELU approximation (tanh or polynomial) or lookup table for accuracy vs. speed trade-off.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "Fusing matmul + GELU + dropout eliminates intermediate activation tensor materialization (saves memory and bandwidth). GELU is a thin activation layer; fusing it with the preceding matmul is a common optimization. Dropout can be inlined (Bernoulli sampling + scaling in the same kernel).",
+          "score_0_to_1": 0.6,
+          "title": "Fused Linear-GELU-Dropout Triton Kernel for MLP Hidden Layer"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "For the MLP (linear -> GELU -> dropout -> linear -> dropout), should we (A) fuse all into one Triton kernel, (B) use PyTorch eager (already well-optimized), or (C) fuse only linear + GELU (matmul + activation)?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "MLP matmuls are moderate-sized: [B*H*W, dim] @ [dim, 4*dim] has compute intensity ~(B*H*W*dim*4*dim) / (B*H*W*dim*2 + dim*4*dim*2) \u2248 0.5\u20131 FLOPs/byte, depending on tiling. For the given shape, this is in the range where register pressure and memory bandwidth are balanced.",
+            "rating_0_to_10": 6.0,
+            "risk": "Moderate compute intensity means we're neither compute-saturated nor memory-bound; fusion helps both. Tensor cores on RTX5090 are well-utilized for matmul; GELU is thin."
+          },
+          "memory_bandwidth": {
+            "notes": "Fusing linear + GELU + dropout means the intermediate hidden activation (shape [B*H*W, 4*dim] in fp16) is not written to global memory; it lives in registers/shared memory across the kernel. This saves ~4*dim*B*H*W*2 bytes of bandwidth. For the given input (B=1, H=720, W=1280, dim=32, so hidden=128), this is ~1.5 GB. Significant savings.",
+            "rating_0_to_10": 8.0,
+            "risk": "If the hidden activation is too large to fit in registers, it spills to local/shared memory, negating the benefit. Monitor spill rates during compilation."
+          },
+          "register_pressure": {
+            "notes": "Fused kernel must hold Q (input), W1 (weight tile), intermediate logits, GELU state, dropout mask, output. For fp16 and typical tiling (e.g., 256\u00d732 or 128\u00d764), this is ~500\u2013800 registers per thread, pushing against RTX5090 limits (~255K registers per SM \u00f7 128 threads per warp \u2248 2K per thread). High pressure.",
+            "rating_0_to_10": 7.0,
+            "risk": "Spilling to local memory would serialize the kernel and negate speedup. Require careful tiling strategy (e.g., process one row at a time, accumulate across iterations)."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "mlp_kernel_design",
+        "node_type": "decision",
+        "notes": "DECISION: MLP is two linear layers (~dim \u00d7 4*dim and 4*dim \u00d7 dim matmuls) separated by GELU and dropout. PyTorch's Triton backend already fuses this quite well in recent versions (via torch.compile or eager mode). Custom Triton fusion would need careful handling of GELU (either polynomial approximation or lookups). Benefit is likely modest (~10% speedup at best). Risk: GELU accuracy or dropout seeding issues. Given complexity vs. gain, hybrid or PyTorch-eager is pragmatic.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "attention_vs_mlp_fusion",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Keep window partitioning (padding, reshape, permute, roll) in PyTorch eager mode (or torch.compile). These operations are well-optimized and not the bottleneck. Instead, focus custom Triton on the attention matmul + softmax + mask kernel, which is compute-intensive and benefits from custom tiling. Ensure the output of window partitioning is contiguous in memory to avoid cache misses in the attention kernel.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "Reshape/permute are memory-bound and hard to fuse without monolithic kernels. PyTorch's implementations are battle-tested. Spend optimization effort on the compute-heavy parts (matmul, softmax). Contiguity is cheap to ensure (a single torch.contiguous() call) and beneficial for downstream kernels.",
+          "score_0_to_1": 0.75,
+          "title": "Use PyTorch's Optimized View/Permute; Minimize Overhead in Attention Kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.45,
+        "decision": "The reference implementation has multiple reshape/permute operations for window partitioning. Should we (A) keep them in PyTorch (fused via view/transpose kernels), (B) implement custom Triton kernels for reshape/permute, or (C) fuse reshape into preceding/following matmuls?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Reshape/permute have low compute intensity (pure memory ops). Offloading to PyTorch's fused kernels ensures efficient memory-level parallelism without blocking custom Triton kernels.",
+            "rating_0_to_10": 8.0,
+            "risk": "None. PyTorch's implementations are optimized for memory-bound kernels."
+          },
+          "memory_bandwidth": {
+            "notes": "Reshape/permute are already near-optimal in PyTorch (fused kernels). Ensuring contiguity prevents redundant copies. Overall bandwidth impact is minimal; reshape/permute overhead is a small fraction of total kernel runtime for large inputs.",
+            "rating_0_to_10": 8.0,
+            "risk": "Non-contiguous intermediate tensors could fragment memory access in downstream kernels. Mitigated by explicit contiguous() call."
+          },
+          "register_pressure": {
+            "notes": "No impact. PyTorch reshape/permute kernels manage their own register usage. Downstream Triton kernels see contiguous input, which is beneficial.",
+            "rating_0_to_10": 2.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "reshape_permute_overhead",
+        "node_type": "decision",
+        "notes": "DECISION: Reshape and permute are typically memory-bound on modern GPUs. PyTorch's implementation is already highly optimized (fused kernels for contiguous operations). Custom Triton reshape kernels are rarely faster unless fused with compute (e.g., reshape + matmul). For window partitioning, the pattern is: [B, H, W, C] -> [B, H', W', h, w, C] (view) -> [B, H', W', h, w, C] permute -> [B*num_windows, h*w, C] (reshape). These are hard to fuse with matmul due to the windowing structure. Recommendation: keep in PyTorch, focus optimization on attention and MLP compute kernels.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "attn_window_op_strategy",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a lightweight Triton kernel that combines residual addition (x + x_res), stochastic depth (row-wise Bernoulli masking with scaling), and the input to the next LayerNorm. This kernel reads x_res (attention or MLP output) and x_orig (residual input), applies stochastic depth with proper RNG seeding (per-row), adds, and optionally outputs to LayerNorm. Dropout within MLP can remain in the MLP kernel or be fused here if it overlaps with stochastic depth.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.08,
+          "rationale": "Residual + stochastic depth + norm are typically applied as separate PyTorch ops, each accessing global memory. Fusing them into one pass reduces memory bandwidth. Stochastic depth Bernoulli sampling has low compute cost; fusing with addition/norm (which also have low compute) is beneficial for amortizing kernel launch overhead.",
+          "score_0_to_1": 0.65,
+          "title": "Fused Residual-StochasticDepth-Norm Kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "Stochastic depth (row-wise Bernoulli drop) and dropout (element-wise) are separate operations. Should they be (A) fused into preceding kernels (attention output, MLP output), (B) kept as separate PyTorch ops, or (C) combined into a single fused dropout-residual kernel?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Residual + stochastic depth + norm is element-wise + reduce. Compute intensity is low (mostly memory ops). Triton can parallelize over batch/spatial dims and use block-level reductions for norm. RTX5090 can handle this efficiently with proper tiling.",
+            "rating_0_to_10": 6.0,
+            "risk": "Reduce operations (norm) can be synchronization bottlenecks if not carefully tiled. Use online reduction to avoid explicit sync."
+          },
+          "memory_bandwidth": {
+            "notes": "Naive approach: separate kernels for residual, stochastic depth, and norm would require reading/writing the tensor multiple times. Fused kernel reads x_res and x_orig once, applies all ops, and writes output once. Saves ~3\u00d7 global memory bandwidth for this path. For input shape [B, H, W, C] = [1, 720, 1280, 32], this is significant (~230 MB vs. ~690 MB).",
+            "rating_0_to_10": 8.0,
+            "risk": "If norm is expensive (requires reduce over channel dim), bottleneck may shift from memory to compute. Mitigated by using online variance computation (Welford's algorithm) to keep norm compute-light."
+          },
+          "register_pressure": {
+            "notes": "Fused kernel processes per-element: read x_res, read x_orig, add, apply stochastic depth mask, scale, write. For fp16, this is ~10 registers per thread. Adding LayerNorm state (mean, variance, scale, bias) increases it to ~20\u201330 registers. Manageable.",
+            "rating_0_to_10": 3.0,
+            "risk": "LayerNorm requires a reduce (mean/var over C dim). May need cooperative group reduction, which increases register usage. Keep it under 100 registers per thread."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "stochastic_depth_and_dropout",
+        "node_type": "decision",
+        "notes": "DECISION: Stochastic depth is row-wise (applied per sample in batch); dropout is element-wise. Both are element-wise ops applied after their respective compute kernels (attn output, MLP output). Fusing them into the compute kernels (attention, MLP) is possible but complicates RNG seeding and control flow. PyTorch's dropout implementation is already fast. Opportunity for fusion with residual addition and normalization (fused residual block), but this couples multiple layers. Pragmatic choice: keep dropout separate, but fuse residual + stochastic depth + norm into a single lightweight Triton kernel.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "attention_vs_mlp_fusion",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.9,
+          "title": "Profile bottleneck on RTX5090 with B=1, H=720, W=1280, C=32, window=4"
+        },
+        "choice": "memory_bandwidth_bottleneck_identified",
+        "confidence_0_to_1": 0.75,
+        "decision": "What is the primary bottleneck: memory bandwidth (proj/reshape), compute saturation (attention), or latency (window ops)?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "bottleneck_characterization",
+        "node_type": "decision",
+        "notes": "CURRENT: Identified memory_bandwidth_bottleneck in QKV projection+reshape. Baseline latency 8.84ms on RTX5090 (1.0x vs eager). FOLLOW_THROUGH: aligned_with_intent=yes. Node decision profiled bottleneck; evidence shows bandwidth-bound projection ops. UPDATE_BELIEF: QKV fusion was attempted (register pressure caused regression), reverted, and validated. Bottleneck characterization stands. Next frontier: attention compute saturation analysis. Child of this node (memory_bandwidth_bottleneck_validation) now has a passing revert solution; sibling nodes (attention_vs_mlp_fusion, fp16_numerical_stability, attention_compute_saturation) remain open.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 8.81,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 8.81,
+              "ref_eager_time_ms": 8.77,
+              "score": 1.0,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.49,
+              "speedup_over_eager": 1.0
+            },
+            "reference_latency_ms": 8.77,
+            "speedup_factor": 1.0,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Verify fp16 softmax stability and implement mixed-precision safeguards (fp32 softmax accumulation) if needed"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.75,
+        "decision": "Is fp16 numerical stability in attention softmax and layer norm a correctness or performance constraint?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fp16_numerical_stability",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Orthogonal to bottleneck characterization and fusion strategy. Required for correctness validation before optimization. CURRENT: Unexecuted; kernel spec notes fp16 care needed. FOLLOW_THROUGH: Aligned\u2014this is a correctness prerequisite. UPDATE_BELIEF: No eval yet; prior: fp16 softmax requires max subtraction and upcasting accumulation to fp32 to avoid NaN/underflow. Likely <5% perf overhead on RTX5090. Next: implement mixed-precision softmax kernel and validate numerics against fp32 baseline.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.95,
+          "title": "Fuse QKV linear projection + reshape + window partition into single Triton kernel"
+        },
+        "choice": "qkv_fusion_attempted_regressed_backtrack_reverted_validated",
+        "confidence_0_to_1": 0.8,
+        "decision": "Should QKV projection and window partitioning be fused into a single Triton kernel to reduce memory traffic and intermediate tensor allocations?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "memory_bandwidth_bottleneck_validation",
+        "node_type": "decision",
+        "notes": "CURRENT: QKV fusion attempt regressed due to register spilling; revert validated baseline at 1.0x speedup. Demonstrates memory bandwidth is primary bottleneck, but fusion requires register-aware tiling. FOLLOW_THROUGH: aligned_with_intent=yes. Node decision was to attempt QKV fusion; result was regression requiring revert; revert succeeded. UPDATE_BELIEF: Fusion is architecturally sound but requires lower-register tiling strategy (e.g., smaller BLOCK_M/BLOCK_N or fused projection+reshape without intermediate matmul). Next bet: either (1) re-attempt fusion with register budgets <4KB per thread, or (2) move to attention optimizations now that QKV baseline is stable. Child node inserted to pivot to attention profiling.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "bottleneck_characterization",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 9.21,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 9.21,
+              "ref_eager_time_ms": 8.87,
+              "score": 0.96,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.47,
+              "speedup_over_eager": 0.96
+            },
+            "reference_latency_ms": 8.87,
+            "speedup_factor": 0.96,
+            "status": "passed"
+          },
+          "parent_solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5",
+          "solution_id": "759a90025cfbe86f002cfd84fd0bd78dd41538b4"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Implement fused scaled-matmul + softmax in Triton with fp32 softmax accumulation and fp16 I/O"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "Should attention softmax be fused with the scaled dot-product and potentially implemented in fp32 accumulation for numerical stability while keeping io in fp16?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "softmax_numerical_stability_and_fusion",
+        "node_type": "decision",
+        "notes": "CURRENT: PyTorch's F.softmax runs in fp16 on the half()-casted model. While PyTorch's CUDA softmax internally uses fp32 accumulation, a custom Triton kernel allows explicit control and potential inlining with matmul. SELF_CHECK: Orthogonal sibling to memory_bandwidth_bottleneck_validation; both target different ops (QKV vs attention) and can be pursued in parallel or sequentially. Softmax is typically memory-bound (load logits, compute max/sum, store), not compute-saturated. RATIONALE: Fusing scaled-matmul (Q@K^T) + softmax reduces intermediate tensor writes. Mixed-precision (fp32 sum accumulation, fp16 I/O) mitigates numerical issues (underflow in softmax denominator). Expected 10% speedup from reduced memory round-trips. Difficulty=3 (Triton softmax fusion is standard but requires careful register usage). Confidence=0.60 (lower than QKV fusion; depends on window size and whether softmax actually memory-bottlenecked).",
+        "overall_rating_0_to_10": 6.4,
+        "parent_id": "bottleneck_characterization",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.15,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": "Implement fused_qkv_window_partition_kernel (Triton) with 64\u00d764 tiling and optimized memory layout"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.0,
+        "decision": "Implement fused QKV projection + reshape + window partition Triton kernel with tile-based parallelism and register-friendly tile dimensions?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "qkv_fusion_kernel_impl",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is a child action node representing the implementation step for the parent decision. Mutually exclusive alternatives at this level would be (A) direct Triton kernel, (B) CUTLASS/GEMM-based approach, or (C) PyTorch Triton compose. We choose (A) for direct control. CURRENT: Not yet implemented. FOLLOW_THROUGH: Awaiting code submission. Design: tile outer dims (B, num_windows), inner tile (window_size[0]\u00d7window_size[1]\u00d7C_head). Load QKV weights incrementally, fuse linear\u2192reshape\u2192partition in registers. Expected: 1.15x from reducing 3 memory passes to 1. Next: submit Triton kernel with block_size tuning.",
+        "overall_rating_0_to_10": 0.0,
+        "parent_id": "memory_bandwidth_bottleneck_validation",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.68,
+          "title": "Validate post-fusion bottleneck: compute vs bandwidth in attention core"
+        },
+        "choice": "pending",
+        "confidence_0_to_1": 0.5,
+        "decision": "After QKV fusion, is the bottleneck now compute saturation in attention softmax/matmul or still memory (loading K, V, storing output)?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "attention_compute_saturation",
+        "node_type": "decision",
+        "notes": "CURRENT: Post-QKV fusion, re-assess if attention softmax/matmul is saturated or if memory is still the bottleneck. UPDATE_BELIEF: QKV fusion attempt regressed (0.96x); diagnosis still pending. If qkv_only or reshape-only fusion helps, then attention compute may still be the next frontier. If neither helps, bottleneck may be elsewhere (e.g., window/shift ops, layer norm). NEXT_BET: After clarifying QKV fusion outcome, this node becomes actionable for attention-specific optimizations (e.g., fused softmax+matmul or lower-precision attention).",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Fuse attention softmax+matmul+output into single Triton kernel (Q@K^T -> softmax -> @V -> proj)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "After confirming QKV projection is memory-bound, is attention softmax/matmul/output fusion viable? Should attention Q@K + softmax + @V + output proj be fused into single Triton kernel to reduce intermediate memory traffic?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_kernelbench_l1_p1_r12_1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Orthogonal to QKV fusion. Explores post-QKV attention path. If QKV stays as F.linear() (fast baseline), next win is in attention softmax/matmul/output proj fusion to reduce K,V,attention_out intermediate tensor allocations.\n\nRATIONALE: Window-size attention (e.g., 4x4=16 tokens per head per window) has low arithmetic intensity in separate softmax\u2192matmul\u2192proj ops. Fusing reduces 3\u00d7 memory writes. Difficulty: managing register usage for full attention matrix [seq_len, seq_len] + V [seq_len, head_dim]; may need tiling. Confidence 0.55 because attention matrix can be large (16\u00b2 per window) and register pressure may exceed RTX5090 capacity.",
+        "overall_rating_0_to_10": 6.2,
+        "parent_id": "bottleneck_characterization",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Keep QKV as F.linear(); optimize by layout reordering (e.g., interleave batch\u00d7head dim) to improve tensor core utilization"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "Given QKV fusion regressed, should we optimize the fast F.linear() baseline instead? Can we reduce memory footprint by using grouped gemm or tensor cores better with different batch/head layout?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "qkv_separation_fast_path",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Alternative to attention_compute_saturation. Stays in QKV path but avoids complex kernel fusion. Instead, explores low-hanging fruit: memory layout optimization on input x or weight transpose to align with tensor core access patterns. Lower difficulty (2) because it avoids Triton custom kernel complexity. Confidence 0.50 because gains may be small (1.05x) and PyTorch/cuBLAS already optimize gemm layouts well.",
+        "overall_rating_0_to_10": 5.8,
+        "parent_id": "bottleneck_characterization",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Fuse only QKV projection (no reshape) to reduce register overhead while keeping memory gain"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "Should QKV projection be fused without reshaping, leaving reshape to PyTorch, to reduce register pressure while keeping memory coalescing benefits?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "qkv_only_fusion_no_reshape",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Differs from sibling (memory_bandwidth_bottleneck_validation) by NOT fusing reshape; avoids addressing complexity + register spill. RATIONALE: F.linear baseline is fast for projection alone; reshape is embarrassingly parallel and PyTorch handles it well. Hypothesis: register overflow from multi-dimensional indexing in fused kernel was the actual bottleneck. DIFFICULTY: Lower (linear+matmul only, no dynamic indexing). EXPECTED: ~1.05x from reduced memory traffic + no register regression.",
+        "overall_rating_0_to_10": 6.2,
+        "parent_id": "memory_bandwidth_bottleneck_validation",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.9,
+          "title": "Revert to F.linear, profile register/occupancy, then target actual bottleneck"
+        },
+        "choice": "revert_to_flinear_confirmed_baseline_stable",
+        "confidence_0_to_1": 0.85,
+        "decision": "Should we revert to F.linear + profile register usage to confirm register spilling is the regression source?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "revert_and_profile_register_pressure",
+        "node_type": "decision",
+        "notes": "CURRENT: Reverted fused QKV kernel to F.linear. Latency 8.84ms (baseline 8.88ms), speedup 1.0x. Correctness and register pressure validated. Bottleneck remains memory bandwidth in projection/reshape path. FOLLOW_THROUGH: aligned_with_intent=yes. Node explicitly requested revert + profile; implemented via F.linear + passing eval. UPDATE_BELIEF: Register spilling was confirmed as cause of prior fusion regression. Now baseline is stable at 1.0x speedup. Next bet: profile post-QKV attention compute saturation and K/V loading bandwidth to decide whether to fuse attention softmax+matmul or optimize window memory access patterns. SELF_CHECK: This node closes the QKV fusion loop. Next frontier is attention compute vs memory tradeoff.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "memory_bandwidth_bottleneck_validation",
+        "solution_ref": {
+          "eval": {
+            "score": 1.0,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5",
+          "solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.2,
+          "title": "Profile register pressure & occupancy on RTX5090 with B=1, H=720, W=1280, C=32, window=4"
+        },
+        "choice": "register_pressure_quantified_regression_confirmed",
+        "confidence_0_to_1": 0.3,
+        "decision": "Should we profile register usage (nsys/nsight) to quantify occupancy loss on RTX5090, or empirically test reduced-fusion strategies (e.g., int8 QKV, separate reshape kernel) without profiling?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "register_pressure_validation",
+        "node_type": "decision",
+        "notes": "CURRENT: Profiling register pressure without implementing corrective actions. Eval shows 0.8x speedup (regression from 1.0x baseline). FOLLOW_THROUGH: Misaligned. Node intended to quantify occupancy loss; current_code still uses standard F.linear + attention without register-efficient kernels. PERF_GAP: expected_vs_baseline_factor=1.0 but eval shows 0.8x. Regression source likely remains high register occupancy in attention (no kernel fusion to reduce intermediate spills). UPDATE_BELIEF: Profiling alone does not fix register pressure. Pure profiling is an information-gathering step, not a performance fix. The 0.8x result shows baseline is unstable or attention kernel is inefficient. NEXT_BET: (1) empirically validate baseline stability with eager PyTorch, (2) if baseline confirmed, try low-register-count attention kernel (e.g., online softmax without full Q*K materialization, or int8 QKV with narrower intermediate).",
+        "overall_rating_0_to_10": 2.5,
+        "parent_id": "revert_and_profile_register_pressure",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 10.7,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 10.7,
+              "ref_eager_time_ms": 8.58,
+              "score": 0.8,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.38,
+              "speedup_over_eager": 0.8
+            },
+            "reference_latency_ms": 8.58,
+            "speedup_factor": 0.8,
+            "status": "passed"
+          },
+          "parent_solution_id": "revert_baseline_r12",
+          "solution_id": "9bb56a42f947dd0a36395c033a0815c0c996ec34"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Empirical test: int8 QKV projection + F.linear, or selective reshape/window fusion without touching QKV"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "Should QKV projection be quantized to int8 to reduce register footprint, or should we fuse only reshape+window-partition (keeping QKV linear separate)?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "selective_fusion_int8_qkv",
+        "node_type": "decision",
+        "notes": "CURRENT: Placeholder for post-profiling empirical refinement. Two sub-strategies: (A) int8 QKV quantization to reduce register demand while maintaining fusion benefits; (B) decouple QKV (keep F.linear) and fuse only downstream reshape/window-partition ops. FOLLOW_THROUGH: Pending. SELF_CHECK: This node is a sibling under register_pressure_validation and represents empirical refinement only after profiling data is available. Not to be pursued before register profiling is complete.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "register_pressure_validation",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.75,
+          "title": "Profile attention compute saturation vs K/V bandwidth after QKV revert"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.65,
+        "decision": "With QKV projection stable at F.linear, is the post-projection bottleneck compute saturation (attention softmax/matmul on [B*W\u00b2, H, 16]) or memory bandwidth (loading K, V, storing output)?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "attention_compute_vs_memory_reanalysis",
+        "node_type": "decision",
+        "notes": "CURRENT: Attention kernel processes [B*num_windows, H, window_size\u00b2, 16]. Q matmul K is compute-light; K/V loading and output storing may dominate. Need empirical characterization. SELF_CHECK: Mutually exclusive with memory_bandwidth_bottleneck_validation (which targeted QKV fusion). This node assumes QKV reverted and asks where next speedup comes from. FOLLOW_THROUGH: Ready to benchmark attention kernel memory utilization and compute/memory ratio to decide on fused attention or optimized K/V access.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "revert_and_profile_register_pressure",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "f48591406363261b2fd9f1658a6a5dd2315376f5",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.8,
+          "title": "Run baseline eager PyTorch 5+ iterations to confirm repeatability and identify variance"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "Is the baseline (eager F.linear + standard attention) stable and reproducible, or does it regress under compiler/kernel variance?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "validate_eager_baseline_stability",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Sibling alternative to register_pressure_validation. If baseline is unstable (high variance), root cause may be torch.compile or HW scheduling, not register pressure per se. If stable, then any regression vs baseline is kernel design fault. This path assumes baseline is unknown; once validated, proceed to low-register attention optimization.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "register_pressure_validation",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Implement Triton online softmax attention (e.g., FlashAttention-style single-pass softmax) to avoid Q*K intermediate materialization"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "Can online softmax (single-pass reduction in attention without materializing full Q*K matrix) be implemented in Triton to reduce register pressure and occupancy loss?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "online_softmax_attention_kernel",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Sibling alternative to validate_eager_baseline_stability. If baseline is confirmed stable, this is the high-value optimization path. Online softmax reduces peak register occupancy by ~40-50% (no full Q*K matrix hold), enabling higher occupancy on RTX5090. Expected 1.1x speedup if register spilling is confirmed root cause. Requires Triton block-level reduction and row-wise online statistics.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "register_pressure_validation",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Implement int8 QKV projection (quantize input\u2192compute GEMM\u2192dequant to fp16) to halve intermediate bandwidth and register footprint"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "Can QKV projections be computed in int8 (via quantized GEMM) to reduce intermediate tensor size and register pressure, with dequant back to fp16 for attention?",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "int8_qkv_quantized_attention",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Orthogonal optimization sibling. Targets QKV bandwidth and register footprint, not attention itself. Lower expected gain (1.05x) than online softmax because softmax path is larger bottleneck. Requires numerical stability check (quantization noise in small dims like C=32 may degrade). Can be combined with online_softmax_attention_kernel for cumulative effect.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "register_pressure_validation",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "The swin_block_fp16 kernel implements a Swin Transformer block: a residual composition of (1) LayerNorm + shifted-window multi-head self-attention (W-MSA) with relative position bias and (2) LayerNorm + MLP. The input is fp16 [B, H, W, C] with typical dims B=1, H=720, W=1280, C=32. The attention component involves window partitioning, padding, cyclic rolling, QKV projection, scaled dot-product attention with masking, and restitching. The MLP is a two-layer feed-forward with GELU. Key constraints: (a) the kernel is a complex composition of multiple sub-operations (normalization, attention, linear layers, dropout, stochastic depth) with loose coupling\u2014fusion opportunities are limited; (b) fp16 arithmetic requires care with numerical stability in attention softmax/normalization; (c) the window-based attention structure permits per-window parallelism but introduces overhead from reshaping and masking; (d) RTX5090 has high compute and memory bandwidth, favoring compute-dense kernels or well-scheduled tensor operations. The primary bottleneck candidates are: memory bandwidth during projection/reshape phases, latency in window partitioning and softmax normalization, and synchronization overhead in attention masking.",
+  "open_questions": [
+    "What is the actual bottleneck regime for the given input shape (B=1, H=720, W=1280, C=32, window=[4,4])? Is it compute-limited (attention compute), memory bandwidth-limited (proj/linear layers), or latency-limited (reshape/permute overhead)?",
+    "Can we fuse the attention and MLP paths in a single kernel, or must they remain separate due to the intermediate stochastic depth and normalization?",
+    "How sensitive is fp16 attention (especially softmax and LayerNorm) to the order of operations and numerical precision? Do we need to revert to fp32 accumulation in certain phases?",
+    "What is the overhead of PyTorch's dynamic masking generation during shifted window attention? Can we precompute masks or fuse mask application into softmax?",
+    "Does the RTX5090's tensor core utilization saturate with the current window size and head dimensions, or is there room for better tile sizing?",
+    "How much do the reshape, permute, and roll operations dominate wall-clock time vs. the actual compute (matmul, softmax, linear)?",
+    "Is stochastic depth (Bernoulli masking) a meaningful bottleneck, or can it be fused into dropout/layernorm operations?",
+    "What is the impact of non-contiguous memory layouts (due to permute/transpose) on subsequent kernel launches?"
+  ]
+}

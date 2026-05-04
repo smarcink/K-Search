@@ -110,7 +110,7 @@ class ScriptConfig(Config):
         # number of trials to run for correctness
         self.num_correct_trials = 5
         # number of trials to run for performance
-        self.num_perf_trials = 100
+        self.num_perf_trials = 1000
         # timeout for each trial
         self.timeout = 300
         # verbose logging
