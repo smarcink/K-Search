@@ -3,6 +3,7 @@ Source: https://github.com/ScalingIntelligence/KernelBench/blob/main/scripts/run
 """
 
 import shutil
+import sys
 import torch
 import pydra
 from pydra import REQUIRED, Config
@@ -265,6 +266,10 @@ def main(config: ScriptConfig):
     if config.ref_origin == "local":
         assert config.ref_arch_src_path != "", "ref_arch_src_path is required"
         ref_arch_src = read_file(config.ref_arch_src_path)
+        # Add reference file's directory to sys.path so relative imports resolve during exec
+        ref_dir = os.path.dirname(os.path.abspath(config.ref_arch_src_path))
+        if ref_dir not in sys.path:
+            sys.path.insert(0, ref_dir)
         print(f"Loaded reference from local file: {config.ref_arch_src_path}")
     elif config.ref_origin == "kernelbench":
         from kernelbench.dataset import construct_kernelbench_dataset
