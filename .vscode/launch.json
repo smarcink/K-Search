@@ -32,6 +32,23 @@
                 "--atol", "1e-2",
                 "--compile-mode", "default"
             ]
+        },
+        {
+            "name": "Compare Conv Pooling fp16 implementations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/conv_pooling_fp16/compare_conv_pooling_fp16.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "conv_pooling_fp16/conv_block_fp16.py",
+                "conv_pooling_fp16/conv_block_fp16_opus47_triton_r12.py",
+                "--warmup", "100",
+                "--iters", "2000",
+                "--atol", "1e-2",
+                "--compile-mode", "default"
+            ]
         }
     ]
 }
