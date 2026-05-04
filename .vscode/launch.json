@@ -44,6 +44,7 @@
             "args": [
                 "conv_pooling_fp16/conv_block_fp16.py",
                 "conv_pooling_fp16/conv_block_fp16_opus47_triton_r12.py",
+                "conv_pooling_fp16/conv_block_fp16_opus47_tldot_r15.py",
                 "--warmup", "100",
                 "--iters", "2000",
                 "--atol", "1e-2",

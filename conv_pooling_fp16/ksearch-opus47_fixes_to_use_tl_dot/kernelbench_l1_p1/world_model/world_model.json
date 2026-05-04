@@ -1,0 +1,551 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 0.718,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 1.13,
+      "speedup_factor": 1.57,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "fused_kernel_tuned",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): supports fp16 tensor cores, large L2, high HBM bw. Conv 3x3 with C_in=16, C_out=32 is small per-element FLOPs => bandwidth-bound likely.",
+            "notes": "Conv has 16*3*3=144 MACs per output channel per spatial pos => 144*32 = 4608 MACs per pixel. Output is 32*720*1280 ~ 30M outputs after pool; small compute, memory dominated.",
+            "rating_0_to_10": 6.0,
+            "risk": "Tensor core utilization low if we don't reformulate as GEMM (im2col)."
+          },
+          "memory_bandwidth": {
+            "notes": "Input 16*720*1280 fp16 ~ 30MB, weights tiny (~9KB), output 32*360*640 fp16 ~ 14MB. BW dominant.",
+            "rating_0_to_10": 7.0,
+            "risk": "Need to fuse conv+bias+relu+avgpool to avoid materializing intermediates."
+          },
+          "register_pressure": {
+            "notes": "Tile sized by spatial block; manageable with C_in=16 unrolled in registers.",
+            "rating_0_to_10": 5.0,
+            "risk": "If tile too large with 32 out_channels accumulators, spills."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: ConvBlock fp16 with quantize=False, integer_forward=False. Forward: conv2d(3x3, pad=1, stride=1, bias=True, in=16, out=32) -> ReLU -> AvgPool2d(2). Input shape (1,16,720,1280) fp16. Output (1,32,360,640) fp16. SECTIONS: 1) Classification: small conv (in=16,out=32,3x3) + elementwise relu + 2x2 avgpool; bandwidth-bound elementwise-stencil mixed. No reductions across batch. 2) Canonical: y[c_out,h,w]=sum_{c_in,kh,kw} x[c_in,h+kh-1,w+kw-1]*W[c_out,c_in,kh,kw]+b[c_out]; relu; pool: avg over 2x2 block. Can fuse all stages: produce 4 conv outputs per output pixel of pool then avg. 3) Layout: NCHW contiguous fp16. Weights 32*16*3*3=4608 fp16 elements, fits in shared/registers. Input read with 3x3 stencil (~9 reads per pixel). 4) Regimes: a) full 720x1280 -> BW-bound; b) tiny H/W -> launch overhead; c) different C -> mapping change. 5) Knobs: tile (BLOCK_H,BLOCK_W) per program covering 2x2 pool stride, tile over C_out (full 32 fits), unroll C_in=16, use shared/const weights, fuse relu+pool. 6) Skeleton: each program computes a tile of pooled output (tile_h,tile_w) for all 32 c_out: load weights (small), load input region (tile_h*2+2)*(tile_w*2+2)*16, compute 4 conv outputs per pool cell, relu, average, store. 7) Families: A) fused conv+relu+avgpool single Triton kernel with weights in registers/const; B) im2col + tensor-core matmul via tl.dot then fused relu+pool; C) two-stage: triton conv->relu and triton avgpool. Family A favored due to small C and BW-bound.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single Triton kernel computing conv2d(3x3,pad=1) + bias + ReLU + AvgPool2d(2) fused. Each program computes a (BLOCK_H, BLOCK_W) tile of pooled output across all 32 output channels. Weights/bias loaded once per program. Use fp16 loads/stores and fp32 accumulation.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.56,
+          "rationale": "Fuses 3 ops, eliminates intermediates ~14MB+30MB, leverages small C_in/C_out fitting in registers.",
+          "score_0_to_1": 0.78,
+          "title": "Fused conv3x3 + bias + ReLU + avgpool2x2 Triton kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "No tensor cores used directly; compute is small enough that scalar FMAs may suffice.",
+            "notes": "tl.dot used for K-reduction; good fp16 tensor-core fit on RTX5090.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Eliminates ~14MB conv-out + pool-in intermediates.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "acc tile (C_OUT=32, CH*CW=16*64=1024) is heavy; BLOCK tuning matters.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fused_kernel",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single Triton kernel fuses conv3x3+bias+ReLU+avgpool2x2 with fp16 loads, fp32 accum, tl.dot over C_IN; produces pooled output directly. bottleneck=likely register pressure / occupancy from large acc tile and possibly HBM bandwidth on weight reloads. FOLLOW_THROUGH: aligned_with_intent=yes; matches the fused-kernel intent. UPDATE_BELIEF: Eval passed at 1.56x eager (0.72ms vs 1.12ms) but only 0.86x torch.compile, suggesting room via better tile/warps tuning, weight prefetch, or persistent scheduling. next bet: tune BLOCK_H/BLOCK_W, num_warps, num_stages and try loading weights once across spatial tiles via persistent or larger tiles.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.72,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.72,
+              "ref_eager_time_ms": 1.12,
+              "score": 1.56,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.86,
+              "speedup_over_eager": 1.56
+            },
+            "reference_latency_ms": 1.12,
+            "speedup_factor": 1.56,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "b9778fb65b8516e6520f698f247d184d96b64708"
+        }
+      },
+      {
+        "action": {
+          "description": "Reformulate conv as implicit GEMM: M=N_pool*4 (or full output), K=C_in*9=144, N=C_out=32. Use tl.dot with fp16 inputs and fp32 accum. Then fuse ReLU and 2x2 avgpool in epilogue.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.8,
+          "rationale": "Leverages tensor cores; but K=144,N=32 are small so utilization limited.",
+          "score_0_to_1": 0.5,
+          "title": "Implicit GEMM family"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Tensor cores need M,N,K multiples; N=32 small, K=144 not power of 2.",
+            "notes": "Padding K to 160 or 144 fine; small N hurts utilization.",
+            "rating_0_to_10": 5.0,
+            "risk": "Possibly slower than fused scalar due to small N."
+          },
+          "memory_bandwidth": {
+            "notes": "Implicit im2col adds read amplification ~9x for input but reuse via shared.",
+            "rating_0_to_10": 6.0,
+            "risk": "Need careful tiling to avoid extra global reads."
+          },
+          "register_pressure": {
+            "notes": "Standard GEMM tiling; predictable.",
+            "rating_0_to_10": 6.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "implicit_gemm",
+        "node_type": "decision",
+        "notes": "Pure GEMM tiling over (C_OUT) x (N*OH*OW), K=C_IN*9. Could exploit tensor cores at fp16. Risk: pooling fusion adds complexity; current fused kernel already at 1.72x. SELF_CHECK: distinct mapping family from fused single-kernel (root child).",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use cuDNN via torch (F.conv2d) for the conv (already optimized), then a single Triton kernel that fuses ReLU + 2x2 AvgPool to avoid two separate kernel launches and one materialization.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.2,
+          "rationale": "Low-risk baseline improvement: cuDNN handles conv well; Triton handles the BW-bound tail.",
+          "score_0_to_1": 0.15,
+          "title": "cuDNN conv + fused ReLU/pool epilogue"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "cuDNN already tuned for fp16 small-channel conv on Blackwell.",
+            "notes": "Low risk; minimal compute issues.",
+            "rating_0_to_10": 7.0,
+            "risk": "cuDNN may already be near optimal; gain limited to fusion of relu+pool."
+          },
+          "memory_bandwidth": {
+            "notes": "Saves one read+write of conv output (~14MB).",
+            "rating_0_to_10": 7.0,
+            "risk": "Low."
+          },
+          "register_pressure": {
+            "notes": "Trivial for elementwise+pool kernel.",
+            "rating_0_to_10": 9.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "hybrid_cudnn",
+        "node_type": "decision",
+        "notes": "Dominated by fused_kernel_tuned (1.72x) and fused_kernel_tc_dot (1.57x). At N=1 cuDNN launch + extra DRAM roundtrip unlikely to beat single fused kernel. Deprioritized.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.72,
+          "rationale": "",
+          "score_0_to_1": 0.8,
+          "title": "Tuned BLOCK_H/BLOCK_W, num_warps, num_stages for fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fused_kernel_tuned",
+        "node_type": "decision",
+        "notes": "Best leaf so far: 1.72x speedup, 0.762ms. Bottleneck likely tensor-core utilization (acc fp32 with fp16 inputs - check tl.dot dtype path) and weight reload across tiles.",
+        "overall_rating_0_to_10": 7.8,
+        "parent_id": "fused_kernel",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.762,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.762,
+              "ref_eager_time_ms": 1.31,
+              "score": 1.72,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.77,
+              "speedup_over_eager": 1.72
+            },
+            "reference_latency_ms": 1.31,
+            "speedup_factor": 1.72,
+            "status": "passed"
+          },
+          "parent_solution_id": "b9778fb65b8516e6520f698f247d184d96b64708",
+          "solution_id": "3bc8c3f426b64b460962084e6a45185959cb9785"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.56,
+          "rationale": "",
+          "score_0_to_1": 0.4,
+          "title": "Persistent CTA: launch num_SMs blocks iterating tile list, weights/bias preloaded once"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fused_kernel_persistent",
+        "node_type": "decision",
+        "notes": "CURRENT: fused conv3x3+bias+ReLU+avgpool2x2 in single Triton kernel using tl.dot over C_IN, tile (BLOCK_H=8,BLOCK_W=32) producing 16x64 conv tile pooled to 8x32. bottleneck: compute/register pressure (acc shape C_OUT x CH*CW with C_OUT up to 64+).\nFOLLOW_THROUGH: no. expected intent was persistent CTA loop over tile list with weight preload; actual code is non-persistent grid-launch kernel. Downgrading.\nUPDATE_BELIEF: eval shows 1.56x (no improvement over fused_kernel parent). Persistent rewrite never landed; tuned variant (sibling) reached 1.72x and is current best. Next bet: focus refinements under fused_kernel_tuned (fp16 tl.dot, k-reduce) rather than persistent rewrite.\nSELF_CHECK: excludes fused_kernel_tuned because that path keeps grid-launch with tuned BLOCK/warps; persistent would replace grid scheme.",
+        "overall_rating_0_to_10": 4.5,
+        "parent_id": "fused_kernel",
+        "solution_ref": {
+          "eval": {
+            "score": 1.56,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "3bc8c3f426b64b460962084e6a45185959cb9785",
+          "solution_id": "current"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.95,
+          "rationale": "",
+          "score_0_to_1": 0.45,
+          "title": "Cast w_tile/x_flat to fp16 for tl.dot with fp32 accumulator (TC utilization)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fused_kernel_tc_dot",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Fused conv3x3+bias+ReLU+avgpool2x2 in one Triton kernel using 9 tl.dot ops (K=C_IN each), fp16 in/out, fp32 accumulate. bottleneck: compute/TC utilization (small K per dot). FOLLOW_THROUGH: aligned_with_intent: yes - tiles are already fp16 and tl.dot uses fp32 accumulator. UPDATE_BELIEF: Eval gave 1.57x, slightly worse than fused_kernel_tuned 1.72x; the fp16 cast path didn't help because K=C_IN may already be small and 9 separate dots underutilize TCs regardless of dtype. Next bet: collapse the 9 K-dim dots into a single K=C_IN*9 dot (im2col gather) to grow K and improve TC utilization. PERF_GAP: expected 1.95x vs observed 1.57x; reason: per-dot K too small to benefit from TC, dtype already fp16.",
+        "overall_rating_0_to_10": 4.5,
+        "parent_id": "fused_kernel_tuned",
+        "solution_ref": {
+          "eval": {
+            "score": 1.57,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "3bc8c3f426b64b460962084e6a45185959cb9785",
+          "solution_id": "e1132882a9e53df09bdb3963b8cb5c932123b6f9"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.95,
+          "rationale": "",
+          "score_0_to_1": 0.75,
+          "title": "Single tl.dot with K=C_IN*9 via im2col gather"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.65,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fused_kernel_kreduce",
+        "node_type": "decision",
+        "notes": "Replace 9 small tl.dot calls (K=C_IN) with one tl.dot of K=C_IN*9 via im2col gather of [C_IN*9, CH*CW] tile. Larger K should saturate tensor cores; risk is register pressure and shared memory for the gathered tile. SELF_CHECK: distinct from fused_kernel_tc_dot (dtype-only) and fused_kernel_persistent (scheduling) since this changes the GEMM shape itself.",
+        "overall_rating_0_to_10": 7.6,
+        "parent_id": "fused_kernel_tuned",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "3bc8c3f426b64b460962084e6a45185959cb9785",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.9,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Actually implement persistent kernel: grid=num_SMs, internal tile-id loop, preload weights/bias"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fused_kernel_persistent_real",
+        "node_type": "decision",
+        "notes": "CHILD of fused_kernel_persistent (which did not actually change code). Implement: grid=(NUM_SMS,), each CTA loops over tile_id in [pid, num_tiles, NUM_SMS), loads weights+bias once into registers/shared, processes all assigned tiles. Goal: amortize weight loads and reduce scheduling overhead. SELF_CHECK: only one persistent variant; mutually exclusive vs non-persistent siblings.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "fused_kernel_persistent",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "current",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.85,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Grid swizzle + L2-friendly tile order for fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "fused_kernel_swizzle",
+        "node_type": "decision",
+        "notes": "Reorder program_id mapping (e.g., super-grouping along OW then OH) to improve L2 reuse of weight loads across tiles. SELF_CHECK: distinct from fused_kernel_kreduce (algorithmic GEMM restructure) and fused_kernel_tc_dot (dtype/dot change); this only changes launch grid mapping, mutually exclusive in tactic.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "fused_kernel_tuned",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "3bc8c3f426b64b460962084e6a45185959cb9785",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.5,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 30,
+        "node_id": "node_kernelbench_l1_p1_r30_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 4.5,
+        "parent_id": "fused_kernel_tc_dot",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "e1132882a9e53df09bdb3963b8cb5c932123b6f9",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused fp16 conv-block: Conv2d(in=16,out=32,k=3,pad=1,stride=1,bias=True) -> ReLU -> AvgPool2d(2x2) on input (1,16,720,1280). Bandwidth-bound due to small channel counts and tiny weight tensor (~9KB). Output is (1,32,360,640) fp16 (~14MB). Key opportunity is to fuse all three ops in a single Triton kernel, hold weights in registers/constant, and avoid materializing the conv and post-relu intermediates. Tensor core use offers limited gains because N=C_out=32 is small. Main constraints: zero padding, fp16 dtype with fp32 accumulation, and per-program register budget when tiling across (H,W) and 32 output channels.",
+  "open_questions": [
+    "Is the conv weight tensor stable across calls (constant) so it can be cached/pre-loaded into a fp16 const buffer?",
+    "What is cuDNN's baseline latency on RTX5090 for this conv shape (to estimate headroom)?",
+    "Can we tile fully across all 32 output channels in registers, or must we tile c_out (e.g., 16+16)?",
+    "Will fp32 accumulation be required for numerical match, or does fp16 accum pass tolerance?",
+    "Best (BLOCK_H, BLOCK_W) for pooled output: tradeoff between halo reuse and register pressure?",
+    "Does padding_mode='zeros' allow us to use boundary masks efficiently without branching?",
+    "Are there alignment guarantees on H,W (720,1280 are divisible by 16/32) that enable vectorized loads?",
+    "Should bias be loaded into shared memory once per program or broadcast via tl.load each tile?"
+  ]
+}

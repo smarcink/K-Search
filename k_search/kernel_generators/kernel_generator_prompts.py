@@ -11,6 +11,20 @@ CUDA_OPTIMIZATION_HINTS = "** You MUST use MMA to utilize the tensor cores on H1
 # Triton-appropriate subset
 TRITON_OPTIMIZATION_HINTS = """
 ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
+
+Key Triton performance principles:
+- Use tl.dot() for any reduction/inner-product dimension >= 16 to leverage GPU tensor cores.
+  Scalar FMA loops (wv * xv in tl.static_range) use only CUDA cores and are much slower.
+- For convolutions, consider the implicit-GEMM approach: reshape the convolution as a
+  matrix multiplication (im2col-style or direct) and use tl.dot() on [K, N] x [N, M] tiles.
+- Stage data through shared memory (SRAM): load input tiles with tl.load into a block,
+  then use tl.dot for the compute. This maximizes data reuse and hides memory latency.
+- If your custom kernel cannot beat torch.compile, you likely need a fundamentally
+  different algorithm (not just tile-size tuning). torch.compile uses cuDNN/tensor-cores
+  internally for standard ops like conv2d.
+- Fusing elementwise ops (bias, activation, pooling) into the matmul epilogue is where
+  custom Triton kernels can beat torch.compile — but only if the matmul itself uses
+  tensor cores via tl.dot.
 """
 
 
