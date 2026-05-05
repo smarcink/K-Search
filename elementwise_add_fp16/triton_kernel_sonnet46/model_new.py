@@ -51,7 +51,7 @@ class ModelNew(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-
+    
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # Ensure contiguous layout
         x = x.contiguous()

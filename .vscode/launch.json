@@ -37,37 +37,40 @@
             "name": "Compare Conv Pooling fp16 implementations",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/conv_pooling_fp16/compare_conv_pooling_fp16.py",
+            "program": "${workspaceFolder}/compare_kernels.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "python": "${workspaceFolder}/.venv/bin/python",
             "args": [
                 "conv_pooling_fp16/conv_block_fp16.py",
-                "conv_pooling_fp16/conv_block_fp16_opus47_triton_r12.py",
-                "conv_pooling_fp16/conv_block_fp16_opus47_tldot_r15.py",
-                "conv_pooling_fp16/conv_block_fp16_cudnn_triton_relupool.py",
+                "conv_pooling_fp16/triton_opus47_r12",
+                "conv_pooling_fp16/triton_opus47_tldot_r15",
+                "--precision", "fp16",
+                "--compile-mode", "default",
                 "--warmup", "100",
                 "--iters", "2000",
                 "--atol", "1e-2",
-                "--compile-mode", "default"
+                "--shape", "64", "360", "640"
             ]
         },
         {
             "name": "Compare Elementwise ADD fp16 implementations",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/elementwise_add_fp16/compare_elementwise_add_fp16.py",
+            "program": "${workspaceFolder}/compare_kernels.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "python": "${workspaceFolder}/.venv/bin/python",
             "args": [
-                "elementwise_add_fp16/elementwise_add_fp16.py",
+                "elementwise_add_fp16/elementwise_add_fp16.py",  // path to reference
                 "elementwise_add_fp16/ksearch-sonnet46_cuda_kernel",
                 "elementwise_add_fp16/triton_kernel_sonnet46",
+                "--precision", "fp16",
+                "--compile-mode", "default",
                 "--warmup", "100",
-                "--iters", "2000",
+                "--iters", "4000",
                 "--atol", "1e-2",
-                "--compile-mode", "default"
+                //"--shape", "64", "1024", "1024"
             ]
         }
     ]

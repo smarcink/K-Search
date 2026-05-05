@@ -1,19 +1,22 @@
-"""
-Compare kernel solutions against the reference for elementwise_add_fp16.
+"""Generic kernel comparison script.
 
-Supports both CUDA (kernel.h + kernel.cu + main.cpp) and Triton (model_new.py
-with ModelNew class) solutions.
-
-Can accept:
-  - K-Search artifacts directories (scans for solution JSONs)
-  - Directories containing kernel.h / kernel.cu / main.cpp directly
-  - Directories containing model_new.py directly
+Compares optimized kernel solutions (CUDA or Triton) against a reference
+PyTorch model. Works with any task that follows the K-Search convention:
+  - Reference .py file with: Model class, get_inputs(), get_init_inputs()
+  - CUDA solutions: kernel.h / kernel.cu / main.cpp (or K-Search artifacts)
+  - Triton solutions: model_new.py with ModelNew class (or K-Search artifacts)
 
 Usage:
-    python elementwise_add_fp16/compare_elementwise_add_fp16.py
-    python elementwise_add_fp16/compare_elementwise_add_fp16.py elementwise_add_fp16/ksearch-sonnet46_cuda_kernel
-    python elementwise_add_fp16/compare_elementwise_add_fp16.py elementwise_add_fp16/ksearch-sonnet46_triton
-    python elementwise_add_fp16/compare_elementwise_add_fp16.py /path/to/kernel_dir1 /path/to/kernel_dir2
+    # Compare extracted kernel dirs against a reference
+    python compare_kernels.py path/to/reference.py path/to/cuda_dir path/to/triton_dir
+
+    # Compare K-Search artifacts directories
+    python compare_kernels.py path/to/reference.py path/to/ksearch-artifacts1 path/to/ksearch-artifacts2
+
+    # With options
+    python compare_kernels.py path/to/reference.py path/to/kernels \\
+        --precision fp16 --compile-mode default --shape 64 1024 1024 \\
+        --warmup 100 --iters 2000
 """
 
 from __future__ import annotations
@@ -28,17 +31,19 @@ from typing import Any
 
 import torch
 import torch.utils.cpp_extension
+from torch import nn
 
-# Reference file path (relative to this script)
-SCRIPT_DIR = Path(__file__).parent
-DEFAULT_REF = SCRIPT_DIR / "elementwise_add_fp16.py"
+SEED = 42
 
-# Default artifacts/kernel dirs to scan
-DEFAULT_ARTIFACTS = [
-    str(SCRIPT_DIR / "ksearch-sonnet46_cuda_kernel"),
-    str(SCRIPT_DIR / "cuda_kernel_sonnet_46"),
-    str(SCRIPT_DIR / "ksearch-sonnet46_triton"),
-]
+
+def _copy_weights(dst: nn.Module, src: nn.Module) -> None:
+    """Copy matching parameters/buffers from src to dst (non-strict)."""
+    src_state = src.state_dict()
+    if not src_state:
+        return
+    missing, unexpected = dst.load_state_dict(src_state, strict=False)
+    if missing:
+        print(f"    [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
 
 
 def load_reference(ref_path: Path, precision: str = "fp16"):
@@ -58,7 +63,7 @@ def load_reference(ref_path: Path, precision: str = "fp16"):
     dtype = dtype_map.get(precision, torch.float16)
 
     model = model_cls(*get_init_inputs_fn()).to(dtype=dtype, device="cuda").eval()
-    return model, get_inputs_fn, dtype
+    return model, get_inputs_fn, get_init_inputs_fn, dtype
 
 
 def compile_kernel(kernel_h: str, kernel_cu: str, main_cpp: str, name: str = "kernel") -> Any:
@@ -84,12 +89,26 @@ def compile_kernel(kernel_h: str, kernel_cu: str, main_cpp: str, name: str = "ke
     return module
 
 
+def load_triton_model(code: str, init_inputs: list, dtype, name: str = "triton"):
+    """Load a triton/python ModelNew from source code string."""
+    tmp_dir = tempfile.mkdtemp(prefix=f"compare_triton_{name}_")
+    model_path = Path(tmp_dir) / "model_new.py"
+    model_path.write_text(code)
+
+    mod_globals: dict = {}
+    exec(compile(code, str(model_path), "exec"), mod_globals)
+
+    model_cls = mod_globals["ModelNew"]
+    model = model_cls(*init_inputs).to(dtype=dtype, device="cuda").eval()
+    return model
+
+
 def collect_kernels(paths: list[str]) -> list[dict]:
     """Collect kernel sources from artifacts dirs or direct kernel dirs.
 
     Returns list of dicts with either:
-      - type='cuda', kernel_h, kernel_cu, main_cpp  (CUDA kernels)
-      - type='triton', model_new_code  (Triton/Python kernels with ModelNew)
+      - type='cuda', kernel_h, kernel_cu, main_cpp
+      - type='triton', model_new_code
     """
     kernels = []
 
@@ -153,23 +172,9 @@ def collect_kernels(paths: list[str]) -> list[dict]:
     return kernels
 
 
-def load_triton_model(code: str, init_inputs: list, dtype, name: str = "triton"):
-    """Load a triton/python ModelNew from source code string."""
-    tmp_dir = tempfile.mkdtemp(prefix=f"compare_triton_{name}_")
-    model_path = Path(tmp_dir) / "model_new.py"
-    model_path.write_text(code)
-
-    mod_globals: dict = {}
-    exec(compile(code, str(model_path), "exec"), mod_globals)
-
-    model_cls = mod_globals["ModelNew"]
-    model = model_cls(*init_inputs).to(dtype=dtype, device="cuda").eval()
-    return model
-
-
 @torch.inference_mode()
-def benchmark_reference(model, inputs: list[torch.Tensor], warmup: int, iters: int) -> tuple[float, torch.Tensor]:
-    """Benchmark the reference model, return (ms_per_iter, output)."""
+def benchmark_model(model, inputs: list[torch.Tensor], warmup: int, iters: int) -> tuple[float, torch.Tensor]:
+    """Benchmark a model (reference or triton ModelNew), return (ms_per_iter, output)."""
     for _ in range(warmup):
         out = model(*inputs)
     torch.cuda.synchronize()
@@ -184,8 +189,9 @@ def benchmark_reference(model, inputs: list[torch.Tensor], warmup: int, iters: i
     return start.elapsed_time(end) / iters, out
 
 
-def benchmark_kernel(module, inputs: list[torch.Tensor], warmup: int, iters: int) -> tuple[float, torch.Tensor]:
-    """Benchmark a compiled kernel module, return (ms_per_iter, output)."""
+@torch.inference_mode()
+def benchmark_cuda_module(module, inputs: list[torch.Tensor], warmup: int, iters: int) -> tuple[float, torch.Tensor]:
+    """Benchmark a compiled CUDA module (with .run()), return (ms_per_iter, output)."""
     for _ in range(warmup):
         out = module.run(*inputs)
     torch.cuda.synchronize()
@@ -198,7 +204,6 @@ def benchmark_kernel(module, inputs: list[torch.Tensor], warmup: int, iters: int
     end.record()
     torch.cuda.synchronize()
 
-    # Normalize output
     if isinstance(out, (list, tuple)):
         out = out[0] if len(out) == 1 else torch.cat([o.flatten() for o in out])
     return start.elapsed_time(end) / iters, out
@@ -217,10 +222,17 @@ def diff(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare CUDA kernels for elementwise_add_fp16")
-    parser.add_argument("paths", nargs="*", default=DEFAULT_ARTIFACTS,
-                        help="Artifacts dirs or kernel dirs to compare")
-    parser.add_argument("--ref", default=str(DEFAULT_REF), help="Reference .py file")
+    parser = argparse.ArgumentParser(
+        description="Compare optimized kernels against a reference model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  %(prog)s ref.py cuda_dir/ triton_dir/
+  %(prog)s ref.py ksearch-artifacts/ --compile-mode default
+  %(prog)s ref.py dir1/ dir2/ --shape 64 1024 1024 --precision fp16
+""")
+    parser.add_argument("ref", help="Reference .py file (must define Model, get_inputs, get_init_inputs)")
+    parser.add_argument("paths", nargs="+", help="Kernel dirs or K-Search artifacts dirs to compare")
     parser.add_argument("--precision", default="fp16", choices=["fp32", "fp16", "bf16"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
@@ -235,6 +247,8 @@ def main():
     if not torch.cuda.is_available():
         sys.exit("CUDA is required.")
 
+    torch.manual_seed(SEED)
+
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Precision: {args.precision}  Warmup: {args.warmup}  Iters: {args.iters}")
     if args.compile_mode:
@@ -243,15 +257,13 @@ def main():
 
     # Load reference
     ref_path = Path(args.ref).resolve()
+    if not ref_path.exists():
+        sys.exit(f"Reference file not found: {ref_path}")
     print(f"Reference: {ref_path.name}")
-    model, get_inputs_fn, dtype = load_reference(ref_path, args.precision)
-
-    if args.compile_mode:
-        model = torch.compile(model, mode=args.compile_mode)
+    model, get_inputs_fn, get_init_inputs_fn, dtype = load_reference(ref_path, args.precision)
 
     # Get inputs
     if args.shape:
-        # Override: create inputs with the specified shape (same count as get_inputs)
         orig_inputs = get_inputs_fn()
         num_tensors = sum(1 for x in orig_inputs if isinstance(x, torch.Tensor))
         inputs = [torch.randn(args.shape, dtype=dtype, device="cuda") for _ in range(num_tensors)]
@@ -260,8 +272,18 @@ def main():
         inputs = [x.to(dtype=dtype, device="cuda") if isinstance(x, torch.Tensor) else x for x in inputs]
     print(f"Input shapes: {[tuple(t.shape) for t in inputs if isinstance(t, torch.Tensor)]}")
 
+    # Compute reference output from EAGER model (for correctness comparison)
+    with torch.inference_mode():
+        ref_out = model(*inputs)
+    torch.cuda.synchronize()
+
+    # Optionally compile reference for timing (compile can change numerics via tf32 etc.)
+    ref_model_for_timing = model
+    if args.compile_mode:
+        ref_model_for_timing = torch.compile(model, mode=args.compile_mode)
+
     # Benchmark reference
-    ref_ms, ref_out = benchmark_reference(model, inputs, args.warmup, args.iters)
+    ref_ms, _ = benchmark_model(ref_model_for_timing, inputs, args.warmup, args.iters)
     print(f"Reference latency: {ref_ms:.4f} ms\n")
 
     # Collect kernels
@@ -272,10 +294,10 @@ def main():
     print(f"Found {len(kernels)} kernel(s) to compare\n")
 
     # Get init_inputs for triton models
-    spec_globals: dict = {}
-    exec(compile(ref_path.read_text(), str(ref_path), "exec"), spec_globals)
-    get_init_inputs_fn = spec_globals["get_init_inputs"]
     init_inputs = get_init_inputs_fn()
+
+    # Collect model parameters for CUDA kernels that may need them
+    model_params = [p.data for p in model.parameters()]
 
     # Benchmark each kernel
     rows: list[tuple[str, float, float, float, float, str]] = []
@@ -289,12 +311,17 @@ def main():
                     kernel["kernel_h"], kernel["kernel_cu"], kernel["main_cpp"],
                     name=f"k{i}",
                 )
-                ms, out = benchmark_kernel(module, inputs, args.warmup, args.iters)
+                # Try run with just inputs first; if it fails, try with model params appended
+                try:
+                    ms, out = benchmark_cuda_module(module, inputs, args.warmup, args.iters)
+                except TypeError:
+                    ms, out = benchmark_cuda_module(module, inputs + model_params, args.warmup, args.iters)
             else:  # triton
                 triton_model = load_triton_model(
                     kernel["model_new_code"], init_inputs, dtype, name=f"k{i}"
                 )
-                ms, out = benchmark_reference(triton_model, inputs, args.warmup, args.iters)
+                _copy_weights(triton_model, model)
+                ms, out = benchmark_model(triton_model, inputs, args.warmup, args.iters)
             max_abs, mse, cos_sim = diff(out, ref_out)
             ok = max_abs <= args.atol
             status = "PASS" if ok else "FAIL"
@@ -302,24 +329,24 @@ def main():
             print(f"{ms:.4f}ms  speedup={ref_ms/ms:.2f}x  {status}")
         except Exception as e:
             err_msg = str(e).split("\n")[0][:80]
-            rows.append((name, float("nan"), float("nan"), float("nan"), float("nan"), f"ERROR"))
+            rows.append((name, float("nan"), float("nan"), float("nan"), float("nan"), "ERROR"))
             print(f"ERROR: {err_msg}")
 
     # Summary table
-    name_w = max(len(r[0]) for r in rows) if rows else 20
+    ref_label = f"[reference] {ref_path.name}"
+    name_w = max(len(ref_label), *(len(r[0]) for r in rows)) if rows else len(ref_label)
     name_w = min(name_w, 60)
     print(f"\n{'='*100}")
     print(f"{'impl':<{name_w}}  {'ms/iter':>10}  {'speedup':>8}  {'max_abs':>11}  {'mse':>11}  {'cos_sim':>10}  status")
     print(f"{'-'*100}")
 
     # Reference row
-    print(f"{'[reference] ' + ref_path.name:<{name_w}}  {ref_ms:>10.4f}  {'1.00x':>8}  {'0.000e+00':>11}  {'0.000e+00':>11}  {'1.000000':>10}  REF")
+    print(f"{ref_label:<{name_w}}  {ref_ms:>10.4f}  {'1.00x':>8}  {'0.000e+00':>11}  {'0.000e+00':>11}  {'1.000000':>10}  REF")
 
     for name, ms, ma, mse_v, cs, status in rows:
         display_name = name[:name_w]
         if ms != ms or ms <= 0:  # nan check
-            speed = "-"
-            print(f"{display_name:<{name_w}}  {'N/A':>10}  {speed:>8}  {'N/A':>11}  {'N/A':>11}  {'N/A':>10}  {status}")
+            print(f"{display_name:<{name_w}}  {'N/A':>10}  {'-':>8}  {'N/A':>11}  {'N/A':>11}  {'N/A':>10}  {status}")
         else:
             speed = f"{ref_ms / ms:.2f}x"
             print(f"{display_name:<{name_w}}  {ms:>10.4f}  {speed:>8}  {ma:>11.3e}  {mse_v:>11.3e}  {cs:>10.6f}  {status}")
