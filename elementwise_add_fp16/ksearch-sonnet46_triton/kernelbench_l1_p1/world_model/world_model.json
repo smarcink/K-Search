@@ -1,0 +1,406 @@
+{
+  "computed_signals": {
+    "round_index": 7,
+    "trace": {
+      "latency_ms": 0.0115,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 0.0125,
+      "speedup_factor": 1.09,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "flat_1d_num_stages",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.85,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 has high memory bandwidth (~1.8 TB/s HBM3e). Elementwise ops are almost entirely bandwidth-bound. SM count ~170, each running 32 warps. FP16 vector width is 128 bits (8 elements) per transaction.",
+            "notes": "Arithmetic intensity ~0.5 FLOPs/byte for fp16 add. Roofline is firmly bandwidth-limited. No meaningful compute to hide.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Total data: 16*256*256*2 bytes * 3 tensors (2 reads + 1 write) = ~48 MB. At 1.8 TB/s theoretical peak, theoretical latency ~26 us. PyTorch eager may underutilize bandwidth due to kernel launch overhead and non-optimal vectorization. Custom Triton kernel can saturate bandwidth with proper tiling.",
+            "rating_0_to_10": 9.0,
+            "risk": "low \u2014 straightforward to saturate bandwidth with coalesced accesses"
+          },
+          "register_pressure": {
+            "notes": "Elementwise kernel with no reuse. Each thread holds a few fp16 values plus index registers. Register pressure is trivially low.",
+            "rating_0_to_10": 1.0,
+            "risk": "negligible"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS SUMMARY:\n1) CLASSIFICATION: Pure elementwise (pointwise) kernel. Output = x + y element-by-element. No reduction, no data-dependent addressing. Dense 1D-flattened access over 16*256*256=1,048,576 fp16 elements. All dims variable but small total volume (~2 MB per input tensor).\n2) CANONICAL MATH: out[i] = x[i] + y[i], for i in [0, N), N=1,048,576. Fully parallel, zero dependencies between outputs. Trivially streamable.\n3) DATA LAYOUT: x,y,out shape [16,256,256] fp16 contiguous. Treat as flat 1D array of N=1,048,576 elements. Dominant cost: 3 global memory transactions (2 reads, 1 write) per element. No reuse possible. Vectorized loads (128-bit = 8 fp16 elements) maximize bandwidth utilization.\n4) BOTTLENECK REGIMES:\n   - Regime A (small N, launch-overhead dominated): N<100K, kernel launch > compute. Not our case.\n   - Regime B (bandwidth-bound, our regime): N~1M, roofline determined by memory BW. Triton with proper BLOCK_SIZE and vectorized loads should saturate ~1.8 TB/s.\n   - Regime C (latency-bound if poorly tiled): Too few blocks or too large BLOCK_SIZE wastes occupancy. Need enough blocks to keep all SMs busy.\n5) DESIGN SPACE: BLOCK_SIZE (256-2048), grid = cdiv(N, BLOCK_SIZE), vectorization via tl.load with fp16, num_warps, autotuning across BLOCK_SIZE values.\n6) SKELETON: Single-phase kernel. Each program handles [pid*BLOCK_SIZE, (pid+1)*BLOCK_SIZE) elements. Load x[offsets], load y[offsets], add, store. Mask for tail. All in registers, no shared memory needed.\n7) CANDIDATE FAMILIES: (A) Flat 1D tiled \u2014 simplest, maps well to hardware; (B) 2D-blocked \u2014 unnecessary complexity; (C) persistent kernel \u2014 overkill for this size.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a flat 1D Triton kernel that treats the input/output tensors as a contiguous 1D array of N=1,048,576 fp16 elements. Each Triton program block processes BLOCK_SIZE consecutive elements using vectorized fp16 loads/stores (tl.load/tl.store with contiguous offsets). Use autotuning over BLOCK_SIZE in {512, 1024, 2048} and num_warps in {4, 8} to find the configuration that saturates RTX5090 memory bandwidth. Apply a boundary mask for the last block. This is the simplest and most likely fastest approach for a pure elementwise op of this size.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.03,
+          "rationale": "Bandwidth-bound elementwise kernels respond primarily to coalesced, vectorized memory access and sufficient occupancy. A flat 1D tiling with large BLOCK_SIZE naturally achieves coalescing. Autotuning finds the sweet spot between block count (SM utilization) and per-block work. PyTorch eager for this op may have overhead from dispatcher and non-optimal vectorization; a dedicated Triton kernel should match or beat it.",
+          "score_0_to_1": 0.72,
+          "title": "Flat 1D Tiled Elementwise Add with Autotuning"
+        },
+        "choice": "flat_1d_autotuned",
+        "confidence_0_to_1": 0.92,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 ~170 SMs. N=1M elements. At BLOCK_SIZE=1024, grid=1024 blocks \u2014 sufficient to keep all SMs busy with multiple waves.",
+            "notes": "Pure bandwidth-bound; compute intensity ~0. RTX5090 bandwidth advantage helps but op is trivial.",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Coalesced 1D access pattern; autotuner selects BLOCK_SIZE. Near bandwidth ceiling for fp16 elementwise.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Only 3 live values (x, y, out) per iteration; minimal register usage.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "flat_1d_autotuned",
+        "node_type": "decision",
+        "notes": "CURRENT:\n  does: Implements a flat 1D Triton kernel that treats fp16 tensors as a contiguous 1D array and processes BLOCK_SIZE elements per block with autotuned configs.\n  bottleneck: memory_bandwidth \u2014 this is a pure bandwidth-bound elementwise operation; latency is 0.0119ms vs reference 0.0122ms.\nFOLLOW_THROUGH:\n  aligned_with_intent: yes\nUPDATE_BELIEF:\n  Achieved 1.03x speedup over eager (1.05x over compile). The kernel is correct and fast but marginal gains suggest we're near the bandwidth ceiling for this simple op.\n  next bet: Try vector-loading 128-bit words (int32 packing of 2xfp16 pairs) to reduce instruction count and better saturate memory bandwidth, or explore num_stages > 1 for software pipelining.\nPERF_GAP:\n  expected_vs_baseline_factor=1.15, observed=1.03 \u2014 gap is ~12%. Reason: PyTorch eager for simple elementwise add is already well-optimized (cuBLAS/cublasLt not used; just a fused CUDA kernel), leaving little room. The autotuner found the best config but bandwidth ceiling limits further gains.\nSELF_CHECK: This is the active solution node. Children should be refinements, not alternatives.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0119,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0119,
+              "ref_eager_time_ms": 0.0122,
+              "score": 1.03,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 1.05,
+              "speedup_over_eager": 1.03
+            },
+            "reference_latency_ms": 0.0122,
+            "speedup_factor": 1.03,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "35fd97f570626107744a78b3308b77d8ee915c8c"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a persistent kernel variant where a fixed number of Triton programs (equal to SM count \u00d7 occupancy_factor) loop over multiple chunks of the input array. Each program iterates through its assigned strided chunks until all elements are processed. This amortizes kernel launch overhead and keeps SMs continuously fed, potentially improving throughput when the workload is too small to fill all SMs with a naive grid.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "For small-to-medium N (~1M elements), persistent kernels can reduce tail effects and improve SM utilization. However, the added complexity of the loop and stride pattern may introduce overhead that outweighs benefits. Less likely to win over the flat 1D approach for N=1M.",
+          "score_0_to_1": 0.35,
+          "title": "Persistent Kernel with Grid-Stride Loop"
+        },
+        "choice": "persistent_kernel",
+        "confidence_0_to_1": 0.3,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Persistent kernels shine when N is too small to fill the GPU. At N=1M and 170 SMs, naive grid already provides ~6 blocks/SM (at BLOCK_SIZE=1024), so persistent kernel benefit is marginal.",
+            "notes": "Loop overhead per SM adds instruction pressure with no arithmetic benefit. Unlikely to outperform flat 1D for this problem size.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium \u2014 loop overhead may negate gains"
+          },
+          "memory_bandwidth": {
+            "notes": "Same coalesced access pattern as flat 1D. Stride between iterations is num_programs * BLOCK_SIZE, which may hurt L2 cache line reuse compared to sequential access in flat 1D.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium \u2014 strided access across SM programs may reduce L2 hit rate"
+          },
+          "register_pressure": {
+            "notes": "Additional loop counter and stride variables slightly increase register usage, but still trivially low overall.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "persistent_kernel",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is a different kernel family from flat_1d_autotuned (persistent grid-stride loop vs. one-shot blocked dispatch). Cannot be combined with flat_1d_autotuned.\nUPDATE_BELIEF: Given that flat_1d_num_stages already achieves 1.09x with a simple approach, persistent kernels add complexity for diminishing returns on a memory-bandwidth-bound op of this size. De-prioritized but not deleted as it may help for very large tensors. Difficulty raised to 3.",
+        "overall_rating_0_to_10": 4.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel that reinterprets fp16 inputs as int32 (packing 2 fp16 values per int32) and processes pairs of elements together, effectively doubling the arithmetic throughput per load/store instruction. After loading int32 values, unpack to fp16 pairs, add, repack, and store. This aims to reduce the number of memory instructions by 2x compared to scalar fp16 loads, potentially improving instruction efficiency on RTX5090's memory subsystem.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "On some GPU architectures, explicitly packing fp16 pairs into wider integer types and using wider loads can improve memory instruction throughput. However, Triton's tl.load already handles vectorization internally when BLOCK_SIZE is large, so manual packing may only help at the margins. Added complexity is a risk.",
+          "score_0_to_1": 0.45,
+          "title": "Packed int32 Reinterpret Loads for fp16 Pairs"
+        },
+        "choice": "packed_int32_loads",
+        "confidence_0_to_1": 0.4,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 memory controller handles 128-byte cache lines. Triton's tl.load with large BLOCK_SIZE already issues 128-bit loads. Manual int32 packing offers no additional hardware-level benefit over Triton's native vectorization.",
+            "notes": "Triton already auto-vectorizes loads for aligned, contiguous accesses. Manual packing adds complexity without clear benefit.",
+            "rating_0_to_10": 4.0,
+            "risk": "medium \u2014 likely redundant with Triton's built-in vectorization"
+          },
+          "memory_bandwidth": {
+            "notes": "Same effective bandwidth utilization as flat 1D. The number of bytes transferred is identical. Instruction count reduction is marginal since Triton already issues wide loads.",
+            "rating_0_to_10": 7.0,
+            "risk": "low for correctness, medium for expected improvement"
+          },
+          "register_pressure": {
+            "notes": "Pack/unpack operations require temporary int32 registers. Slightly higher register usage but still well within limits.",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "packed_int32_loads",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is a different implementation strategy from flat_1d_autotuned (explicit manual packing vs. relying on Triton's vectorizer). Cannot be combined with flat_1d_autotuned directly.\nUPDATE_BELIEF: The vectorized_fp16_loads child under flat_1d_num_stages covers similar ground with less complexity. This node is still valid as an alternative root-level family but is now lower priority. The child vectorized_fp16_loads node is the preferred path to explore vectorization.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.09,
+          "rationale": "",
+          "score_0_to_1": 0.87,
+          "title": "Add num_stages Pipelining + Larger Block Configs"
+        },
+        "choice": "num_stages_pipeline",
+        "confidence_0_to_1": 0.93,
+        "decision": "refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "flat_1d_num_stages",
+        "node_type": "decision",
+        "notes": "CURRENT: Flat 1D elementwise add with autotuned BLOCK_SIZE (512-8192) and num_stages (2-3) pipelining; dispatches one block per tile. Bottleneck: memory bandwidth (fp16 load+store bound). FOLLOW_THROUGH: aligned_with_intent=yes, code matches num_stages pipeline intent. UPDATE_BELIEF: Achieved 1.09x speedup vs 1.06x expected; num_stages pipelining yields meaningful gains on RTX5090. Next bet: try explicit 128-bit vectorized loads (load 8 fp16 at once) to reduce load instruction count and better saturate memory bandwidth. SELF_CHECK: This is a refinement child of flat_1d_autotuned (adds pipelining), not an alternative kernel family.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "flat_1d_autotuned",
+        "solution_ref": {
+          "eval": {
+            "score": 1.09,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "35fd97f570626107744a78b3308b77d8ee915c8c",
+          "solution_id": "a47585e02dcbd1cfab09071ca09b0243d77"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.12,
+          "rationale": "",
+          "score_0_to_1": 0.8,
+          "title": "Explicit 128-bit Vectorized fp16 Loads"
+        },
+        "choice": "vectorized_loads",
+        "confidence_0_to_1": 0.72,
+        "decision": "refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Op is bandwidth-bound; vectorization helps throughput but compute intensity remains low.",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Vectorized 128-bit loads (8xfp16) maximize memory bus utilization per warp; reduces load instruction count by 8x.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Larger vector registers but fewer active warps needed; should stay within bounds for BLOCK_SIZE 1024-4096.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "vectorized_fp16_loads",
+        "node_type": "decision",
+        "notes": "CURRENT: (open - no solution yet) Intent: Extend flat_1d_num_stages by using explicit 128-bit vectorized loads (tl.load on contiguous fp16 tensors with eviction hints) so each thread issues fewer load instructions, improving bandwidth utilization. Bottleneck: memory bandwidth. SELF_CHECK: This is a composable chain refinement under flat_1d_num_stages (vectorized loads on top of pipelining), not an alternative kernel family. UPDATE_BELIEF: Parent achieved 1.09x; vectorized loads may squeeze another 2-4% on RTX5090 with its high memory bandwidth.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "flat_1d_num_stages",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "a47585e02dcbd1cfab09071ca09b02",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.12,
+          "rationale": "",
+          "score_0_to_1": 0.74,
+          "title": "Extend Autotune with num_stages=4,5 and num_warps=16"
+        },
+        "choice": "num_stages_4_plus",
+        "confidence_0_to_1": 0.65,
+        "decision": "refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "warp_specialization_stages4",
+        "node_type": "decision",
+        "notes": "CURRENT: (open - no solution yet) Intent: Add num_stages=4 and num_stages=5 configs to the autotune search, plus num_warps=16 for larger block sizes (4096, 8192, 16384). The RTX5090 has deeper pipelines than older GPUs and may benefit from more software pipelining stages on this memory-bandwidth-bound kernel.\n\nSELF_CHECK: This is a child refinement of flat_1d_num_stages (extends pipelining depth), not a sibling. Excludes vectorized_fp16_loads approach (that focuses on load width, not pipeline depth). Excludes warp count tuning as primary mechanism.\n\nExpected: modest gain to ~1.12x by better hiding memory latency with deeper pipeline on RTX5090's newer SM architecture.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "flat_1d_num_stages",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "a47585e02dcbd1cfab09071ca09b0243d77",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.13,
+          "rationale": "",
+          "score_0_to_1": 0.78,
+          "title": "num_stages=4 + eviction_policy=evict_first for streaming access"
+        },
+        "choice": "eviction_policy_and_num_stages4",
+        "confidence_0_to_1": 0.65,
+        "decision": "refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "num_stages_larger_blocks_evict",
+        "node_type": "decision",
+        "notes": "CURRENT: (open - no solution yet) Intent: Build on flat_1d_num_stages by increasing num_stages to 4 and adding eviction_policy='evict_first' to tl.load calls, since elementwise add is a streaming access pattern that should not pollute L2 cache. Also add num_warps=16 config for larger blocks. Bottleneck: memory bandwidth / L2 cache pressure. SELF_CHECK: This is a composable chain refinement under flat_1d_num_stages (eviction policy + deeper pipelining), mutually exclusive from vectorized_fp16_loads sibling (different axis of optimization: cache vs. vectorization width). UPDATE_BELIEF: Parent at 1.09x; eviction hints may help on RTX5090's large L2 by freeing cache lines for reuse.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "flat_1d_num_stages",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "a47585e02dcbd1cfab09071ca09b0243d77",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This is a pure elementwise (pointwise) fp16 tensor addition kernel operating on [16,256,256] tensors (~1M elements, ~2MB per tensor). The computation is trivially parallel (out[i] = x[i] + y[i]) with no reductions, no data-dependent addressing, and dense contiguous memory layout. The kernel is firmly in the memory-bandwidth-bound regime on RTX5090 (arithmetic intensity ~0.5 FLOP/byte, far below the roofline knee). The key optimization levers are: (1) maximizing effective memory bandwidth utilization via coalesced fp16 vectorized loads/stores, (2) sufficient grid occupancy to keep all ~170 SMs busy, (3) minimizing kernel launch overhead relative to execution time. The primary challenge is that PyTorch eager may already approach peak bandwidth for this op, leaving limited headroom; a custom Triton kernel's advantage comes from reduced dispatcher overhead and guaranteed vectorization. BLOCK_SIZE autotuning across {512, 1024, 2048} with appropriate num_warps is the central design decision.",
+  "open_questions": [
+    "What is the baseline PyTorch eager latency for this exact op on RTX5090? If it already saturates memory bandwidth, any speedup will be marginal (<5%).",
+    "Does Triton's tl.load automatically emit 128-bit (8xfp16) vectorized loads for contiguous accesses, or does BLOCK_SIZE/alignment need to be tuned explicitly?",
+    "What is the optimal BLOCK_SIZE for RTX5090's memory subsystem \u2014 does L2 cache line size or SM count constrain the sweet spot?",
+    "Is kernel launch overhead significant relative to execution time for N=1M? At ~26us theoretical execution, launch overhead (~5-10us) could dominate and favor persistent kernels.",
+    "Does torch.compile already produce near-optimal code for this simple add, making it the harder baseline to beat vs. eager?",
+    "Are the input tensors guaranteed to be contiguous (no strided views passed at runtime)? Non-contiguous inputs would require index remapping.",
+    "Does RTX5090 have any fp16 tensor core acceleration for elementwise adds (unlikely, but worth verifying in Triton's backend codegen)?"
+  ]
+}

@@ -51,6 +51,24 @@
                 "--atol", "1e-2",
                 "--compile-mode", "default"
             ]
+        },
+        {
+            "name": "Compare Elementwise ADD fp16 implementations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/elementwise_add_fp16/compare_elementwise_add_fp16.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "elementwise_add_fp16/elementwise_add_fp16.py",
+                "elementwise_add_fp16/ksearch-sonnet46_cuda_kernel",
+                "elementwise_add_fp16/triton_kernel_sonnet46",
+                "--warmup", "100",
+                "--iters", "2000",
+                "--atol", "1e-2",
+                "--compile-mode", "default"
+            ]
         }
     ]
 }
