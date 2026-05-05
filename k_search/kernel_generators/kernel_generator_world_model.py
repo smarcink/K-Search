@@ -702,6 +702,23 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                 all_passed = bool(getattr(round_eval, "is_passed", lambda: False)())
                 round_score = float(getattr(round_eval, "score", lambda: -1.0)())
 
+                # Log evaluation result
+                _status_str = "PASSED" if all_passed else "FAILED"
+                _eval_lines = [f"[Eval] round={round_num} status={_status_str} score={round_score:.4f}"]
+                if all_passed:
+                    if isinstance(getattr(round_eval, "latency_ms", None), (int, float)):
+                        _eval_lines.append(f"  latency={round_eval.latency_ms:.3f}ms")
+                    if isinstance(getattr(round_eval, "speedup_factor", None), (int, float)):
+                        _eval_lines.append(f"  speedup={round_eval.speedup_factor:.2f}x")
+                    if isinstance(getattr(round_eval, "mean_vs_baseline_factor", None), (int, float)):
+                        _eval_lines.append(f"  vs_baseline={round_eval.mean_vs_baseline_factor:.3f}x")
+                else:
+                    _log_exc = str(getattr(round_eval, "log_excerpt", "") or "")
+                    if _log_exc:
+                        # Show first 300 chars of failure reason
+                        _eval_lines.append(f"  reason: {_log_exc[:300]}")
+                _emit(" ".join(_eval_lines))
+
                 # Save as "last attempt" for the next debug prompt
                 last_eval = round_eval
 
@@ -832,6 +849,11 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
 
                 rounds_consumed += 1
                 if no_improve_streak >= stagnation_window or no_improve_over_base_streak >= stagnation_window:
+                    _emit(
+                        f"[STAGNATION] Ending cycle: no_improve={no_improve_streak}/{stagnation_window} "
+                        f"no_beat_base={no_improve_over_base_streak}/{stagnation_window} "
+                        f"cycle_best_score={cycle_best_score:.4f}"
+                    )
                     break
 
             if cycle_best_solution is not None and cycle_best_eval is not None:

@@ -243,7 +243,7 @@ def main():
     parser.add_argument("--local", required=False, default=None, help="Path to flashinfer-trace dataset root (flashinfer only)")
     parser.add_argument(
         "--task-source",
-        choices=["flashinfer", "gpumode", "kernelbench"],
+        choices=["flashinfer", "gpumode", "kernelbench", "cuda_kernel"],
         default="flashinfer",
         help="Task backend to use.",
     )
@@ -402,6 +402,21 @@ def main():
             backend=args.language,  # Pass language as KernelBench evaluation backend
             precision=args.kernelbench_precision,
             local_ref_path=args.task_path,
+        )
+    elif task_source == "cuda_kernel":
+        from k_search.tasks.cuda_kernel_task import CudaKernelTask
+
+        if not task_path:
+            raise ValueError("--task-path is required for --task-source=cuda_kernel (path to reference .py file)")
+        task = CudaKernelTask(
+            ref_path=task_path,
+            gpu=args.target_gpu,
+            num_correct_trials=args.kernelbench_num_correct_trials,
+            num_perf_trials=args.kernelbench_num_perf_trials,
+            precision=args.kernelbench_precision,
+            rtol=args.rtol,
+            atol=args.atol,
+            artifacts_dir=args.artifacts_dir,
         )
     else:
         raise ValueError(f"Unsupported task_source: {task_source}")

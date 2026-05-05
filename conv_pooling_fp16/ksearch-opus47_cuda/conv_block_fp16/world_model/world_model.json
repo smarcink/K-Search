@@ -1,0 +1,301 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1_fused_direct",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell), fp16 with tensor cores via wmma/mma; 128KB shmem/SM; large L2; 1x16x720x1280 input -> 1x32x720x1280 conv output -> 1x32x360x640 after avgpool.",
+            "notes": "Conv 3x3, 16->32, stride 1, pad 1. Small in-channels (16) limits tensor-core efficiency; output channels 32 is one wmma 16x16x16 tile pair. Compute is moderate; memory traffic non-trivial (~28MB output).",
+            "rating_0_to_10": 6.0,
+            "risk": "Underutilized tensor cores due to small C_in/C_out"
+          },
+          "memory_bandwidth": {
+            "notes": "Input ~28.8MB fp16, output (post-pool) ~14.7MB fp16. Weight tensor only 32*16*9*2 = 9216B (fits in regs/shmem). Likely bandwidth-leaning.",
+            "rating_0_to_10": 7.0,
+            "risk": "Edge boundary handling for padding may hurt vectorization"
+          },
+          "register_pressure": {
+            "notes": "Per-thread accumulators for tile output; weights small enough to keep in shared/constant memory.",
+            "rating_0_to_10": 5.0,
+            "risk": "If tiling output spatial regions x 32 channels, register count may grow"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: fused conv2d(3x3,s1,p1) + bias + ReLU + AvgPool2d(2). Dense regular access; reductions over (C_in, kH, kW) per output channel; spatial 720x1280. 2) Canonical: y[n,oc,h,w] = relu(sum_{ic,kh,kw} x[n,ic,h+kh-1,w+kw-1]*w[oc,ic,kh,kw] + b[oc]); pooled[n,oc,i,j] = (y[*,*,2i,2j]+...+y[*,*,2i+1,2j+1])/4. 3) Layout: NCHW fp16 contiguous; weights 32x16x3x3 (small, fit in shared/const); input 1x16x720x1280; output post-pool 1x32x360x640. 4) Regimes: (a) memory-bound bulk (interior tiles) \u2014 limited by global input reads with halo reuse; (b) edge-bound (padding) \u2014 divergence on borders; (c) compute-fusion \u2014 fusing conv+bias+relu+pool eliminates an entire intermediate write of 28MB. 5) Knobs: tile size (output H x W), use of shared mem for input halo, fuse pool into conv (write per pool output), use of __half2 vectorization, wmma vs CUDA cores (small K=16*9=144), const mem for weights, channels in registers per block. 6) Skeleton: each block computes a tile of pooled output (e.g., 16x32 pooled = 32x64 conv output) for all 32 oc; load input halo (16+2 x 64+2 x 16 ic) into shared; iterate ic, kh, kw accumulating 32 oc per spatial; apply bias+relu+avgpool; write. 7) Families: F1 Direct fused conv+pool with shared-mem halo and CUDA-core FMA in __half2; F2 Implicit GEMM via wmma tensor cores reshaping conv to GEMM (M=N*H*W,K=C_in*9,N=32) plus separate fused pool; F3 Two-kernel pipeline (cuDNN-like conv) + fused pool kernel.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused CUDA kernel that computes conv2d(3x3, pad=1) + bias + ReLU + AvgPool2x2 in one pass. Each block produces a tile of pooled outputs (e.g., 8x16 pooled => 16x32 conv) for all 32 output channels. Input halo for all 16 input channels staged in shared memory; weights kept in constant or shared memory. Use __half2 vectorization where possible.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.4,
+          "rationale": "Eliminates intermediate 28MB conv tensor write/read; small Cin/Cout fits well in shared/const memory; pool output is half the conv elements so writing pooled directly halves output BW.",
+          "score_0_to_1": 0.5,
+          "title": "Fused Conv3x3+Bias+ReLU+AvgPool2 single kernel (shared halo)"
+        },
+        "choice": "fused_direct",
+        "confidence_0_to_1": 0.45,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Uses CUDA cores with __half2 FMA; avoids wmma alignment constraints on small C dims.",
+            "notes": "FP32 accumulate via __half2float; not using tensor cores.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Halo shared reuse + constant weights; output BW halved by pool fusion.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "4 partial sums per thread across 32 OC may spill; consider OC tiling.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_fused_direct",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single fused kernel computing conv3x3+bias+ReLU+avgpool2 per tile of 8x16 pooled outputs over all 32 OC, with 18x34 halo in shared memory and weights/bias in __constant__. bottleneck=likely compute/register pressure (per-thread 4 partials x 32 OC x 16 IC x 9 taps); also wmma not used. FOLLOW_THROUGH: aligned_with_intent=yes; implementation matches the fused single-kernel intent. UPDATE_BELIEF: eval failed due to host-side harness contract (run() requires load_weights to be called first); kernel correctness was not actually tested. Need to ensure host glue exposes load_weights and the launch path uses stored device weights instead of (or in addition to) constant-memory copy at every call. Next bet: fix host harness to register weights via load_weights(); keep cudaMemcpyToSymbol on first load only, then reuse. impacts: bandwidth low risk (constant+shared reuse), register pressure medium-high (4 partials*OC loop), compute_intensity medium (no tensor cores).",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement implicit GEMM using wmma (or mma) tensor-core fp16 accumulate-fp32: reshape conv as M=H*W (per output spatial), K=Cin*9=144, N=Cout=32. Pad K to 160 (multiple of 16) and N is 32 (two 16-wide tiles). Im2col is implicit per-block via shared-mem halo gather. Then a small fused epilogue kernel applies bias+ReLU+AvgPool2.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.5,
+          "rationale": "Tensor cores boost throughput for the conv; implicit im2col avoids materialization. However small N=32 underutilizes tensor cores; epilogue split adds an extra pass.",
+          "score_0_to_1": 0.5,
+          "title": "Implicit GEMM (wmma) + fused pool epilogue"
+        },
+        "choice": "wmma_implicit_gemm",
+        "confidence_0_to_1": 0.45,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "wmma 16x16x16 fp16; need K aligned and N>=16. Cin*9=144 -> pad to 160; Cout=32 fits 2 tiles.",
+            "notes": "Tensor cores accelerate FMAs but small N limits efficiency; latency hiding via pipelined shared loads needed.",
+            "rating_0_to_10": 6.0,
+            "risk": "Padding K and small N reduce TC efficiency"
+          },
+          "memory_bandwidth": {
+            "notes": "Shared im2col loads dominate; benefits from cp.async on Blackwell.",
+            "rating_0_to_10": 6.0,
+            "risk": "Two-kernel split re-reads conv intermediate from L2/global"
+          },
+          "register_pressure": {
+            "notes": "wmma fragments are register-resident; manageable for these tile sizes.",
+            "rating_0_to_10": 6.0,
+            "risk": "Fragment count grows if M tile is large"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2_wmma_gemm",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative to fused direct family; cannot combine because tensor-core mma demands a GEMM-shaped tiling and warp-cooperative fragments incompatible with per-thread oc accumulators in n1.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use cuDNN/ATen fp16 convolution for the 3x3 conv (with bias) and write a small custom CUDA kernel that fuses ReLU + AvgPool2x2 in one pass over the conv output. This is the simplest correct baseline-beater.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.7,
+          "rationale": "Low risk; cuDNN handles conv efficiently; fused pool kernel removes one full read/write cycle of the activation tensor.",
+          "score_0_to_1": 0.55,
+          "title": "ATen conv2d + custom fused ReLU+AvgPool kernel"
+        },
+        "choice": "aten_plus_fused_pool",
+        "confidence_0_to_1": 0.7,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Relies on cuDNN-tuned conv; pool kernel is bandwidth-bound elementwise reduction 2x2.",
+            "notes": "Pool kernel can vectorize via __half2 reads of 2 horizontal pixels; trivially fused with ReLU.",
+            "rating_0_to_10": 6.0,
+            "risk": "cuDNN may pick a suboptimal algo for 1x16x720x1280"
+          },
+          "memory_bandwidth": {
+            "notes": "Saves one full pass over conv output by fusing relu+pool; conv output still materialized.",
+            "rating_0_to_10": 6.0,
+            "risk": "Conv output materialization dominates"
+          },
+          "register_pressure": {
+            "notes": "Trivial.",
+            "rating_0_to_10": 8.0,
+            "risk": "None"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3_aten_plus_pool",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative because it does NOT write a custom conv kernel; the conv is delegated to ATen/cuDNN. Cannot combine with n1/n2 since they replace conv entirely.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.4,
+          "rationale": "",
+          "score_0_to_1": 0.8,
+          "title": "Fix host harness: implement load_weights() and cache weights on device; copy to constant memory once"
+        },
+        "choice": "expose_load_weights_and_cache",
+        "confidence_0_to_1": 0.7,
+        "decision": "host_glue_fix",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a_fix_harness",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: this is a CHILD refinement of n1_fused_direct (not a sibling family); strictly required to make the fused kernel evaluable. Implements module.load_weights(weight,bias) storing device pointers and performing cudaMemcpyToSymbol once; run() then launches without re-uploading. Addresses eval failure 'Weights not loaded'.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n1_fused_direct",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.35,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "OC tiling (e.g., 8 OC/iter) with register-blocked 2x2 conv outputs to cut spills"
+        },
+        "choice": "oc_tiling_and_reg_blocking",
+        "confidence_0_to_1": 0.5,
+        "decision": "micro_optim",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b_oc_tile_regs",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: CHILD refinement of n1_fused_direct, composable after n1a_fix_harness; reduces register pressure by streaming OC in tiles and accumulating in registers, preserving the same fused data flow.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1_fused_direct",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused conv2d(3x3, stride1, pad1, 16->32) + bias + ReLU + AvgPool2x2 in fp16 NCHW on a 1x16x720x1280 input, producing 1x32x360x640. Compute is moderate (16*9=144 MACs per output channel per spatial) and the tensor is bandwidth-leaning (~28MB input, ~15MB pooled output). Weights are tiny (~9KB) and fit in constant/shared memory. Key constraints: small Cin/Cout limit tensor-core efficiency; padding on borders requires careful bounds handling; fusing pool with conv halves output writes and avoids materializing the 28MB activation. Numerical tolerance is loose (rtol=atol=0.01) so fp16 accumulation paths are acceptable but fp32 accumulator is safer.",
+  "open_questions": [
+    "Is bias actually present and what initialization is used at eval time (affects correctness checks)?",
+    "Does AvgPool2d divide by exactly 4 in fp16, or does PyTorch upcast? Need to match rounding for tolerance.",
+    "What is the cuDNN fp16 baseline latency on RTX5090 for this exact shape (to set realistic targets)?",
+    "Is N always 1 in production runs, or can batch grow (affects tiling)?",
+    "Are inputs guaranteed 16-byte aligned and contiguous NCHW?",
+    "Should accumulation be fp32 to stay within rtol=0.01 across 144 MACs?",
+    "Is it acceptable to use constant memory for the 9KB weight tensor (fixed per call)?",
+    "Does the test harness call forward repeatedly with the same weights so we can precompute/transform weights?"
+  ]
+}
