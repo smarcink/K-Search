@@ -1,0 +1,445 @@
+{
+  "computed_signals": {
+    "round_index": 22,
+    "trace": {
+      "latency_ms": 0.8552960157394409,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 1.3817600011825562,
+      "speedup_factor": 1.6155342428293251,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1a_nhwc_biasact",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): high SM count, large L2, strong fp16/bf16 tensor cores. Conv input 1x64x360x640 fp16, weight 128x64x3x3, bias 128, then ReLU + AvgPool2d(2). Output is 1x128x180x320.",
+            "notes": "Conv2d 3x3 with 64->128 channels is compute-bound but small batch (N=1). Tensor cores via WMMA/cuBLAS GEMM (im2col) or cuDNN implicit GEMM are ideal. Fusing ReLU + 2x2 avgpool reduces traffic.",
+            "rating_0_to_10": 7.0,
+            "risk": "Tensor core alignment requirements (multiples of 8/16) for fp16; im2col memory blowup."
+          },
+          "memory_bandwidth": {
+            "notes": "Input 64*360*640*2B ~29.5MB; output pre-pool 128*360*640*2B ~59MB; post-pool 128*180*320*2B ~14.7MB. Fusing pool+activation avoids materializing pre-pool tensor.",
+            "rating_0_to_10": 7.0,
+            "risk": "If conv writes full HxW output then pool reads it, doubles traffic. Fuse to avoid."
+          },
+          "register_pressure": {
+            "notes": "Implicit GEMM tiles (e.g., 128x128 with K=64*9=576) fit Blackwell register budget; ReLU+pool fusion adds minimal pressure.",
+            "rating_0_to_10": 6.0,
+            "risk": "Aggressive tiling could spill; need careful tile selection."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: Fused conv2d (3x3, stride1, pad1) + ReLU + 2x2 avgpool, fp16, single batch. Quantization disabled per init args (quantize_conv=False, quantize_act=False) so QConv2D acts as a regular Conv2d and act_quantizer is identity. 2) Canonical math: y[k,oh,ow] = sum_{c,kh,kw} x[c, oh+kh-1, ow+kw-1] * w[k,c,kh,kw] + b[k]; z = ReLU(y); out[k,i,j] = (z[k,2i,2j]+z[k,2i+1,2j]+z[k,2i,2j+1]+z[k,2i+1,2j+1])/4. 3) Layouts: x:(1,64,360,640) NCHW fp16 contig, w:(128,64,3,3) fp16, b:(128) fp16, output:(1,128,180,320) fp16. Reuse: each x element used by up to 9 conv output positions; each conv output used by exactly one pool output. 4) Regimes: (a) full pipeline as-is is bandwidth-bound on intermediate tensor; (b) fused conv+relu+pool is compute-bound (GEMM-like); (c) very small batch limits tensor-core utilization unless we tile spatially. 5) Knobs: implicit GEMM vs explicit im2col, WMMA tile sizes (16x16x16 / 16x8x16), shared memory staging of weights & input tiles, fuse pool by computing 2x2 conv outputs per thread block iteration, use cuDNN as baseline. 6) Skeleton: tile output in (K_tile, OH_tile, OW_tile) where OH_tile, OW_tile are even (for pool); each block loads weight tile to shared mem, streams input rows, accumulates fp32, applies ReLU + 2x2 avg, writes pooled output. 7) Families: F-A cuDNN/cuBLAS-backed conv then fused relu+pool kernel (safe baseline); F-B custom implicit-GEMM WMMA fused kernel writing pooled output directly; F-C im2col + cuBLAS GEMM + fused epilogue. SELF_CHECK at children added below.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "pending"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use cuDNN (via cudnnConvolutionForward with bias+activation if available) for the 3x3 conv, then launch a small custom CUDA kernel that fuses ReLU and 2x2 average pooling into a single pass over the conv output. Establish a correct, fast baseline.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "cuDNN is highly tuned for 3x3 fp16 conv on Blackwell; only the cheap ReLU+pool epilogue needs custom code. Lowest risk path to correctness and a strong baseline.",
+          "score_0_to_1": 0.8,
+          "title": "F-A: cuDNN conv + fused ReLU+AvgPool epilogue"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "cuDNN will pick tensor-core implicit-GEMM kernel; aligns with fp16 channel multiples of 8/16.",
+            "notes": "cuDNN fp16 3x3 conv well-tuned for Blackwell; epilogue trivial.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Vectorized float4 loads/stores in epilogue; epilogue is BW-bound but small relative to conv.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "vec8x2 kernel uses ~16 __half2 regs/thread; fine.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_cudnn_baseline",
+        "node_type": "decision",
+        "notes": "CURRENT: does=cuDNN forward conv (fp16) followed by a fused ReLU+2x2 avgpool epilogue with vectorized float4 loads (vec8x2 path for W%16,H%4). bottleneck=conv compute (cuDNN) dominates; epilogue is BW-bound but small. FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 1.50x speedup at 0.956ms vs 1.434ms ref \u2014 solid baseline, slightly above the 1.2x prediction. PERF_GAP: expected 1.2x, observed 1.50x (epilogue fusion + good cuDNN algo selection paid off more than expected). Next bet: fuse bias+ReLU into conv via cudnnConvolutionBiasActivationForward (if bias path applies) and/or pre-select fastest cuDNN algo with workspace, and try NHWC fp16 layout to enable Tensor Core IMMA paths.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.9559680223464966,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "reference_latency_ms": 1.434175968170166,
+            "speedup_factor": 1.5002342491016294,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "f9c6b65e4b65caf97d4139d3c36b548f8e122188"
+        }
+      },
+      {
+        "action": {
+          "description": "Write a custom implicit-GEMM fp16 conv kernel using WMMA (16x16x16) that processes 3x3 conv with K=64 input channels (Kgemm=576) and directly produces the post-ReLU, post-2x2-avgpool output in one kernel. Output tile per block covers an even (OH,OW) region so pool fuses naturally.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.9,
+          "rationale": "Avoids materializing the 59MB pre-pool tensor and exploits tensor cores. Largest potential win but high implementation cost.",
+          "score_0_to_1": 0.45,
+          "title": "F-B: Fused implicit-GEMM WMMA conv+ReLU+pool"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.35,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "out_channels=128 and in_channels=64 are multiples of 16 \u2192 WMMA-friendly. K_gemm=576 not multiple of 16 \u2192 need padding to 592 or careful tail.",
+            "notes": "Strong tensor-core fit for 64->128 channels.",
+            "rating_0_to_10": 8.0,
+            "risk": "Edge handling for spatial padding (pad=1) and non-multiple K dimension increases complexity."
+          },
+          "memory_bandwidth": {
+            "notes": "Eliminates intermediate tensor; reduces global writes by 4x via pool fusion.",
+            "rating_0_to_10": 8.0,
+            "risk": "Shared memory pressure to stage input halos for tile boundaries."
+          },
+          "register_pressure": {
+            "notes": "WMMA fragments + 2x2 accumulators per thread; manageable but tight.",
+            "rating_0_to_10": 6.0,
+            "risk": "Spills if tile too large."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2_fused_wmma",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: mutually exclusive with n1 (replaces conv). High-risk/high-ceiling; only worth attempting if n1a* refinements stall below ~1.8x.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement im2col into a workspace buffer (K=576 x M=360*640) followed by a cuBLAS HGEMM (128 x M) and a fused bias+ReLU+2x2-avgpool epilogue kernel that reads the GEMM output and writes the final pooled tensor.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.2,
+          "rationale": "Leverages cuBLAS tensor-core HGEMM (very fast on Blackwell) with a simple custom im2col and epilogue. Easier than F-B, potentially competitive with F-A if cuDNN heuristic is poor for N=1.",
+          "score_0_to_1": 0.15,
+          "title": "F-C: im2col + cuBLAS GEMM"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "M=230400, K=576, N=128. Large M favors HGEMM; K alignment to 8 OK (576 multiple of 8).",
+            "notes": "Excellent GEMM fit for tensor cores.",
+            "rating_0_to_10": 8.0,
+            "risk": "im2col workspace ~ 576*230400*2B \u2248 253MB \u2014 too large; must tile im2col along M to bound memory."
+          },
+          "memory_bandwidth": {
+            "notes": "Tiled im2col adds extra writes/reads of input but avoids pre-pool output buffer if epilogue fuses pool.",
+            "rating_0_to_10": 5.0,
+            "risk": "im2col duplication (~9x input read) costs bandwidth."
+          },
+          "register_pressure": {
+            "notes": "Epilogue kernel light; im2col light.",
+            "rating_0_to_10": 8.0,
+            "risk": "None significant."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3_im2col_cublas",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: mutually exclusive with n1/n2. Dominated: cuDNN NHWC fp16 already at 1.62x; im2col+GEMM unlikely to exceed and adds memory traffic. Deprioritize.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.62,
+          "rationale": "",
+          "score_0_to_1": 0.78,
+          "title": "F-A.1: NHWC fp16 + cudnnConvolutionBiasActivationForward (fuse ReLU into conv)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.75,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a_nhwc_biasact",
+        "node_type": "decision",
+        "notes": "CURRENT: does=NHWC fp16 cuDNN conv with fused bias+ReLU via cudnnConvolutionBiasActivationForward, plus custom NHWC->NCHW ReLU+AvgPool2x2 epilogue with vectorized float4 loads. bottleneck=likely conv GEMM compute + epilogue memory bandwidth. FOLLOW_THROUGH: aligned_with_intent=yes; conv epilogue fuses ReLU and switches to NHWC fp16 path as planned. UPDATE_BELIEF: eval shows 1.62x vs ref (lat 0.855ms), beating predicted 1.7x slightly under but solid; main remaining cost is the post-conv ReLU+AvgPool->NCHW epilogue and any NCHW<->NHWC transposes. next bet: keep epilogue fused but try (a) writing pool output directly in NHWC if downstream allows, (b) tuning cuDNN algo/workspace for this shape, (c) eliminating NCHW conversion if model wrapper can consume NHWC. impacts: bw med-high, reg low, compute_fit high on RTX5090 tensor cores.",
+        "overall_rating_0_to_10": 7.8,
+        "parent_id": "n1_cudnn_baseline",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.8552960157394409,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "reference_latency_ms": 1.3817600011825562,
+            "speedup_factor": 1.6155342428293251,
+            "status": "passed"
+          },
+          "parent_solution_id": "f9c6b65e4b65caf97d4139d3c36b548f8e122188",
+          "solution_id": "d1dcf2cf5b50368d50fb8f1441411b738fbdde0c"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.55,
+          "rationale": "",
+          "score_0_to_1": 0.35,
+          "title": "F-A.2: Wider epilogue tiling + cp.async prefetch"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b_pool_in_epilogue_smem",
+        "node_type": "decision",
+        "notes": "Downscoped: superseded by n1a2 which addresses pool epilogue under the better NHWC-biasact base (n1a). Kept open as fallback if we revert from biasact path.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "n1_cudnn_baseline",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "f9c6b65e4b65caf97d4139d3c36b548f8e122188",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.55,
+          "rationale": "",
+          "score_0_to_1": 0.35,
+          "title": "F-A.3: cuDNN algo find + persistent workspace + graph capture"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c_algo_workspace_tune",
+        "node_type": "decision",
+        "notes": "Downscoped: superseded by n1a1 under the active n1a NHWC-biasact base.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "n1_cudnn_baseline",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "f9c6b65e4b65caf97d4139d3c36b548f8e122188",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.75,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "F-A.1.1: Tune cuDNN conv algo + workspace for NHWC fp16 shape (heuristic + benchmark cache)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a1_algo_ws_tune",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n1a (composable, not alternative). Mutually exclusive with sibling n1a2 only in execution-order priority, not design. Plan: enumerate cudnnGetConvolutionForwardAlgorithm_v7 candidates, pick best by measured time, allocate persistent workspace; cheap, low risk.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1a_nhwc_biasact",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "d1dcf2cf5b50368d50fb8f1441411b738fbdde0c",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.72,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "F-A.1.2: NHWC ReLU+AvgPool epilogue with shared-memory row reuse and wider per-thread tiles"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a2_pool_smem_reuse",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n1a focused on epilogue bandwidth; mutually exclusive with n1a1 in scheduling priority but compatible after. Hypothesis: current epilogue does redundant loads across ow neighbors; smem staging of 2 input rows per block + larger OW_PER_BLOCK can cut HBM reads ~2x. Risk: occupancy/register pressure.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1a_nhwc_biasact",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "d1dcf2cf5b50368d50fb8f1441411b738fbdde0c",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused fp16 ConvBlock on RTX5090: 3x3 stride-1 pad-1 conv (in=64, out=128) on a 1x64x360x640 input, followed by ReLU and a 2x2 average pool, producing a 1x128x180x320 fp16 tensor. Quantization knobs are disabled in the init args, so QConv2D and act_quantizer reduce to a plain Conv2d and identity. The workload is dominated by the conv (mid-sized GEMM-like, tensor-core friendly: channels 64->128 are multiples of 16) but the unfused intermediate (~59 MB) makes ReLU+pool fusion a clear bandwidth win. Constraints: fp16 numerics with rtol/atol=0.01, NCHW contiguous layout, batch=1 (limits parallelism per output channel), 3x3 stencil with halos requires careful tiling, K_gemm=64*9=576 is not a multiple of 16 (matters for WMMA).",
+  "open_questions": [
+    "Does the runtime/build environment allow linking cuDNN and cuBLAS, or must conv be implemented from scratch?",
+    "What is the cuDNN-baseline latency on RTX5090 for this exact shape so we know the bar to beat?",
+    "Is the bias actually used (bias=True) and in what dtype (fp16 vs fp32 master)?",
+    "Are inputs guaranteed contiguous NCHW fp16, and is output layout flexibility (e.g., NHWC) acceptable?",
+    "Can we assume static shapes (1,64,360,640) for specialization, or must the kernel be shape-generic?",
+    "How tight is the 0.01 tolerance once we accumulate in fp32 vs fp16 for the conv and pool divide?",
+    "Is workspace memory allocation allowed (for im2col tiles) and what is the budget?",
+    "Does PyTorch's reference path use TF32/fp16-accum, and do we need to match its exact reduction order?"
+  ]
+}

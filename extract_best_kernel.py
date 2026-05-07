@@ -99,6 +99,9 @@ def load_solutions_and_evals(artifacts_root: Path) -> list[dict]:
                     # Only add if not already found via eval reports
                     if sol_name and not any(r["name"] == sol_name for r in results):
                         sol_data = _find_solution_json(sol_dir, sol_name)
+                        # If no solution file, build from JSONL record directly
+                        if not sol_data and "code" in record:
+                            sol_data = _build_solution_from_record(record)
                         if sol_data:
                             results.append({
                                 "name": sol_name,
@@ -110,6 +113,33 @@ def load_solutions_and_evals(artifacts_root: Path) -> list[dict]:
                     continue
 
     return results
+
+
+def _parse_xml_sources(code: str) -> list[dict]:
+    """Parse XML-formatted code into a list of {path, content} dicts."""
+    import re
+    sources = []
+    # Match <header_file name="...">, <cuda_file name="...">, <cpp_file name="...">
+    pattern = r'<(header_file|cuda_file|cpp_file)\s+name="([^"]+)">(.*?)</\1>'
+    for match in re.finditer(pattern, code, re.DOTALL):
+        sources.append({"path": match.group(2), "content": match.group(3).strip()})
+    # Also handle model_new.py (triton/python format) — just raw code
+    if not sources:
+        sources.append({"path": "model_new.py", "content": code})
+    return sources
+
+
+def _build_solution_from_record(record: dict) -> dict:
+    """Build a solution dict from a solution_db.jsonl record."""
+    code = record.get("code", "")
+    sources = _parse_xml_sources(code)
+    return {
+        "name": record.get("solution_name", "unknown"),
+        "definition": record.get("definition", ""),
+        "author": "unknown",
+        "description": f"Extracted from solution_db.jsonl",
+        "sources": sources,
+    }
 
 
 def _find_solution_json(sol_dir: Path, sol_name: str) -> dict | None:

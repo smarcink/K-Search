@@ -50,7 +50,25 @@
                 "--warmup", "100",
                 "--iters", "2000",
                 "--atol", "1e-2",
-                "--shape", "64", "360", "640"
+            ]
+        },
+        {
+            "name": "Compare Conv Pooling SMALLER fp16 implementations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/compare_kernels.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "conv_pooling_fp16_smaller_spatial/conv_block_fp16.py",
+                "conv_pooling_fp16_smaller_spatial/opus47_triton_50r_kernel",
+                "conv_pooling_fp16_smaller_spatial/opus47_cuda_kernel",
+                "--precision", "fp16",
+                "--compile-mode", "default",
+                "--warmup", "100",
+                "--iters", "2000",
+                "--atol", "1e-2",
             ]
         },
         {
