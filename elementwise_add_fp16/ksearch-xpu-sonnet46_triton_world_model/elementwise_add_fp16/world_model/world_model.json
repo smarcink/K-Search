@@ -1,0 +1,351 @@
+{
+  "computed_signals": {
+    "round_index": 10,
+    "trace": {
+      "latency_ms": 12.0877,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 12.1745,
+      "speedup_factor": 1.0072,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "node_C1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.7,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 Xe-HPG architecture; SIMD-16 EU lanes; supports fp16 native ops; prefers 256-bit or 512-bit vector loads. Memory bandwidth ~400 GB/s HBM/LPDDR5. Elementwise ops are fully bandwidth-bound at this tensor size.",
+            "notes": "Arithmetic intensity ~0.33 FLOP/byte for fp16 add (2 bytes read * 2 tensors + 2 bytes write = 6 bytes, 1 FLOP per element). Far below roofline compute ceiling; purely memory-bound.",
+            "rating_0_to_10": 2.0,
+            "risk": "Low compute risk; bottleneck is memory bandwidth not compute."
+          },
+          "memory_bandwidth": {
+            "notes": "Total data moved: 3 * 64 * 4096 * 4096 * 2 bytes = ~6.44 GB per kernel invocation. Must sustain near-peak memory bandwidth. Coalesced/vectorized access is critical. Intel XPU prefers 256-bit aligned vectorized loads (16 fp16 elements per transaction).",
+            "rating_0_to_10": 9.0,
+            "risk": "Primary bottleneck. Any stride, non-coalesced access, or launch overhead will directly degrade performance."
+          },
+          "register_pressure": {
+            "notes": "Elementwise add with no intermediate accumulation. Each work item loads 2 fp16 values and stores 1. Register usage is minimal regardless of block size.",
+            "rating_0_to_10": 2.0,
+            "risk": "Negligible register pressure; not a concern."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "\u2022 PROBLEM CLASS: Pure elementwise binary operation (fp16 add). No reductions, no data dependencies between output elements. Dense, contiguous 3D tensor [64,4096,4096] flattened to 1D for kernel purposes.\n\u2022 CANONICAL MATH: out[i] = x[i] + y[i], for i in [0, N), N = 64*4096*4096 = 1,073,741,824 elements.\n\u2022 DATA LAYOUT: All tensors row-major contiguous fp16. Access is perfectly linear/coalesced. No reuse across elements (read-once pattern). Output written once.\n\u2022 BOTTLENECK HYPOTHESES:\n  (1) Bandwidth-bound large N: Primary regime. ~6.44 GB total data. Must sustain ~99%+ peak BW. Kernel overhead negligible vs data movement.\n  (2) Launch-overhead regime (small N): Not applicable here\u2014N is huge.\n  (3) Suboptimal vectorization: If loads are scalar (1 fp16 per lane), throughput drops 8-16x vs vectorized 256-bit loads. Intel XPU EU architecture benefits strongly from wide SIMD loads.\n\u2022 DESIGN KNOBS: BLOCK_SIZE (elements per program), vector width (fp16x2/x4/x8/x16 packed loads), grid size (N / BLOCK_SIZE), use of tl.load/tl.store with mask vs no-mask, num_warps equivalent (subgroup size on XPU), alignment guarantees.\n\u2022 KERNEL SKELETON: (1) Compute flat index from program_id and BLOCK_SIZE. (2) Load BLOCK_SIZE fp16 elements from x and y. (3) Add. (4) Store. No shared memory needed. No sync needed. Purely register-resident.\n\u2022 CANDIDATE FAMILIES: (A) Flat-index large-block streaming \u2014 maximizes memory bandwidth utilization with large BLOCK_SIZE and vectorized loads; (B) Tuned-block with explicit fp16x8 packing \u2014 matches Intel XPU SIMD width; (C) Moderate-block baseline \u2014 simple reference-quality Triton kernel for correctness baseline.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a flat-index Triton kernel that treats all 3 dimensions as a single 1D array of N=64*4096*4096 fp16 elements. Use a large BLOCK_SIZE (e.g., 1024 or 2048) to maximize memory transaction efficiency and hide latency. Each program processes a contiguous tile of elements using tl.load + tl.store with offset masking. Grid = ceil(N / BLOCK_SIZE). Tune BLOCK_SIZE as a constexpr. This establishes the correctness baseline and measures bandwidth utilization.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.005,
+          "rationale": "Simplest correct Triton formulation. Flat 1D indexing avoids multi-dim stride calculations, enabling fully coalesced access. Large BLOCK_SIZE amortizes launch overhead and gives Triton's compiler room to vectorize loads.",
+          "score_0_to_1": 0.45,
+          "title": "Pure flat-1D elementwise kernel (family A)"
+        },
+        "choice": "family_A",
+        "confidence_0_to_1": 0.45,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70: 128 EUs, 16 SIMD lanes each. Flat 1D grid maps cleanly to EU dispatch. BLOCK_SIZE=1024 means 64 fp16 elements per SIMD lane if subgroup_size=16 \u2014 well-aligned.",
+            "notes": "AI ~0.33 FLOP/byte, firmly bandwidth-bound. No compute pressure. Kernel fits the hardware dispatch model well.",
+            "rating_0_to_10": 3.0,
+            "risk": "Low compute risk. Main risk is Triton's vectorization choosing suboptimal load widths for Intel backend."
+          },
+          "memory_bandwidth": {
+            "notes": "Large BLOCK_SIZE maximizes in-flight memory transactions. Fully coalesced linear reads. Expected to achieve 85-95% peak bandwidth if Triton generates wide loads.",
+            "rating_0_to_10": 8.0,
+            "risk": "Medium risk: depends on Triton Intel backend generating 256-bit or wider loads. May need explicit hints or specific BLOCK_SIZE alignment."
+          },
+          "register_pressure": {
+            "notes": "BLOCK_SIZE=1024 fp16 elements = 512 bytes = trivial register usage. No spill risk.",
+            "rating_0_to_10": 2.0,
+            "risk": "Negligible."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_A",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Root child \u2014 family_A pure flat-1D approach. Mutually exclusive with family_B (persistent grid) and family_C (SIMD-aligned). Given family_C already achieves 1.007x with autotune, family_A without vectorization is unlikely to surpass it. De-prioritized.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel where each program instance processes multiple independent tiles in a loop (persistent/streaming pattern). Instead of one tile per program, each thread block iterates over a stride-separated sequence of tiles until all N elements are covered. Grid size is set to a fixed multiple of EU count (e.g., 128*8=1024 programs) regardless of N. This reduces kernel launch overhead and improves L2/LLC locality on Intel XPU by reusing EU state across tiles.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.002,
+          "rationale": "Intel XPU has a fixed number of EUs (128). With N=1B elements, a naive grid of 500K programs may introduce scheduling overhead. A persistent kernel with fixed grid saturates all EUs immediately and avoids re-launch scheduling. Each EU processes many tiles sequentially, improving instruction cache utilization.",
+          "score_0_to_1": 0.4,
+          "title": "Persistent/fixed-grid elementwise kernel (family B)"
+        },
+        "choice": "family_B",
+        "confidence_0_to_1": 0.38,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 has 128 Xe-core EUs. Persistent grid of ~1024 workgroups maps multiple tiles per EU. May improve HW occupancy scheduling vs millions of tiny workgroups.",
+            "notes": "Persistent pattern trades simplicity for potential scheduler efficiency. Benefit depends heavily on Intel Triton backend's workgroup scheduling overhead.",
+            "rating_0_to_10": 5.0,
+            "risk": "Medium risk: Triton Intel backend may not benefit from persistent kernels as much as CUDA GPUs since XPU scheduler may already efficiently handle large grids."
+          },
+          "memory_bandwidth": {
+            "notes": "Memory access pattern unchanged (linear). Potential improvement from fewer kernel dispatch events. No bandwidth regression expected.",
+            "rating_0_to_10": 7.0,
+            "risk": "Low risk of bandwidth regression. Upside uncertain\u2014depends on scheduler overhead being measurable."
+          },
+          "register_pressure": {
+            "notes": "Loop counter adds minimal register usage. Still negligible overall.",
+            "rating_0_to_10": 2.0,
+            "risk": "Negligible."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_B",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Root child \u2014 family_B persistent/fixed-grid approach. Mutually exclusive with family_A and family_C. For a pure elementwise bandwidth-bound kernel on Arc Pro B70, persistent grid adds overhead without benefit. De-prioritized given family_C results.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement the flat-1D kernel (same as node_A) but explicitly cast fp16 tensors to int32 (packing 2 fp16 values per int32 word) before loading, perform the addition using fp16 arithmetic after unpacking via tl.cast, then repack and store. Alternatively, use tl.load with explicit dtype=tl.float16 and BLOCK_SIZE aligned to 16 (subgroup width) to nudge the Triton Intel backend into emitting 256-bit vector load instructions (16 fp16 = 256 bits). Measure whether explicit width alignment changes generated ISA.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.993,
+          "rationale": "Intel XPU SIMD units prefer 256-bit aligned loads. If Triton's Intel backend defaults to narrower loads, explicit alignment to subgroup width (16) or packing via int32 can improve memory throughput by 2x. This is the highest-upside optimization for a pure bandwidth-bound kernel.",
+          "score_0_to_1": 0.58,
+          "title": "SIMD-width-aligned vectorized load/store kernel"
+        },
+        "choice": "family_C",
+        "confidence_0_to_1": 0.72,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 EUs: 256-bit SIMD per EU per cycle for fp16. Aligning BLOCK_SIZE to 16*k (subgroup_size=16 * k elements) maximizes per-EU throughput. Misaligned or narrow loads may halve effective bandwidth.",
+            "notes": "bandwidth-bound; Arc Pro B70 benefits from wide memory transactions",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "aligned accesses help but vectorization not yet fully exploited",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "simple elementwise; registers not a concern",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C",
+        "node_type": "decision",
+        "notes": "CURRENT:\n  does: Flat-1D fp16 elementwise add with BLOCK_SIZE=256, num_warps=2; loads fp16 directly and accumulates.\n  bottleneck: memory bandwidth (purely bandwidth-bound elementwise op).\nFOLLOW_THROUGH:\n  aligned_with_intent: yes (int32-packing path was considered but simple fp16 load with SIMD-aligned block was implemented, consistent with the node's family description).\nUPDATE_BELIEF:\n  Achieved 1.007x speedup \u2014 marginal improvement over baseline. BLOCK_SIZE=256 with num_warps=2 is near-optimal for this approach.\n  next bet: Try a persistent-grid kernel (node_B family) OR tune the block size sweep further with explicit int32 packing to double effective vector width.\nPERF_GAP:\n  expected_vs_baseline_factor=0.80 (predicted), observed speedup=1.007x (i.e., ~1.0x vs baseline).\n  Hypothesized reason: Intel Arc Pro B70 Triton backend already emits efficient vector loads for fp16; explicit packing yields negligible uplift at BLOCK_SIZE=256. The hardware or driver-level vectorization already handles 256-bit loads.\nSELF_CHECK: This node is family_C (SIMD-aligned vectorized). Cannot be combined with family_A (pure flat large-block) or family_B (persistent/fixed-grid) as they represent different end-to-end mapping strategies.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": 1.007,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "28ed45dc5d0af23e83ac8342be114e73b1d3d27c"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.993,
+          "rationale": "",
+          "score_0_to_1": 0.63,
+          "title": "Autotuned BLOCK_SIZE sweep with int32 packing and num_warps variants"
+        },
+        "choice": "autotuned_block_sizes",
+        "confidence_0_to_1": 0.78,
+        "decision": "block_size_tuning",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "pure memory-bound kernel, compute intensity is inherently low; autotune helps fit HW warp schedulers",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "fp16 loads/stores are bandwidth-bound; autotune finds best block but no vectorized int32 packing was actually implemented",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "small register footprint with simple elementwise op",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C1",
+        "node_type": "decision",
+        "notes": "CURRENT:\n  does: Autotuned Triton kernel sweeping BLOCK_SIZE (128-2048) and num_warps (1-8) for fp16 elementwise add with masked loads/stores.\n  bottleneck: Memory bandwidth \u2014 elementwise add is fully bandwidth-bound; kernel launch and autotune selection overhead is negligible.\nFOLLOW_THROUGH:\n  aligned_with_intent: yes\nUPDATE_BELIEF:\n  Achieved 1.0072x speedup, consistent with prior round. Autotune is working but marginal gains suggest bandwidth ceiling is nearly reached with simple scalar loads.\n  next bet: Try vectorized loads (load 4x fp16 = 64-bit at once) to better saturate bandwidth on Arc Pro B70, which benefits from wider memory transactions.\nSELF_CHECK: Child of node_C (SIMD-aligned family). Refines block/warp config via autotune. Children should represent further refinements (vectorization, cache hints) rather than alternatives.",
+        "overall_rating_0_to_10": 7.3,
+        "parent_id": "node_C",
+        "solution_ref": {
+          "eval": {
+            "score": 1.0072,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "28ed45dc5d0af23e83ac8342be114e73b1d3d27c",
+          "solution_id": "a70dfbda059eeac7d0bf0cd17ddbd0a77b8bac26"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.97,
+          "rationale": "",
+          "score_0_to_1": 0.66,
+          "title": "Vectorized int32-packed loads (4x fp16 per transaction) on top of autotuned block sizes"
+        },
+        "choice": "int32_packed_vectorized_loads",
+        "confidence_0_to_1": 0.68,
+        "decision": "vectorization_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C1_v1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Child of node_C1 (autotune baseline). This is a chain refinement \u2014 adds vectorized loads on top of autotuned block sizes. Mutually exclusive with scalar load variants at the same level. Packs 2 fp16 values into int32 for 64-bit load transactions to better saturate Arc Pro B70 memory bandwidth. Not a sibling of node_C1 \u2014 it builds on it.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "node_C1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": "a70dfbda059eeac7d0bf0cd17ddbd0a77",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.97,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Reinterpret fp16 buffer as fp32 for 32-bit coalesced loads, add in fp32, store back"
+        },
+        "choice": "coalesced_fp32_reinterpret",
+        "confidence_0_to_1": 0.65,
+        "decision": "memory_access_pattern",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C1_v2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Child of node_C1 (autotuned scalar baseline). Refines memory access by reinterpreting the fp16 tensor as fp32 pairs, performing the add in fp32 domain (or via bitwise split), and writing back. Mutually exclusive with node_C1_v1 (int32 packing) at same level \u2014 both aim at wider loads but via different mechanisms. Arc Pro B70 may prefer natural 32-bit aligned accesses over packed 16-bit ops.",
+        "overall_rating_0_to_10": 7.4,
+        "parent_id": "node_C1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": "a70dfbda059eeac7d0bf0cd17ddbd0a77b8bac26",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "The kernel performs pure elementwise fp16 addition of two [64,4096,4096] tensors (~1.07B elements, ~6.44 GB total I/O), which is a trivially compute-simple but bandwidth-dominated problem. On the Intel Arc Pro B70 (Xe-HPG, ~400 GB/s peak bandwidth, 128 EUs with 16-wide SIMD), the sole optimization axis is maximizing memory bandwidth utilization through coalesced, wide vectorized loads and stores. The kernel can be viewed as a 1D streaming problem over N=1,073,741,824 contiguous fp16 elements: each output element out[i] = x[i] + y[i] with no inter-element dependencies, no reductions, and read-once access. The critical unknowns are: (1) whether the Triton Intel backend auto-vectorizes to 256-bit loads, (2) the optimal BLOCK_SIZE for EU occupancy, and (3) whether a persistent grid pattern reduces scheduling overhead compared to a large dynamic grid.",
+  "open_questions": [
+    "Does the Triton Intel XPU backend automatically emit 256-bit (16xfp16) vector load/store instructions, or does it default to narrower scalar/32-bit loads? This directly determines peak bandwidth achievable.",
+    "What is the actual peak sustained memory bandwidth of Intel Arc Pro B70 under Triton workloads (vs theoretical spec), and what fraction does naive PyTorch eager mode achieve?",
+    "What is the optimal BLOCK_SIZE (elements per program) for the Intel Arc Pro B70's EU scheduler? Too small wastes dispatch overhead; too large may reduce occupancy if EUs are limited in concurrent workgroups.",
+    "Does the Intel Triton backend support tl.load with tensor pointer / block pointer semantics that hint at vectorization, or must alignment be implicit through BLOCK_SIZE choices?",
+    "Is there measurable kernel launch overhead for a grid of ~500K programs (N=1B, BLOCK_SIZE=2048) on Intel XPU, and would a persistent kernel with fewer programs help?",
+    "What subgroup size (num_warps analog) should be used for Intel XPU Triton? The default may differ from NVIDIA's 32-thread warp; Intel EUs use SIMD-16 natively.",
+    "Does reinterpreting fp16 tensors as int32 (packing 2 elements) for load purposes and then casting back work correctly in Triton's Intel backend without triggering precision or alignment errors?",
+    "Is torch.xpu contiguous tensor layout guaranteed to be 128-byte aligned, enabling the compiler to use maximum-width aligned load instructions without masking overhead?"
+  ]
+}

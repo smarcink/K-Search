@@ -1,0 +1,16 @@
+{
+  "task": "elementwise_add_fp16",
+  "problem": "elementwise_add_fp16",
+  "device": "xpu:0",
+  "precision": "fp16",
+  "solutions": [
+    {
+      "solution": "claude-sonnet-4-6_elementwise_add_fp16_r29_20260511_104044_78e4c15d",
+      "status": "passed",
+      "speedup_over_eager": 0.6474,
+      "latency_ms": 0.0608,
+      "score_name": "speedup_over_eager",
+      "score": 0.6474
+    }
+  ]
+}

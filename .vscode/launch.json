@@ -23,11 +23,6 @@
             "justMyCode": true,
             "args": [
                 "swin_fp16/swin_block_fp16.py",
-                "swin_fp16/swin_block_fp16_simplified.py",
-                "swin_fp16/swin_block_fp16_simplified_opus46_triton_r24.py",
-                "swin_fp16/swin_block_fp16_simplified_gpt54_triton_r11.py",
-                "swin_fp16/swin_block_fp16_opus47_triton_r21.py",
-                "swin_fp16/swin_block_fp16_haiku45_triton_r6.py",
                 "--warmup", "100",
                 "--iters", "2000", 
                 "--atol", "1e-2",
@@ -85,11 +80,11 @@
             "justMyCode": true,
             "args": [
                 "elementwise_add_fp16/elementwise_add_fp16.py",  // path to reference
-                "elementwise_add_fp16/ksearch-xpu-opus47-triton",
+                "elementwise_add_fp16/sonnet46",
                 "--precision", "fp16",
                 //"--compile-mode", "default",
                 "--warmup", "100",
-                "--iters", "4000",
+                "--iters", "1000",
                 "--atol", "1e-2",
                 //"--shape", "64", "1024", "1024"
             ]

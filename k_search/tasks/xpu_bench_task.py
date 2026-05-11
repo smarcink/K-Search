@@ -32,8 +32,8 @@ class XpuBenchTaskConfig:
     device: str = "xpu:0"
     precision: str = "fp16"
     num_correct_trials: int = 5
-    num_perf_trials: int = 100
-    num_warmup: int = 10
+    num_perf_trials: int = 1000
+    num_warmup: int = 100
     timeout: int = 300
     max_failure_excerpt_chars: int = 4000
 

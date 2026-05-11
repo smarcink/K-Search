@@ -1,0 +1,867 @@
+{
+  "computed_signals": {
+    "round_index": 50,
+    "trace": {
+      "latency_ms": 0.0606,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 0.0396,
+      "speedup_factor": 0.6543,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "native_fp16_persistent_no_bitcast",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.65,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 has Xe2 cores with SIMD-16/32 execution units. Memory bandwidth is the dominant limiter for elementwise ops. Vectorized fp16 loads (8 elements per load via tl.load with 128-bit transactions) align well with the hardware's memory subsystem.",
+            "notes": "Arithmetic intensity is ~0.5 FLOP/byte (1 add per 4 bytes for 2 fp16 inputs + 1 output). This is firmly memory-bandwidth-bound. Compute units will be massively underutilized relative to their peak TFLOPS.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Total data movement: 3 tensors \u00d7 16\u00d7256\u00d7256 \u00d7 2 bytes = ~6.3 MB. At Intel Arc Pro B70 peak bandwidth (~400 GB/s estimated), theoretical time is ~15 \u00b5s. Actual overhead from kernel launch, indexing, and non-coalesced patterns may dominate.",
+            "rating_0_to_10": 9.0,
+            "risk": "high \u2014 any suboptimal access pattern or insufficient vectorization will directly degrade throughput"
+          },
+          "register_pressure": {
+            "notes": "Elementwise add: load x, load y, add, store. Minimal register usage per thread. Large BLOCK_SIZE increases register pressure linearly but remains well within limits for reasonable tile sizes.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS SUMMARY:\n1) CLASSIFICATION: Pure elementwise kernel (z[i] = x[i] + y[i]). No reductions. Dense access. All dims runtime-variable but product = 1,048,576 elements (fixed for benchmarking). Primary output: z (fp16, same shape as inputs).\n2) CANONICAL MATH: z[i] = x[i] + y[i] for i in [0, N), N=16*256*256=1,048,576. Trivially parallel \u2014 no data dependencies between output elements. Entire computation is one pass over memory.\n3) DATA LAYOUT: x,y,z shape=(16,256,256), dtype=fp16, contiguous (row-major). Linear address = base + i, coalesced if block threads read consecutive i. Read-once from global, no reuse opportunity. Staging to shared memory is unnecessary overhead.\n4) BOTTLENECK HYPOTHESES:\n   - Regime A (small N, <1M): Kernel launch latency dominates. Even a single threadblock wastes time.\n   - Regime B (medium N ~1M, this case): Memory bandwidth is the bottleneck. Need maximum memory throughput via wide vectorized loads and sufficient occupancy to hide latency.\n   - Regime C (large N, >100M): Sustained bandwidth saturation. TLB pressure and L2 thrashing may appear.\n5) KNOBS: BLOCK_SIZE (controls occupancy vs register use), num_warps, vectorization width (load 8 fp16 at once = 128 bits), grid size = ceil(N/BLOCK_SIZE), constexpr vs dynamic BLOCK_SIZE.\n6) SKELETON: Each program handles BLOCK_SIZE contiguous elements. Phase 1: compute pid*BLOCK_SIZE + arange(BLOCK_SIZE) offsets. Phase 2: mask = offsets < N. Phase 3: tl.load x and y with mask. Phase 4: z = x + y. Phase 5: tl.store z. Everything in registers, no shared memory needed, no sync.\n7) CANDIDATE FAMILIES: (A) Flat 1D tiling \u2014 simple, maximally coalesced, best for bandwidth utilization. (B) 2D tiling over last two dims \u2014 unnecessary complexity for contiguous layout. (C) Fused multi-kernel \u2014 overkill for a single add.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a flat 1D Triton kernel that linearizes the (16,256,256) input into N=1,048,576 elements and assigns each program instance a contiguous tile of BLOCK_SIZE fp16 elements. Use tl.load/tl.store with masking on the tail. Choose BLOCK_SIZE as a constexpr power-of-two (e.g., 1024) to maximize vectorization and occupancy on Intel Arc Pro B70 Xe2 cores. Launch grid = ceil(N / BLOCK_SIZE) programs.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 0.85,
+          "rationale": "Flat 1D tiling is the canonical approach for contiguous elementwise ops. It guarantees coalesced access, minimal indexing overhead, and maps directly to Intel XPU's SIMD execution model. BLOCK_SIZE=1024 at fp16 = 2KB per tile, fitting comfortably in registers.",
+          "score_0_to_1": 0.2,
+          "title": "Basic flat 1D tiled kernel without persistence or vectorization"
+        },
+        "choice": "flat_1d_tiled",
+        "confidence_0_to_1": 0.3,
+        "decision": "tiling_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 Xe2 cores prefer SIMD-16 or SIMD-32 width operations. A BLOCK_SIZE that is a multiple of 16 ensures no lane waste. 1024 = 64\u00d716, well-aligned.",
+            "notes": "Single addition per element, AI ~0.5 FLOP/byte. Kernel is memory-bound. Compute units idle ~95% of the time. This is expected and acceptable.",
+            "rating_0_to_10": 3.0,
+            "risk": "low \u2014 the operation is trivially simple; the risk is failing to saturate bandwidth, not compute"
+          },
+          "memory_bandwidth": {
+            "notes": "Flat 1D coalesced access pattern is optimal for bandwidth utilization. Each warp/subgroup reads 32 consecutive fp16 = 64 bytes, aligned with typical cache line sizes. Expected to achieve close to peak bandwidth.",
+            "rating_0_to_10": 9.0,
+            "risk": "medium \u2014 Intel XPU Triton backend may impose overhead on tl.load; need to verify that 128-bit vectorized transactions are emitted"
+          },
+          "register_pressure": {
+            "notes": "3 fp16 vectors of BLOCK_SIZE in registers (x_tile, y_tile, z_tile). At BLOCK_SIZE=1024: 3\u00d71024\u00d72 bytes = 6KB per program. Intel Xe2 has ~128KB GRF per EU cluster; this is manageable.",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "flat_1d_tiled",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Basic flat 1D tiled kernel without persistence or vectorization. Now clearly dominated by vectorized_persistent_combined (0.79x) and even native_fp16_persistent (0.65x). De-prioritized. Cannot combine with 2d_batch_grid (different grid dimensionality). Evidence from multiple rounds confirms persistence+vectorization is needed for good performance on Arc B70.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement the same flat 1D Triton kernel but sweep BLOCK_SIZE over {512, 1024, 2048, 4096} using Triton's autotune decorator with num_warps in {4, 8, 16}. This accounts for Intel XPU's potentially different optimal occupancy point vs NVIDIA GPUs. Let the compiler select the best configuration.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.66,
+          "rationale": "Intel Arc Pro B70 has different EU/subgroup geometry than NVIDIA SMs. The optimal BLOCK_SIZE for bandwidth saturation depends on the number of EUs and their SIMD width, which may differ from typical CUDA defaults. Autotuning empirically finds the hardware-optimal tile.",
+          "score_0_to_1": 0.48,
+          "title": "Autotuned BLOCK_SIZE and num_warps for Intel XPU"
+        },
+        "choice": "autotuned_block_size",
+        "confidence_0_to_1": 0.65,
+        "decision": "block_size_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 specs: ~128 EUs (estimated), SIMD-16 default. Optimal BLOCK_SIZE for bandwidth saturation = (EUs \u00d7 SIMD_width \u00d7 latency_hiding_factor). Likely in range 512-2048.",
+            "notes": "Autotuning trades compile-time cost for runtime optimality. For a microbenchmark, this is the right tradeoff. The kernel logic stays identical to flat_1d_tiled.",
+            "rating_0_to_10": 3.0,
+            "risk": "low \u2014 autotuning cannot hurt correctness, only adds compilation overhead"
+          },
+          "memory_bandwidth": {
+            "notes": "Larger BLOCK_SIZE \u2192 fewer kernel dispatch events per element \u2192 lower launch overhead amortization. But diminishing returns after bandwidth saturation. Autotuning finds the crossover point.",
+            "rating_0_to_10": 9.0,
+            "risk": "low \u2014 any power-of-two BLOCK_SIZE \u2265256 should achieve near-peak bandwidth for N=1M"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_SIZE=4096 at fp16 = 3\u00d74096\u00d72 = 24KB registers per EU thread. May cause spilling on Intel Xe2 if GRF is partitioned differently than NVIDIA. This is a genuine risk for the upper end of the sweep.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium \u2014 large BLOCK_SIZE may spill to L1/L2 on Intel XPU if GRF per thread is smaller than NVIDIA A100"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "autotuned_block_size",
+        "node_type": "decision",
+        "notes": "CURRENT:\n  does: Flat 1D elementwise add kernel with fixed BLOCK_SIZE=4096 and num_warps=16, num_stages=2, no autotune overhead.\n  bottleneck: Memory bandwidth bound; kernel latency is 0.063ms vs eager 0.042ms \u2014 the Triton kernel is SLOWER than eager. The overhead is likely kernel launch latency + suboptimal memory access pattern for this small tensor size on Arc B70.\nFOLLOW_THROUGH:\n  aligned_with_intent: yes \u2014 the code implements a fixed-config kernel without autotuning as intended.\nUPDATE_BELIEF:\n  Speedup is only 0.664x \u2014 the Triton kernel is slower than PyTorch eager on this small workload. The tensor is only ~2MB (1M fp16 elements), which may be too small to amortize Triton kernel launch overhead on Intel XPU, and Arc B70's driver/JIT path may be slower than the fused eager path.\n  next bet: Try using persistent kernels or vector loads (load 4 fp16 as int64) to reduce memory transactions and improve bandwidth utilization; also explore whether num_stages=3 or cache hint improvements help.\nPERF_GAP:\n  expected: 0.6x vs baseline | observed: 0.664x vs baseline (speedup 0.664x, meaning kernel is slower than eager)\n  hypothesis: Intel Arc B70 eager PyTorch may use highly optimized oneDNN/SYCL kernels for elementwise ops that outperform a basic Triton kernel; the 2MB working set may fit in L2/LLC making latency the bottleneck rather than bandwidth, and Triton kernel launch overhead dominates.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": 0.6643,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "7ddd4c66ef195f80b8948ca533bf3b1fbe0382d4"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel that processes the (16,256,256) tensor treating the batch dimension (16) as the grid's outer dimension (program dim 0) and the 256\u00d7256=65536 inner elements as a flat tile per batch item. Use a 2D grid: grid=(16, ceil(65536/BLOCK_SIZE)). Each program handles a contiguous slice of one batch item. This exploits the natural data structure without tensor.view() calls.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.85,
+          "rationale": "By preserving the batch dimension in the grid, we avoid the view/reshape overhead and the kernel launch is semantically cleaner. For Intel XPU's work scheduler, 2D grids may map better to the hardware's EU cluster topology if the batch dimension aligns with cluster count.",
+          "score_0_to_1": 0.18,
+          "title": "2D grid approach for elementwise add"
+        },
+        "choice": "2d_batch_grid",
+        "confidence_0_to_1": 0.25,
+        "decision": "grid_dimensionality",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel XPU work scheduler may benefit from 2D grid for better load balancing across EU clusters if the hardware exposes tile-level parallelism in 2D. However, this is speculative \u2014 the scheduler typically flattens grid dims anyway.",
+            "notes": "The 2D grid adds indexing arithmetic (pid_batch * stride + pid_inner * BLOCK_SIZE + arange). This is 2-3 extra integer ops per program launch, negligible vs memory latency.",
+            "rating_0_to_10": 3.0,
+            "risk": "medium \u2014 2D grid may not improve scheduler behavior on Intel XPU; adds complexity without guaranteed benefit"
+          },
+          "memory_bandwidth": {
+            "notes": "Within each batch item, access remains fully coalesced (consecutive fp16 elements). Across batch items, strides are large (256\u00d7256\u00d72=131072 bytes) but each program accesses a contiguous sub-region, so no strided access within a program.",
+            "rating_0_to_10": 8.0,
+            "risk": "low \u2014 access pattern is coalesced within each program's tile"
+          },
+          "register_pressure": {
+            "notes": "Same as flat_1d_tiled for the same BLOCK_SIZE. The 2D grid only affects pid computation, not per-element register usage.",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "2d_batch_grid",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: 2D grid approach. Clearly dominated by vectorized_persistent_combined (0.79x). De-prioritized. Cannot combine with flat_1d_tiled (different grid dimensionality). Evidence strongly favors persistent 1D grid with vectorized int32 loads for Arc B70.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.85,
+          "rationale": "",
+          "score_0_to_1": 0.62,
+          "title": "Vectorized int32/int64 loads for fp16 elementwise add on Arc B70"
+        },
+        "choice": "vectorized_fp16_loads",
+        "confidence_0_to_1": 0.78,
+        "decision": "memory_access_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "vectorized_fp16_loads",
+        "node_type": "decision",
+        "notes": "CURRENT: Loads pairs of fp16 values as int32 scalars to reduce memory transaction count, uses ~256-512 programs with BLOCK_SIZE tuned for Arc B70. Bottleneck: memory bandwidth - vectorized loads help but single int32 packing only gives 2x width improvement.\n\nFOLLOW_THROUGH:\n- aligned_with_intent: yes - achieved 0.7295x which is best so far\n\nUPDATE_BELIEF: This remains the best performing approach at 0.7295x. The persistent kernel child regressed badly (0.5813x), confirming persistence with too few workgroups is harmful. The next refinement should increase vectorization width (int64 packs 4 fp16) or tune num_programs upward.\n\nnext bet: Use int64 loads to pack 4 fp16 values per transaction (2x wider than current int32) combined with more workgroups to saturate bandwidth.\n\nSELF_CHECK: This is a child of autotuned_block_size focusing on memory access vectorization. It excludes flat_1d_tiled and 2d_batch_grid which are root-level grid alternatives.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "autotuned_block_size",
+        "solution_ref": {
+          "eval": {
+            "score": 0.7295,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "7ddd4c66ef195f80b8948ca533bf3b1fbe0382d4",
+          "solution_id": "52c96d7dd4"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.8,
+          "rationale": "",
+          "score_0_to_1": 0.38,
+          "title": "Persistent kernel loop for reduced launch overhead"
+        },
+        "choice": "persistent_kernel_loop",
+        "confidence_0_to_1": 0.35,
+        "decision": "kernel_execution_pattern",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "persistent_kernel_loop",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Chain refinement of autotuned_block_size (0.66x), which underperformed vs vectorized_fp16_loads branch (0.73x). De-prioritized since vectorized path is clearly better. A persistent kernel with loop may help if launch overhead is significant, but evidence suggests bandwidth is the bottleneck, not launch overhead. Consider deprioritizing in favor of true vectorization.",
+        "overall_rating_0_to_10": 4.0,
+        "parent_id": "autotuned_block_size",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "7ddd4c66ef195f80b8948ca533bf3b1fbe0382d4",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.72,
+          "rationale": "",
+          "score_0_to_1": 0.52,
+          "title": "True int32 vectorized loads (2 fp16 per load) without persistent loop"
+        },
+        "choice": "true_int32_vectorized_loads",
+        "confidence_0_to_1": 0.45,
+        "decision": "vectorization_impl_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "true_int32_vectorized_loads",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This explores int32 vectorization without persistence; it cannot be combined with persistent_kernel_loop (that adds a different axis of optimization). Given vectorized_persistent_combined already combines both and only achieves 0.79x, this standalone variant is likely dominated. De-prioritized.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "vectorized_fp16_loads",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "vectorized_fp16_solution_r3",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.72,
+          "rationale": "",
+          "score_0_to_1": 0.72,
+          "title": "Persistent kernel launching exactly 256 workgroups (one per EU) with internal loop over chunks"
+        },
+        "choice": "persistent_kernel_eu_count",
+        "confidence_0_to_1": 0.75,
+        "decision": "kernel_persistence_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "256 WGs matches EU count but without vectorization the occupancy benefit is offset by fewer in-flight loads",
+            "rating_0_to_10": 4.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Persistent 256-WG loop without vectorization underutilizes bandwidth vs scalar baseline",
+            "rating_0_to_10": 4.0,
+            "risk": "high"
+          },
+          "register_pressure": {
+            "notes": "Simple loop body keeps register pressure manageable",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "persistent_kernel_eu_count",
+        "node_type": "decision",
+        "notes": "CURRENT: Implements a persistent kernel with 256 workgroups (one per EU on Arc B70) using an internal while-loop to process chunks; uses basic fp16 loads without int32 vectorization. Bottleneck: memory bandwidth - the persistent loop reduces kernel launch overhead but doesn't improve memory access patterns, and 256 workgroups may be too few to saturate B70 memory bandwidth for this problem size.\n\nFOLLOW_THROUGH:\n- aligned_with_intent: yes - the kernel does use persistent execution with EU-count-matched workgroups\n- if_no: N/A\n\nUPDATE_BELIEF: The persistent kernel approach regressed from 0.7295x to 0.5813x speedup. Using only 256 workgroups severely under-utilizes the hardware for N=1M elements - the loop overhead per workgroup is too high and the memory pipeline stays underutilized. The vectorized fp16 (int32) approach without persistence was better.\n\nnext bet: Return to vectorized int32 loads (which achieved 0.7295x) and combine with more workgroups (~1024) to better saturate memory bandwidth without persistence overhead.\n\nPERF_GAP: expected 0.72x vs observed 0.5813x. Hypothesized reason: 256 workgroups is too few for 1M elements; each workgroup must loop ~16 times (with BLOCK_SIZE=4096), and the serial loop kills parallelism. The vectorized approach with more workgroups spreads work better.\n\nSELF_CHECK: This node is a child of vectorized_fp16_loads exploring kernel persistence. It conflicts with true_int32_vectorized_loads (different optimization axis) - they cannot both be the active strategy simultaneously.",
+        "overall_rating_0_to_10": 7.2,
+        "parent_id": "vectorized_fp16_loads",
+        "solution_ref": {
+          "eval": {
+            "score": 0.5813,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "vectorized_fp16_solution_r3",
+          "solution_id": "persistent_kernel_eu_count_solution_r13"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.78,
+          "rationale": "",
+          "score_0_to_1": 0.58,
+          "title": "Software-pipelined multi-stage load with loop unrolling on Arc B70"
+        },
+        "choice": "loop_unroll_multistage",
+        "confidence_0_to_1": 0.55,
+        "decision": "pipeline_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "loop_unroll_multistage",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Chain refinement of vectorized_fp16_loads. Mutually exclusive with true_int32_vectorized_loads (different optimization axis: pipelining vs reinterpret-cast). Strategy: use num_stages=3 or 4 to overlap memory loads with compute on Intel Xe2. Also try BLOCK_SIZE=8192 with num_warps=32 to better saturate the 256 EUs. The Xe2 architecture benefits from software pipelining to hide memory latency. Cannot be combined with int32 reinterpret approach in the same kernel - pick one axis. Expected to achieve 0.75-0.80x baseline factor by better hiding DRAM latency.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "vectorized_fp16_loads",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "52c96d7dd4",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.75,
+          "rationale": "",
+          "score_0_to_1": 0.58,
+          "title": "True int32 reinterpret-cast vectorized loads packing 2xfp16 per transaction"
+        },
+        "choice": "int32_reinterpret_2xfp16",
+        "confidence_0_to_1": 0.6,
+        "decision": "vectorization_width",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_elementwise_add_fp16_r13_1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is a chain refinement of vectorized_fp16_loads. Implements true int32 reinterpret-cast to pack 2 fp16 values per load, halving the number of load instructions. Excludes int64_4xfp16 (different vectorization width - that would be a child of this node if it works). The parent used plain fp16 loads; this actually implements the vectorization intent.\nStrategy: Cast x_ptr/y_ptr to int32 pointers, load int32, reinterpret as 2xfp16 using tl.view, add, store back. Use BLOCK_SIZE=2048 (covers 4096 fp16 elements), num_warps=16. This should better saturate B70 memory bandwidth by reducing load instruction count by 2x.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "vectorized_fp16_loads",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "52c96d7dd4",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.79,
+          "rationale": "",
+          "score_0_to_1": 0.79,
+          "title": "Vectorized int32 loads + persistent kernel combined (best known: 0.79x)"
+        },
+        "choice": "int32_vectorized_persistent",
+        "confidence_0_to_1": 0.72,
+        "decision": "vectorization_plus_persistence",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "512 WGs * 8192 elements covers 4M fp16 elements in one pass; fits Arc B70 thread dispatch model",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Int32 loads halve transaction count; 512 WGs keep memory pipeline full",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Bitcast ops are free; modest register usage from loop variables",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "vectorized_persistent_combined",
+        "node_type": "decision",
+        "notes": "CURRENT: Int32 vectorized persistent kernel combining vectorization (packing 2 fp16 into int32) with persistence (512 WGs, BLOCK_SIZE=8192). BOTTLENECK: Memory bandwidth; this approach achieved the best result at 0.79x. Child node native_fp16_persistent_no_bitcast confirmed that bitcast/vectorization is beneficial (0.65x without vs 0.79x with). SELF_CHECK: This is the vectorization+persistence combined node; siblings represent alternative non-combined strategies. The int32 vectorized path is strictly better than native fp16 for this hardware.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "persistent_kernel_eu_count",
+        "solution_ref": {
+          "eval": {
+            "score": 0.7901,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "vectorized_fp16_solution_r3",
+          "solution_id": "vectorized_persistent_combined_r22"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.55,
+          "rationale": "",
+          "score_0_to_1": 0.48,
+          "title": "Native fp16 loads with persistent kernel, no int32 bitcast overhead"
+        },
+        "choice": "native_fp16_no_bitcast",
+        "confidence_0_to_1": 0.55,
+        "decision": "load_strategy_refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Arc B70 benefits more from vectorized int32 memory access patterns than from simplified fp16 native loads.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Native fp16 loads are less efficiently packed than int32 vectorized loads on Arc B70; bandwidth utilization is lower.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "No bitcast means simpler register usage, but not the bottleneck.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "native_fp16_persistent_no_bitcast",
+        "node_type": "decision",
+        "notes": "CURRENT: Uses a persistent kernel with BLOCK_SIZE=8192, 512 WGs, native fp16 loads/stores without any bitcast operations. BOTTLENECK: Memory bandwidth bound; removing bitcast did not help vs the int32 vectorized approach - the extra memory transaction overhead from unvectorized fp16 loads outweighs bitcast cost.\n\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\n- Implemented native fp16 persistent kernel as intended, no bitcast.\n\nUPDATE_BELIEF: Native fp16 without bitcast achieves 0.65x speedup, worse than the best int32 vectorized persistent result of 0.79x. The vectorization benefit of int32 packing outweighs bitcast overhead. The bitcast approach was better.\n\nNEXT BET: Try returning to int32 vectorized persistent with corrected/simplified bitcast, or try tuning num_warps and BLOCK_SIZE more aggressively for the Arc B70's EU count.\n\nPERF_GAP: expected 0.55x baseline factor but got 0.65x speedup_over_eager (different metrics). Performance is actually slightly better than naive expectation but still behind the vectorized approach.\n\nSELF_CHECK: This node is a load-strategy refinement child of vectorized_persistent_combined; it tests whether removing bitcast improves over the int32 path. Result: no improvement, bitcast vectorization is better.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "vectorized_persistent_combined",
+        "solution_ref": {
+          "eval": {
+            "score": 0.6543,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "vectorized_persistent_combined_solution",
+          "solution_id": "native_fp16_persistent_no_bitcast_solution_r41"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.6,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "int64 vectorized loads (4 fp16 per load) with persistent 512-WG loop"
+        },
+        "choice": "int64_4fp16_per_load",
+        "confidence_0_to_1": 0.5,
+        "decision": "wider_vectorization",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "int64_vectorized_persistent",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This node extends the int32 vectorization idea to int64 (4 fp16 per load) to double the load width. Cannot be combined with native_fp16_persistent_no_bitcast (different load strategy). Risk: more complex unpacking of 4 fp16 from int64 may increase ALU overhead further. If the hardware bus width on Arc B70 is 64-bit aligned, this could halve memory transactions.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "vectorized_persistent_combined",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "vectorized_persistent_combined_r22",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.58,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Upgrade to int64 vectorized loads (4 fp16 per load) with persistent 512-WG loop"
+        },
+        "choice": "int64_vectorized_persistent",
+        "confidence_0_to_1": 0.65,
+        "decision": "wider_vectorization",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_elementwise_add_fp16_r29_1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Chain refinement of vectorized_persistent_combined. Replaces int32 (2 fp16/load) with int64 (4 fp16/load) to halve load instruction count and potentially saturate bandwidth more efficiently on Arc B70. Keeps the same 512-WG persistent loop. Mutually exclusive with any sibling that uses int32 vectorization at this level.\nStrategy: load x_ptr and y_ptr as int64, unpack 4 fp16 values, add, repack, store as int64. BLOCK_SIZE adjusted to be multiple of 4. May improve throughput on wide SIMD units of Intel Xe architecture. Risk: more complex bit manipulation, potential for alignment issues if N not divisible by 4 (add fallback).",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "vectorized_persistent_combined",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0599,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0599,
+              "ref_eager_time_ms": 0.0371,
+              "score": 0.6187,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": null,
+              "speedup_over_eager": 0.6187
+            },
+            "reference_latency_ms": 0.0371,
+            "speedup_factor": 0.6187,
+            "status": "passed"
+          },
+          "parent_solution_id": "vectorized_persistent_combined_r22",
+          "solution_id": "35be29fcff2f9a644d9eb50af94404f56f821967"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.62,
+          "rationale": "",
+          "score_0_to_1": 0.45,
+          "title": "Upgrade to int64 vectorized loads (4 fp16 per load) with persistent 512-WG loop"
+        },
+        "choice": "int64_4x_fp16_vectorized",
+        "confidence_0_to_1": 0.55,
+        "decision": "vectorization_width",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_elementwise_add_fp16_r29_1",
+        "node_type": "decision",
+        "notes": "CURRENT: Uses int64 vectorized loads to process 4 fp16 values per load in a persistent 512-WG kernel with BLOCK_SIZE=8192 int64 elements. Bottleneck is memory bandwidth - the int64 bit-manipulation overhead on Intel Arc may negate the wider load benefit. FOLLOW_THROUGH: aligned_with_intent=yes - int64 4x vectorized loads were implemented as intended. UPDATE_BELIEF: The int64 approach (0.62x) is worse than the best known int32 approach (0.79x), suggesting the extra bit manipulation overhead for 4-wide packing hurts more than it helps on Arc B70. Next bet: return to the winning int32 vectorized persistent config (BLOCK_SIZE=8192, NUM_WG=512) which achieved 0.79x - that was the best observed result. PERF_GAP: expected 0.58x vs observed 0.62x (slightly better than expected but worse than int32 variant at 0.79x). SELF_CHECK: This node is a child of vectorized_persistent_combined exploring wider int64 loads; it is dominated by the parent's int32 approach.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "vectorized_persistent_combined",
+        "solution_ref": {
+          "eval": {
+            "score": 0.6187,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "vectorized_persistent_combined_solution",
+          "solution_id": "node_elementwise_add_fp16_r29_1_solution"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.79,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Restore winning int32 persistent config and autotune NUM_WG (256/512/1024)"
+        },
+        "choice": "int32_persistent_wg_sweep",
+        "confidence_0_to_1": 0.7,
+        "decision": "wg_count_tuning",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "restore_int32_tune_wg_count",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is a chain refinement of the int64 node (which underperformed) - restore the best known int32 config (BLOCK_SIZE=8192, 512-WG) and autotune NUM_WG across [256, 512, 768, 1024] to find if 512 is truly optimal for Arc B70's EU count. The int64 sibling is dominated; this focuses on the proven int32 approach. Expected to match or slightly exceed the 0.79x best known result.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "node_elementwise_add_fp16_r29_1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "node_elementwise_add_fp16_r29_1_solution",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.75,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Simplified int32 bitcast persistent kernel: view tensors as int32 at Python level, add fp16 via reinterpretation"
+        },
+        "choice": "simplified_int32_bitcast",
+        "confidence_0_to_1": 0.72,
+        "decision": "bitcast_implementation_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "int32_vectorized_simplified_bitcast",
+        "node_type": "decision",
+        "notes": "INTENT: Re-implement the int32 vectorized persistent kernel using a cleaner bitcast strategy - view fp16 tensors as int32 at the PyTorch level (x.view(torch.int32)) before passing to Triton kernel, then load int32, bitcast to fp16 pairs, add, bitcast back, store int32. This avoids complex in-kernel reinterpretation. BLOCK_SIZE=4096 (processing 8192 fp16 elements), 512 WGs. SELF_CHECK: This is a chain refinement of native_fp16_persistent_no_bitcast, not a sibling of the fp16 approach - it restores int32 packing but with a simpler implementation path via Python-level view. Excludes pure fp16 approach (proven slower at 0.654x). impacts: memory_bandwidth=high benefit from int32 packing, register_pressure=moderate, compute_intensity=low (elementwise add).",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "native_fp16_persistent_no_bitcast",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "native_fp16_persistent_no_bitcast_r41",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.45,
+          "rationale": "",
+          "score_0_to_1": 0.62,
+          "title": "Return to int32 vectorized persistent with swept num_warps (4,8,16) and WG count (256,512,1024)"
+        },
+        "choice": "int32_vectorized_warp_grid_sweep",
+        "confidence_0_to_1": 0.65,
+        "decision": "warp_tuning_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Arc B70 has 128 EUs; sweeping WG count from 256-1024 and warps 4-16 should find the sweet spot for occupancy and bandwidth saturation.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Int32 packing doubles effective memory bandwidth utilization for fp16 data on Arc B70.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Int32 loads halve the number of load instructions; moderate register usage.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "int32_vectorized_tuned_warps",
+        "node_type": "decision",
+        "notes": "INTENT: The native fp16 path (0.65x) is worse than int32 vectorized (0.79x). Return to int32 vectorized persistent approach but sweep num_warps in [4,8,16] and num_wgs in [256,512,1024] using triton.autotune to find the optimal configuration for Arc B70's 128 EUs. Use simplified bitcast: view x/y as int32 tensors at Python level before kernel launch to avoid in-kernel bitcast overhead entirely.\n\nSELF_CHECK: This is a chain refinement of native_fp16_persistent_no_bitcast (which confirmed bitcast vectorization is better). It does not duplicate siblings; it re-applies int32 vectorization with better tuning. Cannot combine with flat_1d_tiled (different tiling strategy) or 2d_batch_grid (different grid shape).",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "native_fp16_persistent_no_bitcast",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "native_fp16_persistent_no_bitcast_solution_r41",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "elementwise_add_fp16 is a pure memory-bandwidth-bound elementwise kernel computing z[i] = x[i] + y[i] over N=1,048,576 fp16 elements (shape 16\u00d7256\u00d7256, contiguous). Arithmetic intensity is ~0.5 FLOP/byte, making bandwidth saturation the sole optimization target. The canonical Triton approach linearizes the tensor and assigns contiguous tiles to each program instance, relying on coalesced 128-bit vectorized loads/stores to maximize Intel Arc Pro B70 Xe2 memory throughput. Key constraints are: (1) the Intel XPU Triton backend must emit properly vectorized memory instructions, (2) optimal BLOCK_SIZE depends on Xe2 EU/SIMD geometry which differs from NVIDIA, and (3) kernel launch latency overhead must be minimized relative to the ~15\u00b5s theoretical compute time. The primary risk is suboptimal vectorization by the Intel Triton compiler, which would reduce throughput by up to 8\u00d7.",
+  "open_questions": [
+    "Does the Intel XPU Triton backend emit 128-bit vectorized loads for fp16 tl.load with power-of-two BLOCK_SIZE, or does it fall back to scalar/32-bit transactions?",
+    "What is the actual peak memory bandwidth of the Intel Arc Pro B70, and how close can a simple Triton elementwise kernel get to it?",
+    "What is the optimal BLOCK_SIZE for bandwidth saturation on Intel Xe2 EUs \u2014 does it differ significantly from typical NVIDIA values (512-1024)?",
+    "Does triton.autotune work correctly on the Intel XPU backend, and what is the autotuning overhead for a microbenchmark kernel?",
+    "Is there a Triton-for-Intel (intel-xpu-backend) specific pragma or hint (e.g., num_warps, num_stages for software pipelining) that improves memory latency hiding on Xe2?",
+    "Does reshaping the (16,256,256) tensor to (N,) via .view() or .reshape() incur any overhead on Intel XPU, or is the flat linearization approach preferred?",
+    "What is the kernel launch overhead for Intel XPU Triton kernels vs PyTorch eager mode XPU add \u2014 is the overhead comparable to or larger than CUDA?",
+    "Does the Intel XPU Triton backend support software pipelining (num_stages > 1) for memory-bound kernels, and would it improve latency hiding for this access pattern?"
+  ]
+}

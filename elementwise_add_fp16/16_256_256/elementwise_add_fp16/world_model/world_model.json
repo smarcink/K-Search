@@ -1,0 +1,410 @@
+{
+  "computed_signals": {
+    "round_index": 10,
+    "trace": {
+      "latency_ms": 0.0536,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 0.0367,
+      "speedup_factor": 0.686,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1_autotune",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.6,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 (Xe-HPG/Battlemage class). Wide SIMD, prefers coalesced contiguous fp16 loads. Triton XPU backend likely benefits from vectorized 128-bit loads (8x fp16).",
+            "notes": "Elementwise add is purely memory-bound; compute intensity ~1 FLOP / 6 bytes. HW fit trivial; focus on saturating DRAM/L2 bandwidth.",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Total 16*256*256 = 1,048,576 fp16 elements per tensor = 2 MiB each. Read 4 MiB, write 2 MiB total = 6 MiB traffic. Bound by BW.",
+            "rating_0_to_10": 9.0,
+            "risk": "Achieving peak BW requires correct block size + vectorization; small tensor may underutilize occupancy."
+          },
+          "register_pressure": {
+            "notes": "Trivial - just load, add, store. Block size determines register footprint.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS: (1) Classification: pure elementwise binary op (add) over dense contiguous fp16 tensors, no reduction, fully independent per-element. (2) Math: out[i]=x[i]+y[i] over N=1,048,576 elements; trivial flatten to 1D. (3) Layout: x,y,out all contiguous fp16 [16,256,256]; can treat as 1D N=1M. Single read of each input, single write. Read-once, no reuse. (4) Regimes: (a) small-N latency-bound: kernel launch overhead dominates; (b) mid-N (this case ~2MiB inputs) bandwidth-bound on DRAM/L2; (c) very-large N pure DRAM BW. Our case is (b). (5) Knobs: BLOCK_SIZE (1k-16k), num_warps, vector width via tl.load of contiguous range, grid shape (1D vs masked tail), mask vs aligned no-mask, num_stages/pipelining. (6) Skeleton: 1D grid, each program loads BLOCK elements of x and y with mask, adds, stores. (7) Families: F1 simple 1D contiguous tiled kernel (best fit); F2 multi-element-per-thread unrolled (loop inside program for fewer launches); F3 grid-stride loop. Primary limiter for all: DRAM BW. Avoid implementation-tactic-named families at L1. OPEN ACTIONS below explore BLOCK_SIZE/num_warps tuning and unrolling vs grid-stride alternatives.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "none"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a straightforward 1D contiguous elementwise add Triton kernel: flatten tensors to N elements, launch grid=ceil(N/BLOCK), each program loads BLOCK elements of x and y with mask, computes x+y, stores. Use BLOCK_SIZE=1024 and num_warps=4 as initial defaults. This is the baseline custom kernel.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.36,
+          "rationale": "Establishes a correct, simple Triton kernel that should already match or beat eager due to reduced dispatch overhead.",
+          "score_0_to_1": 0.75,
+          "title": "Baseline 1D tiled elementwise kernel"
+        },
+        "choice": "family_simple_tiled",
+        "confidence_0_to_1": 0.9,
+        "decision": "Pick simple 1D tiled family as starting point",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Contiguous loads ideal for Intel XPU vectorized memory ops.",
+            "notes": "Single add per element; HW underutilized on compute.",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Bandwidth bound; current config already large blocks.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "BLOCK=8192 with num_warps=16 is reasonable.",
+            "rating_0_to_10": 4.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: BLOCK=8192, num_warps=16 simple 1D tiled add; best so far at 1.36x speedup. bottleneck: memory bandwidth. Keep as active best; refine via vectorization.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0818,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0818,
+              "ref_eager_time_ms": 0.111,
+              "score": 1.3579,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": null,
+              "speedup_over_eager": 1.3579
+            },
+            "reference_latency_ms": 0.111,
+            "speedup_factor": 1.3579,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "074a7f096fc177ac8205ed0407c373bb57c3e54e"
+        }
+      },
+      {
+        "action": {
+          "description": "Use a larger BLOCK_SIZE (e.g., 4096 or 8192) with num_warps=8 or 16 to increase per-program work and amortize launch / address-compute overhead. Each program still processes a single contiguous tile but wider, potentially mapping better to wide XPU SIMD.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.35,
+          "rationale": "For a 1M-element workload, fewer larger programs may saturate BW with less overhead on XPU.",
+          "score_0_to_1": 0.35,
+          "title": "Large-block tiled kernel (BLOCK=4096-8192, num_warps tuned)"
+        },
+        "choice": "family_large_block",
+        "confidence_0_to_1": 0.4,
+        "decision": "Alternative tile-size strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Larger tiles align with wide Xe SIMD vector width; ensure num_warps matches.",
+            "notes": "Still BW-bound; better instruction-level parallelism.",
+            "rating_0_to_10": 7.0,
+            "risk": "Too few programs may underutilize EUs on small N=1M."
+          },
+          "memory_bandwidth": {
+            "notes": "Larger contiguous loads improve BW efficiency.",
+            "rating_0_to_10": 9.0,
+            "risk": "Diminishing returns past L2 line size."
+          },
+          "register_pressure": {
+            "notes": "BLOCK=8192 fp16 -> 16KB per buffer per program; manageable but watch register usage.",
+            "rating_0_to_10": 5.0,
+            "risk": "Possible spills if num_warps too low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: sibling to n1/n3; mutually exclusive block-size strategy. DOWNSCORED: n1 already uses BLOCK=8192/num_warps=16 (effectively this strategy) and achieved 1.36x, so this node is largely subsumed. Keep open only as a quick sweep alternative.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use a grid-stride loop: launch a fixed-size grid (e.g., based on number of XPU SMs/EUs) and have each program iterate over multiple tiles. Reduces total program count and launch overhead; keeps each tile size modest (e.g., 1024-2048) for good vectorization.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "Persistent-style kernel can hide launch overhead and improve cache reuse of address computations; useful if many small programs underutilize XPU scheduler.",
+          "score_0_to_1": 0.5,
+          "title": "Grid-stride loop persistent kernel"
+        },
+        "choice": "family_grid_stride",
+        "confidence_0_to_1": 0.5,
+        "decision": "Alternative parallelization scheme",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Requires knowing/choosing a good grid size for XPU; persistent kernels may not be standard on Triton XPU.",
+            "notes": "Same compute; potentially better scheduling.",
+            "rating_0_to_10": 6.0,
+            "risk": "Triton XPU backend may handle this less optimally than NVIDIA."
+          },
+          "memory_bandwidth": {
+            "notes": "Same effective BW pattern, contiguous tiles.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Loop variables minor.",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: sibling to n1/n2; differs in launch shape (grid-stride loop reduces program count, increases per-program work). Mutually exclusive with simple-tiled mapping.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.45,
+          "rationale": "",
+          "score_0_to_1": 0.2,
+          "title": "Add triton.autotune over (BLOCK_SIZE, num_warps, num_stages)"
+        },
+        "choice": "autotune_block_warps",
+        "confidence_0_to_1": 0.4,
+        "decision": "Autotune BLOCK_SIZE and num_warps within the simple tiled family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "autotune dispatch overhead hurts small kernels",
+            "rating_0_to_10": 4.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "no change in IO pattern",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "varies with BLOCK",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_autotune",
+        "node_type": "decision",
+        "notes": "CURRENT: does=1D tiled elementwise add with BLOCK_SIZE=8192, num_warps=16. bottleneck=bandwidth. FOLLOW_THROUGH: aligned_with_intent=no; intent was triton.autotune over (BLOCK_SIZE,num_warps,num_stages) but current_code has no autotune decorator. UPDATE_BELIEF: eval shows 0.69x (regression vs prior 1.36x) -- ref_eager_time_ms shrank from 0.111 to 0.0367, suggesting noisy/different baseline; absolute kernel time grew slightly (0.0536 vs 0.0818). Next bet: actually implement triton.autotune with a small config sweep, and try vectorized loads. PERF_GAP: expected 1.45x vs observed 0.69x; likely cause: autotune not implemented + baseline timing shift.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0536,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0536,
+              "ref_eager_time_ms": 0.0367,
+              "score": 0.686,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": null,
+              "speedup_over_eager": 0.686
+            },
+            "reference_latency_ms": 0.0367,
+            "speedup_factor": 0.686,
+            "status": "passed"
+          },
+          "parent_solution_id": "074a7f096fc177ac8205ed0407c373bb57c3e54e",
+          "solution_id": "301f1147f0d1f0af7399ccdb6955a2617a63085d"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Reinterpret as float4/int4 (or 2x) wider loads to saturate bandwidth"
+        },
+        "choice": "vectorized_io",
+        "confidence_0_to_1": 0.55,
+        "decision": "Vectorized loads/stores via wider dtype reinterpret",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_vec",
+        "node_type": "decision",
+        "notes": "Composable refinement of n1. Pack 2-4 float32s per lane via pointer reinterpret to improve effective bandwidth on B70. Mutually exclusive with n1_autotune only at runtime; can be combined in later child.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "074a7f096fc177ac8205ed0407c373bb57c3e54e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.45,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Add inner loop per program (each program handles K tiles)"
+        },
+        "choice": "inner_grid_stride",
+        "confidence_0_to_1": 0.5,
+        "decision": "Inner grid-stride loop within program to amortize launch overhead",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "better amortization of launch",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "same IO volume",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "unchanged per-iter",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_grid_stride_inner",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n1 (not sibling); composable but mutually exclusive with n1_vec at implementation level \u2014 pick one path first. Aims to reduce program count and amortize dispatch cost, addressing the likely small-kernel overhead seen in n1_autotune.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "074a7f096fc177ac8205ed0407c373bb57c3e54e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Implement @triton.autotune decorator with config grid"
+        },
+        "choice": "implement_autotune_decorator",
+        "confidence_0_to_1": 0.6,
+        "decision": "Actually add @triton.autotune with configs sweeping BLOCK_SIZE in {1024,2048,4096,8192,16384}, num_warps in {4,8,16,32}, num_stages in {1,2,3}",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_autotune_impl",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: this is the corrective child for the misaligned parent; mutually exclusive with manual-tuning alternatives because it delegates choice to Triton's autotuner. Next step after n1_autotune was not actually implemented.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1_autotune",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Pure elementwise fp16 add over two contiguous tensors of shape [16,256,256] (N=1,048,576). Fully memory-bandwidth bound on Intel Arc Pro B70; no reductions, no reuse, trivially flattenable to 1D. Key constraints: maximize coalesced contiguous fp16 throughput, minimize launch overhead, choose BLOCK_SIZE/num_warps that saturate XPU DRAM/L2 bandwidth for ~6 MiB total traffic. Correctness within fp16 tolerance is trivial since op is exact add.",
+  "open_questions": [
+    "Optimal BLOCK_SIZE on Intel Arc Pro B70 Triton backend (1024 vs 2048 vs 4096 vs 8192)?",
+    "Best num_warps setting for XPU (does Triton XPU honor num_warps similarly to CUDA)?",
+    "Does the Triton XPU backend auto-vectorize fp16 contiguous loads to 128-bit, or do we need explicit vector hints?",
+    "Is there meaningful launch overhead reduction from persistent/grid-stride kernels on XPU for N~1M?",
+    "Are inputs guaranteed contiguous (they are from torch.randn, but should we add a .contiguous() guard)?",
+    "Does torch.empty_like on XPU incur sync overhead worth avoiding by reusing buffers?",
+    "Will autotuning across BLOCK_SIZE configs add unacceptable warm-up cost in benchmarking?"
+  ]
+}
