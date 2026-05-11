@@ -7,6 +7,14 @@ Defines Model, get_inputs(), and get_init_inputs() following KernelBench convent
 import torch
 
 
+def get_device():
+    if torch.xpu.is_available():
+        return "xpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 class ElementwiseAdd(torch.nn.Module):
     """Simple elementwise addition of two tensors."""
 
@@ -23,8 +31,9 @@ Model = ElementwiseAdd
 
 def get_inputs():
     """Return input tensors for benchmarking (fp16, on GPU)."""
-    x = torch.randn(16, 256, 256, dtype=torch.float16, device="cuda")
-    y = torch.randn(16, 256, 256, dtype=torch.float16, device="cuda")
+    device = get_device()
+    x = torch.randn(16, 256, 256, dtype=torch.float16, device=device)
+    y = torch.randn(16, 256, 256, dtype=torch.float16, device=device)
     return [x, y]
 
 
@@ -34,7 +43,8 @@ def get_init_inputs():
 
 
 if __name__ == "__main__":
-    model = ElementwiseAdd().half().cuda()
+    device = get_device()
+    model = ElementwiseAdd().half().to(device)
     inputs = get_inputs()
     out = model(*inputs)
     print(f"Input shapes: {inputs[0].shape}, {inputs[1].shape}")

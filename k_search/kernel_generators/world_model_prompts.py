@@ -10,6 +10,8 @@ from __future__ import annotations
 from .kernel_generator_prompts import (
     CUDA_OPTIMIZATION_HINTS,
     TRITON_OPTIMIZATION_HINTS,
+    XPU_TRITON_OPTIMIZATION_HINTS,
+    _is_intel_gpu,
 )
 
 
@@ -212,13 +214,14 @@ def get_generate_code_from_action_prompt_from_text(
     """Task-agnostic variant: accepts rendered definition text."""
     lang = (language or "").lower()
     if lang == "triton":
+        hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return TRITON_ACTION_PROMPT.format(
             definition=str(definition_text or "").strip(),
             base_code=base_code,
             action_text=action_text,
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
-            hints=TRITON_OPTIMIZATION_HINTS,
+            hints=hints,
         )
     if lang == "cuda":
         return CUDA_ACTION_PROMPT.format(
@@ -246,6 +249,7 @@ def get_generate_code_from_spec_with_action_prompt_from_text(
     """
     lang = (language or "").lower()
     if lang == "triton":
+        hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return (
             "You are implementing a SPECIFIC NEXT ACTION starting from the specification.\n\n"
             + TRITON_ACTION_PROMPT.format(
@@ -254,7 +258,7 @@ def get_generate_code_from_spec_with_action_prompt_from_text(
                 action_text=action_text,
                 target_gpu=target_gpu,
                 code_format=str(code_format or "").strip(),
-                hints=TRITON_OPTIMIZATION_HINTS,
+                hints=hints,
             )
         )
     if lang == "cuda":
@@ -326,6 +330,7 @@ def get_debug_generated_code_prompt_from_text(
     if dr > mr:
         dr = mr
     if lang == "triton":
+        hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return TRITON_DEBUG_PROMPT.format(
             definition=str(definition_text or "").strip(),
             base_code=base_code,
@@ -337,7 +342,7 @@ def get_debug_generated_code_prompt_from_text(
             max_rounds=mr,
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
-            hints=TRITON_OPTIMIZATION_HINTS,
+            hints=hints,
         )
     if lang == "cuda":
         return CUDA_DEBUG_PROMPT.format(
@@ -407,6 +412,7 @@ def get_improve_generated_code_prompt_from_text(
     if dr > mr:
         dr = mr
     if lang == "triton":
+        hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return TRITON_IMPROVE_PROMPT.format(
             definition=str(definition_text or "").strip(),
             base_code=base_code,
@@ -417,7 +423,7 @@ def get_improve_generated_code_prompt_from_text(
             max_rounds=mr,
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
-            hints=TRITON_OPTIMIZATION_HINTS,
+            hints=hints,
         )
     if lang == "cuda":
         return CUDA_IMPROVE_PROMPT.format(

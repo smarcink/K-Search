@@ -243,7 +243,7 @@ def main():
     parser.add_argument("--local", required=False, default=None, help="Path to flashinfer-trace dataset root (flashinfer only)")
     parser.add_argument(
         "--task-source",
-        choices=["flashinfer", "gpumode", "kernelbench", "cuda_kernel"],
+        choices=["flashinfer", "gpumode", "kernelbench", "cuda_kernel", "xpu_bench"],
         default="flashinfer",
         help="Task backend to use.",
     )
@@ -345,6 +345,17 @@ def main():
         help="dtype for KernelBench eval (model+inputs are cast to this; allclose tolerance is 1e-4 for fp32, 1e-2 for fp16/bf16)",
     )
 
+    # XPU Bench options
+    parser.add_argument("--xpu-bench-device", default="xpu:0", help="XPU device string (e.g. xpu:0, xpu:1)")
+    parser.add_argument(
+        "--xpu-bench-precision",
+        default="fp16",
+        choices=["fp32", "fp16", "bf16"],
+        help="dtype for XPU Bench eval",
+    )
+    parser.add_argument("--xpu-bench-num-correct-trials", type=int, default=5, help="Number of correctness trials for XPU Bench")
+    parser.add_argument("--xpu-bench-num-perf-trials", type=int, default=100, help="Number of performance trials for XPU Bench")
+
     args = parser.parse_args()
 
     api_key = args.api_key or os.getenv("LLM_API_KEY")
@@ -416,6 +427,19 @@ def main():
             precision=args.kernelbench_precision,
             rtol=args.rtol,
             atol=args.atol,
+            artifacts_dir=args.artifacts_dir,
+        )
+    elif task_source == "xpu_bench":
+        from k_search.tasks.xpu_bench_task import XpuBenchTask
+
+        if not task_path:
+            raise ValueError("--task-path is required for --task-source=xpu_bench (path to reference .py file with Model class)")
+        task = XpuBenchTask(
+            ref_path=task_path,
+            device=args.xpu_bench_device,
+            precision=args.xpu_bench_precision,
+            num_correct_trials=args.xpu_bench_num_correct_trials,
+            num_perf_trials=args.xpu_bench_num_perf_trials,
             artifacts_dir=args.artifacts_dir,
         )
     else:

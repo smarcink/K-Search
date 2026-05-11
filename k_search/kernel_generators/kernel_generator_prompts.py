@@ -8,6 +8,25 @@ from __future__ import annotations
 # Note: keep these hints generic (avoid naming specific low-level instructions).
 CUDA_OPTIMIZATION_HINTS = "** You MUST use MMA to utilize the tensor cores on H100! ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."
 
+# Intel XPU Triton hints (placeholder — refine with internal HW docs)
+XPU_TRITON_OPTIMIZATION_HINTS = """
+** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
+
+Key Triton performance principles for Intel XPU:
+- This kernel targets an Intel GPU (Xe2 / Battlemage architecture), NOT an NVIDIA GPU.
+- Use tl.dot() for matrix operations to leverage Intel Xe Matrix Extensions (XMX).
+  Sub-group sizes are 16 or 32; choose tile sizes that are multiples of these.
+- Stage data through shared memory (SRAM): load input tiles with tl.load into a block,
+  then use tl.dot for the compute. This maximizes data reuse and hides memory latency.
+- The device has 256 Execution Units (EUs), 32 subslices, 32 GB device memory, 192-bit bus.
+- Do NOT reference cuDNN, cuBLAS, CUTLASS, MMA instructions, or any NVIDIA-specific APIs.
+- Do NOT use torch.cuda — use torch.xpu for device operations.
+- Triton kernels use the same standard primitives (tl.load, tl.store, tl.dot, tl.program_id, etc.)
+  regardless of backend — the Intel XPU Triton backend compiles them automatically.
+- Fusing elementwise ops (bias, activation, pooling) into a matmul epilogue is where
+  custom Triton kernels can beat torch.compile.
+"""
+
 # Triton-appropriate subset
 TRITON_OPTIMIZATION_HINTS = """
 ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
@@ -91,6 +110,19 @@ Current Implementation:
 Generate the corrected and optimized implementation:"""
 
 
+def _is_intel_gpu(target_gpu: str) -> bool:
+    """Check if the target GPU string refers to an Intel device."""
+    tg = (target_gpu or "").lower()
+    return any(kw in tg for kw in ("intel", "arc", "xpu", "xe", "battlemage", "ponte vecchio", "bmg"))
+
+
+def _select_triton_hints(target_gpu: str) -> str:
+    """Return the appropriate Triton optimization hints for the target GPU."""
+    if _is_intel_gpu(target_gpu):
+        return XPU_TRITON_OPTIMIZATION_HINTS
+    return TRITON_OPTIMIZATION_HINTS
+
+
 def get_prompt_from_definition_text(
     language: str,
     definition_text: str,
@@ -108,11 +140,12 @@ def get_prompt_from_definition_text(
 
     # Only Triton/CUDA prompts include advanced hints
     if language == "triton":
+        hints = _select_triton_hints(target_gpu)
         return prompts[language].format(
             definition=str(definition_text or "").strip(),
             target_gpu=target_gpu,
             per_task_requirement=str(per_task_requirement or "").strip(),
-            hints=TRITON_OPTIMIZATION_HINTS,
+            hints=hints,
         )
     if language == "cuda":
         return prompts[language].format(
@@ -149,13 +182,14 @@ def get_optimization_prompt_from_definition_text(
     )
 
     if language == "triton":
+        hints = _select_triton_hints(target_gpu)
         return optimization_prompts[language].format(
             definition=str(definition_text or "").strip(),
             trace_logs=str(trace_logs or "").strip(),
             current_code=current_code,
             target_gpu=target_gpu,
             per_task_requirement=str(per_task_requirement or "").strip(),
-            hints=TRITON_OPTIMIZATION_HINTS,
+            hints=hints,
             extra_context=extra_context,
         )
     if language == "cuda":

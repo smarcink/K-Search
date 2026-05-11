@@ -23,6 +23,24 @@ BASE_DIMENSIONS: tuple[str, ...] = (
     "communication",
 )
 
+XPU_DIMENSIONS: tuple[str, ...] = (
+    "tiling_policy",
+    "subgroup_scheduling",
+    "eu_utilization",
+    "xmx_usage",
+    "memory_bandwidth",
+    "register_pressure",
+    "subgroup_efficiency",
+)
+
+
+def get_dimensions_for_target(target_gpu: str = "H100") -> tuple[str, ...]:
+    """Return the appropriate dimension set for the target GPU."""
+    from k_search.kernel_generators.kernel_generator_prompts import _is_intel_gpu
+    if _is_intel_gpu(target_gpu):
+        return XPU_DIMENSIONS
+    return BASE_DIMENSIONS
+
 DIMENSION_ENTRY_DEFAULT: dict[str, Any] = {
     "hypothesis": "",
     "confidence": 0.0,
