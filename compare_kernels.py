@@ -33,6 +33,8 @@ import torch
 import torch.utils.cpp_extension
 from torch import nn
 
+from k_search.utils.device import get_device, get_device_name, synchronize, create_event
+
 SEED = 42
 
 
@@ -46,7 +48,7 @@ def _copy_weights(dst: nn.Module, src: nn.Module) -> None:
         print(f"    [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
 
 
-def load_reference(ref_path: Path, precision: str = "fp16"):
+def load_reference(ref_path: Path, precision: str = "fp16", device: str = "cuda"):
     """Load and instantiate the reference model."""
     ref_dir = str(ref_path.parent)
     if ref_dir not in sys.path:
@@ -62,7 +64,7 @@ def load_reference(ref_path: Path, precision: str = "fp16"):
     dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
     dtype = dtype_map.get(precision, torch.float16)
 
-    model = model_cls(*get_init_inputs_fn()).to(dtype=dtype, device="cuda").eval()
+    model = model_cls(*get_init_inputs_fn()).to(dtype=dtype, device=device).eval()
     return model, get_inputs_fn, get_init_inputs_fn, dtype
 
 
@@ -89,7 +91,7 @@ def compile_kernel(kernel_h: str, kernel_cu: str, main_cpp: str, name: str = "ke
     return module
 
 
-def load_triton_model(code: str, init_inputs: list, dtype, name: str = "triton"):
+def load_triton_model(code: str, init_inputs: list, dtype, name: str = "triton", device: str = "cuda"):
     """Load a triton/python ModelNew from source code string."""
     tmp_dir = tempfile.mkdtemp(prefix=f"compare_triton_{name}_")
     model_path = Path(tmp_dir) / "model_new.py"
@@ -99,7 +101,7 @@ def load_triton_model(code: str, init_inputs: list, dtype, name: str = "triton")
     exec(compile(code, str(model_path), "exec"), mod_globals)
 
     model_cls = mod_globals["ModelNew"]
-    model = model_cls(*init_inputs).to(dtype=dtype, device="cuda").eval()
+    model = model_cls(*init_inputs).to(dtype=dtype, device=device).eval()
     return model
 
 
@@ -173,36 +175,36 @@ def collect_kernels(paths: list[str]) -> list[dict]:
 
 
 @torch.inference_mode()
-def benchmark_model(model, inputs: list[torch.Tensor], warmup: int, iters: int) -> tuple[float, torch.Tensor]:
+def benchmark_model(model, inputs: list[torch.Tensor], warmup: int, iters: int, device: str = "cuda") -> tuple[float, torch.Tensor]:
     """Benchmark a model (reference or triton ModelNew), return (ms_per_iter, output)."""
     for _ in range(warmup):
         out = model(*inputs)
-    torch.cuda.synchronize()
+    synchronize(device)
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = create_event(device)
+    end = create_event(device)
     start.record()
     for _ in range(iters):
         out = model(*inputs)
     end.record()
-    torch.cuda.synchronize()
+    synchronize(device)
     return start.elapsed_time(end) / iters, out
 
 
 @torch.inference_mode()
-def benchmark_cuda_module(module, inputs: list[torch.Tensor], warmup: int, iters: int) -> tuple[float, torch.Tensor]:
+def benchmark_cuda_module(module, inputs: list[torch.Tensor], warmup: int, iters: int, device: str = "cuda") -> tuple[float, torch.Tensor]:
     """Benchmark a compiled CUDA module (with .run()), return (ms_per_iter, output)."""
     for _ in range(warmup):
         out = module.run(*inputs)
-    torch.cuda.synchronize()
+    synchronize(device)
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = create_event(device)
+    end = create_event(device)
     start.record()
     for _ in range(iters):
         out = module.run(*inputs)
     end.record()
-    torch.cuda.synchronize()
+    synchronize(device)
 
     if isinstance(out, (list, tuple)):
         out = out[0] if len(out) == 1 else torch.cat([o.flatten() for o in out])
@@ -242,14 +244,18 @@ Examples:
                         help="Apply torch.compile to the reference model with this mode")
     parser.add_argument("--shape", type=int, nargs="+", default=None,
                         help="Override input tensor shape (e.g. --shape 64 1024 1024)")
+    parser.add_argument("--device", default=None,
+                        help="Device to use (e.g. cuda:0, xpu:0). Auto-detected if omitted.")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        sys.exit("CUDA is required.")
+    device = get_device(args.device)
+    backend = device.split(":")[0]
+    if backend not in ("cuda", "xpu"):
+        sys.exit("CUDA or XPU GPU is required.")
 
     torch.manual_seed(SEED)
 
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Device: {device}  GPU: {get_device_name(device)}")
     print(f"Precision: {args.precision}  Warmup: {args.warmup}  Iters: {args.iters}")
     if args.compile_mode:
         print(f"torch.compile mode: {args.compile_mode}")
@@ -260,30 +266,38 @@ Examples:
     if not ref_path.exists():
         sys.exit(f"Reference file not found: {ref_path}")
     print(f"Reference: {ref_path.name}")
-    model, get_inputs_fn, get_init_inputs_fn, dtype = load_reference(ref_path, args.precision)
+    model, get_inputs_fn, get_init_inputs_fn, dtype = load_reference(ref_path, args.precision, device=device)
 
     # Get inputs
     if args.shape:
         orig_inputs = get_inputs_fn()
         num_tensors = sum(1 for x in orig_inputs if isinstance(x, torch.Tensor))
-        inputs = [torch.randn(args.shape, dtype=dtype, device="cuda") for _ in range(num_tensors)]
+        inputs = [torch.randn(args.shape, dtype=dtype, device=device) for _ in range(num_tensors)]
     else:
         inputs = get_inputs_fn()
-        inputs = [x.to(dtype=dtype, device="cuda") if isinstance(x, torch.Tensor) else x for x in inputs]
+        inputs = [x.to(dtype=dtype, device=device) if isinstance(x, torch.Tensor) else x for x in inputs]
     print(f"Input shapes: {[tuple(t.shape) for t in inputs if isinstance(t, torch.Tensor)]}")
 
     # Compute reference output from EAGER model (for correctness comparison)
     with torch.inference_mode():
         ref_out = model(*inputs)
-    torch.cuda.synchronize()
+    synchronize(device)
 
     # Optionally compile reference for timing (compile can change numerics via tf32 etc.)
     ref_model_for_timing = model
     if args.compile_mode:
-        ref_model_for_timing = torch.compile(model, mode=args.compile_mode)
+        try:
+            compiled = torch.compile(model, mode=args.compile_mode)
+            # Warm-up to trigger compilation and catch errors early
+            with torch.inference_mode():
+                compiled(*inputs)
+            synchronize(device)
+            ref_model_for_timing = compiled
+        except Exception as e:
+            print(f"  [warn] torch.compile failed ({type(e).__name__}), using eager reference.")
 
     # Benchmark reference
-    ref_ms, _ = benchmark_model(ref_model_for_timing, inputs, args.warmup, args.iters)
+    ref_ms, _ = benchmark_model(ref_model_for_timing, inputs, args.warmup, args.iters, device=device)
     print(f"Reference latency: {ref_ms:.4f} ms\n")
 
     # Collect kernels
@@ -307,21 +321,23 @@ Examples:
         print(f"  [{i+1}/{len(kernels)}] [{ktype}] Compiling: {name}...", end=" ", flush=True)
         try:
             if ktype == "cuda":
+                if backend == "xpu":
+                    raise RuntimeError("CUDA kernel compilation not supported on XPU device")
                 module = compile_kernel(
                     kernel["kernel_h"], kernel["kernel_cu"], kernel["main_cpp"],
                     name=f"k{i}",
                 )
                 # Try run with just inputs first; if it fails, try with model params appended
                 try:
-                    ms, out = benchmark_cuda_module(module, inputs, args.warmup, args.iters)
+                    ms, out = benchmark_cuda_module(module, inputs, args.warmup, args.iters, device=device)
                 except TypeError:
-                    ms, out = benchmark_cuda_module(module, inputs + model_params, args.warmup, args.iters)
+                    ms, out = benchmark_cuda_module(module, inputs + model_params, args.warmup, args.iters, device=device)
             else:  # triton
                 triton_model = load_triton_model(
-                    kernel["model_new_code"], init_inputs, dtype, name=f"k{i}"
+                    kernel["model_new_code"], init_inputs, dtype, name=f"k{i}", device=device
                 )
                 _copy_weights(triton_model, model)
-                ms, out = benchmark_model(triton_model, inputs, args.warmup, args.iters)
+                ms, out = benchmark_model(triton_model, inputs, args.warmup, args.iters, device=device)
             max_abs, mse, cos_sim = diff(out, ref_out)
             ok = max_abs <= args.atol
             status = "PASS" if ok else "FAIL"

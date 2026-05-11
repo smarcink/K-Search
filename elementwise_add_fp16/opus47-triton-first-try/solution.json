@@ -1,0 +1,20 @@
+{
+  "name": "claude-opus-4-7_elementwise_add_fp16_r1_20260511_091336_311199cd",
+  "definition": "elementwise_add_fp16",
+  "author": "claude-opus-4-7",
+  "description": "XPU Bench elementwise_add_fp16 optimization (generated 20260511_091336 uid=311199cd)",
+  "spec": {
+    "language": "triton",
+    "target_hardware": [
+      "Intel Arc Pro B70"
+    ],
+    "entry_point": "model_new.py::ModelNew",
+    "dependencies": []
+  },
+  "sources": [
+    {
+      "path": "model_new.py",
+      "content": "import torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef add_kernel(\n    x_ptr, y_ptr, out_ptr, n_elements,\n    BLOCK_SIZE: tl.constexpr,\n):\n    pid = tl.program_id(axis=0)\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    tl.store(out_ptr + offsets, x + y, mask=mask)\n\n\nclass ModelNew(torch.nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:\n        out = torch.empty_like(x)\n        n = x.numel()\n        BLOCK_SIZE = 4096\n        grid = (triton.cdiv(n, BLOCK_SIZE),)\n        add_kernel[grid](x, y, out, n, BLOCK_SIZE=BLOCK_SIZE, num_warps=8)\n        return out"
+    }
+  ]
+}
