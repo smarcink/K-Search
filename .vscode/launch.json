@@ -24,7 +24,8 @@
             "args": [
                 "swin_fp16/swin_block_fp16_simplified.py",
                 "swin_fp16/triton_opus46_copy",
-                "swin_fp16/gpt5-5",
+                //"swin_fp16/gpt5-5",
+                "swin_fp16/gpt5-5_fix",
                 "--precision", "fp16",
                 "--warmup", "100",
                 "--iters", "1000", 

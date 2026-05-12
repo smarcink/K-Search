@@ -39,14 +39,6 @@ def _make_relative_position_bias(window_size, num_heads, dtype):
 
 
 if _HAS_TRITON:
-    # STAGE controls how far the kernel executes (for bisecting crashes):
-    #   0 = empty kernel (just return)
-    #   1 = compute offsets + load x
-    #   2 = + layernorm math (mean/var/rstd)
-    #   3 = + load LN weights, apply LN, cast to fp16
-    #   4 = + load QKV weights and biases
-    #   5 = + tl.dot for Q, K, V
-    #   6 = + tl.store Q, K, V (full kernel)
     @triton.jit
     def _swin_ln_qkv_kernel(
         x_ptr,
@@ -55,16 +47,12 @@ if _HAS_TRITON:
         ln_b_ptr,
         qkv_w_ptr,
         qkv_b_ptr,
-        H: tl.constexpr,
-        W: tl.constexpr,
-        NH: tl.constexpr,
-        NW: tl.constexpr,
-        STAGE: tl.constexpr = 6,
+        H,
+        W,
+        NH,
+        NW,
     ):
         pid = tl.program_id(0)
-
-        if STAGE == 0:
-            return
 
         win_per_b = NH * NW
         b = pid // win_per_b
@@ -84,23 +72,17 @@ if _HAS_TRITON:
         )
 
         x_h = tl.load(x_ptr + x_offsets)
-        if STAGE == 1:
-            return
-
         x_f = x_h.to(tl.float32)
+
         mean = tl.sum(x_f, axis=1) * 0.03125
         xc = x_f - mean[:, None]
         var = tl.sum(xc * xc, axis=1) * 0.03125
         rstd = tl.rsqrt(var + 1.0e-5)
-        if STAGE == 2:
-            return
 
         ln_w = tl.load(ln_w_ptr + offs_c).to(tl.float32)
         ln_b = tl.load(ln_b_ptr + offs_c).to(tl.float32)
         xn = (xc * rstd[:, None]) * ln_w[None, :] + ln_b[None, :]
         xn_h = xn.to(tl.float16)
-        if STAGE == 3:
-            return
 
         offs_k = tl.arange(0, 32)
         offs_o = tl.arange(0, 32)
@@ -112,14 +94,10 @@ if _HAS_TRITON:
         bq = tl.load(qkv_b_ptr + offs_o).to(tl.float32)
         bk = tl.load(qkv_b_ptr + offs_o + 32).to(tl.float32)
         bv = tl.load(qkv_b_ptr + offs_o + 64).to(tl.float32)
-        if STAGE == 4:
-            return
 
         q = (tl.dot(xn_h, wq) + bq[None, :]).to(tl.float16)
         k = (tl.dot(xn_h, wk) + bk[None, :]).to(tl.float16)
         v = (tl.dot(xn_h, wv) + bv[None, :]).to(tl.float16)
-        if STAGE == 5:
-            return
 
         base = pid * 1536 + offs_n[:, None] * 96 + offs_o[None, :]
         tl.store(qkv_out_ptr + base, q)
@@ -135,10 +113,10 @@ if _HAS_TRITON:
         proj_w_ptr,
         proj_b_ptr,
         rpe_ptr,
-        H: tl.constexpr,
-        W: tl.constexpr,
-        NH: tl.constexpr,
-        NW: tl.constexpr,
+        H,
+        W,
+        NH,
+        NW,
     ):
         pid = tl.program_id(0)
 
@@ -186,14 +164,7 @@ if _HAS_TRITON:
 
 
 class ModelNew(nn.Module):
-    """Simplified Swin block with selectable Triton kernel isolation.
-
-    triton_mode controls which Triton kernels run:
-      "both"          – both kernels (original behaviour)
-      "ln_qkv_only"   – Triton kernel 1 (LN+QKV), then PyTorch for attn+proj+residual
-      "attn_proj_only" – PyTorch for LN+QKV, then Triton kernel 2 (attn+proj+residual)
-      "none"          – pure PyTorch fallback (no Triton at all)
-    """
+    """Simplified Swin block with a safe PyTorch fallback and optional Triton attention path."""
 
     def __init__(self, dim, num_heads, window_size, shift_size, mlp_ratio=4.0, **_):
         super().__init__()
@@ -221,29 +192,8 @@ class ModelNew(nn.Module):
 
         self.half()
 
-        # "both" | "ln_qkv_only" | "attn_proj_only" | "none"
-        self.triton_mode = "both"
-        # Stage for _swin_ln_qkv_kernel bisection (0=empty, 1=load_x, 2=LN_math,
-        # 3=LN_apply, 4=load_QKV_weights, 5=tl.dot, 6=tl.store/full)
-        self.ln_qkv_stage = 6
+        self._triton_disabled = False
 
-    # ---- helpers to check if triton path is feasible ----
-    def _triton_eligible(self, x: Tensor) -> bool:
-        B, H, W, C = x.shape
-        Wh, Ww = self.window_size
-        return (
-            _HAS_TRITON
-            and x.device.type == "xpu"
-            and x.dtype == torch.float16
-            and C == 32
-            and Wh == 4
-            and Ww == 4
-            and H % 4 == 0
-            and W % 4 == 0
-            and x.is_contiguous()
-        )
-
-    # ---- pure PyTorch attention (no residual) ----
     def _attn(self, x: Tensor) -> Tensor:
         B, H, W, C = x.shape
         Wh, Ww = self.window_size
@@ -267,9 +217,24 @@ class ModelNew(nn.Module):
         x = x.view(B, nH, nW, Wh, Ww, C).permute(0, 1, 3, 2, 4, 5).reshape(B, H, W, C)
         return x
 
-    # ---- mode: both triton kernels (original) ----
-    def _attn_residual_both(self, x: Tensor) -> Tensor:
+    def _attn_residual_triton(self, x: Tensor) -> Tensor:
         B, H, W, C = x.shape
+        Wh, Ww = self.window_size
+
+        if (
+            not _HAS_TRITON
+            or self._triton_disabled
+            or x.device.type != "xpu"
+            or x.dtype != torch.float16
+            or C != 32
+            or Wh != 4
+            or Ww != 4
+            or H % 4 != 0
+            or W % 4 != 0
+            or not x.is_contiguous()
+        ):
+            return x + self._attn(self.norm1(x))
+
         nH = H // 4
         nW = W // 4
         total_windows = B * nH * nW
@@ -278,109 +243,32 @@ class ModelNew(nn.Module):
         grid = (total_windows,)
 
         _swin_ln_qkv_kernel[grid](
-            x, qkv_tmp,
-            self.norm1.weight, self.norm1.bias,
-            self.qkv.weight, self.qkv.bias,
-            H, W, nH, nW,
-            STAGE=self.ln_qkv_stage,
+            x,
+            qkv_tmp,
+            self.norm1.weight,
+            self.norm1.bias,
+            self.qkv.weight,
+            self.qkv.bias,
+            H,
+            W,
+            nH,
+            nW,
             num_warps=1,
         )
         _swin_attn_proj_res_kernel[grid](
-            x, qkv_tmp, out,
-            self.proj.weight, self.proj.bias,
+            x,
+            qkv_tmp,
+            out,
+            self.proj.weight,
+            self.proj.bias,
             self.rpe_bias,
-            H, W, nH, nW,
+            H,
+            W,
+            nH,
+            nW,
             num_warps=1,
         )
         return out
-
-    # ---- mode: only kernel 1 (LN+QKV in Triton), rest in PyTorch ----
-    def _attn_residual_ln_qkv_only(self, x: Tensor) -> Tensor:
-        B, H, W, C = x.shape
-        Wh, Ww = self.window_size
-        nH, nW = H // Wh, W // Ww
-        N = Wh * Ww
-        total_windows = B * nH * nW
-
-        # --- Triton kernel 1: LN + QKV projection ---
-        qkv_tmp = torch.empty((total_windows, 16, 96), device=x.device, dtype=x.dtype)
-        grid = (total_windows,)
-        _swin_ln_qkv_kernel[grid](
-            x, qkv_tmp,
-            self.norm1.weight, self.norm1.bias,
-            self.qkv.weight, self.qkv.bias,
-            H, W, nH, nW,
-            STAGE=self.ln_qkv_stage,
-            num_warps=1,
-        )
-
-        # --- PyTorch: unpack Q/K/V from qkv_tmp and do attention + proj + residual ---
-        # qkv_tmp layout: [total_windows, 16, 96] with Q at [:,:,:32], K at [:,:,32:64], V at [:,:,64:96]
-        q = qkv_tmp[:, :, :32]   # (total_windows, 16, 32)
-        k = qkv_tmp[:, :, 32:64]
-        v = qkv_tmp[:, :, 64:96]
-
-        scale = C ** -0.5
-        attn = (q * scale) @ k.transpose(-2, -1)  # (total_windows, 16, 16)
-        rpe = self.rpe_bias.view(1, N, N)
-        attn = attn + rpe
-        attn = attn.softmax(dim=-1)
-        ctx = attn @ v  # (total_windows, 16, 32)
-        proj_out = self.proj(ctx)  # (total_windows, 16, 32)
-
-        # Scatter back to (B, H, W, C) and add residual
-        out = x.clone()
-        proj_out = proj_out.view(B, nH, nW, Wh, Ww, C).permute(0, 1, 3, 2, 4, 5).reshape(B, H, W, C)
-        out = out + proj_out
-        return out
-
-    # ---- mode: only kernel 2 (attn+proj+residual in Triton), LN+QKV in PyTorch ----
-    def _attn_residual_attn_proj_only(self, x: Tensor) -> Tensor:
-        B, H, W, C = x.shape
-        Wh, Ww = self.window_size
-        nH, nW = H // Wh, W // Ww
-        N = Wh * Ww
-        total_windows = B * nH * nW
-
-        # --- PyTorch: LN + QKV, pack into qkv_tmp format ---
-        x_normed = self.norm1(x)
-        # Window-partition: (B, H, W, C) -> (total_windows, N, C)
-        x_win = x_normed.view(B, nH, Wh, nW, Ww, C).permute(0, 1, 3, 2, 4, 5).reshape(-1, N, C)
-        qkv = self.qkv(x_win).reshape(-1, N, 3, C)
-        q = qkv[:, :, 0, :]
-        k = qkv[:, :, 1, :]
-        v = qkv[:, :, 2, :]
-
-        # Pack into qkv_tmp with same layout as kernel 1: [total_windows, 16, 96]
-        qkv_tmp = torch.empty((total_windows, N, 96), device=x.device, dtype=x.dtype)
-        qkv_tmp[:, :, :32] = q
-        qkv_tmp[:, :, 32:64] = k
-        qkv_tmp[:, :, 64:96] = v
-
-        # --- Triton kernel 2: attention + projection + residual ---
-        out = torch.empty_like(x)
-        grid = (total_windows,)
-        _swin_attn_proj_res_kernel[grid](
-            x, qkv_tmp, out,
-            self.proj.weight, self.proj.bias,
-            self.rpe_bias,
-            H, W, nH, nW,
-            num_warps=1,
-        )
-        return out
-
-    def _attn_residual_triton(self, x: Tensor) -> Tensor:
-        if not self._triton_eligible(x) or self.triton_mode == "none":
-            return x + self._attn(self.norm1(x))
-
-        if self.triton_mode == "both":
-            return self._attn_residual_both(x)
-        elif self.triton_mode == "ln_qkv_only":
-            return self._attn_residual_ln_qkv_only(x)
-        elif self.triton_mode == "attn_proj_only":
-            return self._attn_residual_attn_proj_only(x)
-        else:
-            raise ValueError(f"Unknown triton_mode: {self.triton_mode!r}")
 
     def forward(self, x: Tensor) -> Tensor:
         x = self._attn_residual_triton(x)
@@ -428,20 +316,7 @@ def state_dict_remap(src_state):
     return out
 
 
-STAGE_DESCRIPTIONS = {
-    0: "empty kernel (just return)",
-    1: "compute offsets + tl.load(x)",
-    2: "+ layernorm math (mean/var/rstd)",
-    3: "+ load LN weights, apply LN, cast fp16",
-    4: "+ load QKV weights and biases",
-    5: "+ tl.dot for Q, K, V",
-    6: "+ tl.store Q, K, V (full kernel)",
-}
-
-
 if __name__ == "__main__":
-    import sys
-
     device = get_device()
     print(f"Device: {device}")
     init_inputs = get_init_inputs()
@@ -449,35 +324,12 @@ if __name__ == "__main__":
     inputs = [t.to(device) for t in get_inputs()]
     print(f"Input shape: {inputs[0].shape}, dtype: {inputs[0].dtype}")
 
-    # Usage:
-    #   python model_new.py                  -> sweep stages 0..6 using ln_qkv_only mode
-    #   python model_new.py 3                -> test only stage 3
-    #   python model_new.py 0 1 2 3 4 5 6    -> explicit list
-    #   python model_new.py modes            -> sweep modes (none/ln_qkv_only/attn_proj_only/both) at stage 6
-    if len(sys.argv) > 1 and sys.argv[1] == "modes":
-        model.ln_qkv_stage = 6
-        for mode in ["none", "ln_qkv_only", "attn_proj_only", "both"]:
-            print(f"\n=== triton_mode={mode!r} ===")
-            model.triton_mode = mode
-            try:
-                with torch.no_grad():
-                    out = model(*inputs)
-                print(f"  Output shape: {out.shape}, dtype: {out.dtype}")
-                print(f"  Output abs-mean: {out.abs().mean().item():.4e}")
-                print("  OK")
-            except Exception as e:
-                print(f"  FAILED: {e}")
-    else:
-        stages = [int(s) for s in sys.argv[1:]] if len(sys.argv) > 1 else list(range(7))
-        model.triton_mode = "ln_qkv_only"  # isolate kernel 1
-        for stage in stages:
-            desc = STAGE_DESCRIPTIONS.get(stage, "?")
-            print(f"\n=== STAGE {stage}: {desc} ===", flush=True)
-            model.ln_qkv_stage = stage
-            try:
-                with torch.no_grad():
-                    out = model(*inputs)
-                print(f"  Output shape: {out.shape}, dtype: {out.dtype}")
-                print("  OK", flush=True)
-            except Exception as e:
-                print(f"  FAILED: {e}")
+    with torch.no_grad():
+        out = model(*inputs)
+    print(f"Output shape: {out.shape}, dtype: {out.dtype}")
+
+    with torch.no_grad():
+        out2 = model(*inputs)
+    max_diff = (out - out2).abs().max().item()
+    print(f"Determinism check (same input twice): max_diff={max_diff:.2e}")
+    print("OK")
