@@ -1,0 +1,268 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "not_evaluated_initial_world_model"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "family_full_window_local_block",
+    "nodes": [
+      {
+        "action": {
+          "description": "No implementation action at root; this node records the initial kernel analysis and branches into alternative first-iteration implementation scopes.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "The root is a dummy planning node as required; real choices start in child nodes.",
+          "score_0_to_1": 0.1,
+          "title": "World model root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.72,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel XPU Triton backend should support fp16 tl.dot, but exact XMX lowering and preferred tile shapes on Arc Pro B70 are unknown.",
+            "notes": "The full block has substantial dense small-matrix work: qkv/proj/fc1/fc2 plus 16x16 attention per window. Arithmetic intensity can be good if intermediates are fused and weights are reused.",
+            "rating_0_to_10": 7.0,
+            "risk": "Small C=32 and N=16 may underutilize matrix engines if tiled poorly."
+          },
+          "memory_bandwidth": {
+            "notes": "PyTorch eager likely materializes LN outputs, qkv, attention logits/probabilities, projection outputs, MLP hidden activations, and residual intermediates. Avoiding these global temporaries is the main speedup path.",
+            "rating_0_to_10": 8.0,
+            "risk": "If custom kernels spill or reread weights excessively, gains from reduced intermediate traffic may be lost."
+          },
+          "register_pressure": {
+            "notes": "Attention can keep 16x16 logits/probabilities and 16x32 q/k/v fragments per window; full MLP fusion may require 16x128 hidden tiles or streaming over hidden dimension.",
+            "rating_0_to_10": 5.0,
+            "risk": "A monolithic full-block kernel can exceed register capacity and reduce occupancy, especially with fp32 accumulators for LN/softmax/GELU math."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Problem classification: mixed dense linear algebra + reductions + softmax attention + elementwise fusion. Output is x_out[B,H,W,C] with B=1,H=720,W=1280,C=32, fp16. Reductions: LayerNorm over C=32, q/k dot over C=32, softmax over N=16, MLP dot over C=32 or hidden=128. Access is dense/contiguous NHWC except window partition is a logical reshape/permute. Fixed small dims: Wh=Ww=4,N=16,C=32,num_heads=1,hidden=128. Large fixed runtime grid: 57,600 windows and 921,600 tokens.\n2) Canonical math/dependencies: y0=LN1(x) per token; for each 4x4 window, q,k,v=y0@Wqkv+b, logits=(q/sqrt(32))kT+rpe[16,16], p=softmax(logits), a=pv, z=a@Wproj+bproj, x1=x+reverse_windows(z); y1=LN2(x1); h=GELU(y1@Wfc1+b1); out=x1+h@Wfc2+b2. Windows are independent through attention; MLP and LN are token-independent. Stable fp32 accumulation is needed for LN variance and softmax max/sum; matmul accum may use fp32 or backend default fp32-like accumulation for tolerance.\n3) Data layout/access: input/output NHWC contiguous shape [1,720,1280,32] fp16. Weights: qkv [96,32], proj [32,32], fc1 [128,32], fc2 [32,128], biases fp16, rpe [1,1,16,16] fp16/possibly fp32 buffer after half(). Weight tensors are small and reusable; input/output traffic is about 59 MB each, while eager intermediates can be hundreds of MB. Window tokens are contiguous in C but rows within a window have W*C strides; logical partition can be handled by address arithmetic.\n4) Bottleneck regimes: Regime A, eager/materialized path: memory bandwidth and kernel launch overhead dominate due many small ops and temporaries. Regime B, attention-only fused path: small 16x16 softmax and qkv/proj dense ops are latency/register limited, with moderate compute pressure. Regime C, MLP-dominated path: fc1/fc2 consume most FLOPs and may become compute/XMX throughput limited if tiled well, or bandwidth limited if hidden activations spill. Regime D, monolithic full-block path: global bandwidth improves greatly but occupancy/register pressure can dominate.\n5) Design knobs: choose granularity by window vs token blocks; decide whether to fuse attention only, MLP only, or whole block; tile over N=16, C=32, hidden=128; stream hidden chunks vs materialize hidden; fp32 vs fp16 accumulation for LN/softmax/matmul; recompute vs store normalized inputs; cache/load weights per program; specialize for fixed H,W,C,N; choose approximate vs exact GELU compatible with PyTorch tolerance.\n6) High-level skeleton: phase LN1 reads 16x32 tokens and computes mean/rsqrt in fp32; phase qkv/proj/attention keeps window-local q,k,v/logits/probs in registers or small tiles; phase residual writes/keeps x1; phase LN2 per token; phase MLP computes fc1+GELU then fc2, preferably streaming hidden to avoid full hidden global write; final residual store. Inter-program sync is unnecessary because windows/tokens are independent.\n7) Candidate families pruned: Family Full window-local block: best memory reduction, highest complexity/register risk. Family W-MSA subsystem: targets partition/qkv/softmax/proj/reverse, manageable correctness, still leaves MLP eager. Family token-wise MLP subsystem: targets largest dense compute and hidden temporary, simpler independence, still leaves attention eager. Low-level tactics such as vectorized loads, prefetching, or specific tile sizes are deferred to deeper implementation choices.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a fixed-shape Triton path that computes LN1, window attention, projection, residual, LN2, MLP, and final residual for one or a small group of 4x4 windows without materializing major intermediates.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "The reference creates many global intermediates and launches many kernels. A window-local full-block kernel can exploit fixed N=16,C=32,hidden=128 and eliminate almost all intermediate memory traffic.",
+          "score_0_to_1": 0.46,
+          "title": "Own the full local-window Swin block mapping"
+        },
+        "choice": "full_window_local_block",
+        "confidence_0_to_1": 0.56,
+        "decision": "first_iteration_scope",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Many independent 4x4 windows expose parallelism; small matrix shapes may not map perfectly to Intel XMX unless Triton lowers tl.dot efficiently for C=32 and hidden=128.",
+            "notes": "Full-block ownership can combine low-intensity normalization with attention and MLP compute, improving overall hardware fit versus isolated LayerNorm. The difficulty is high because exact reference behavior, relative-position bias, and state remapping must all match before performance can be measured.",
+            "rating_0_to_10": 6.5,
+            "risk": "medium_high"
+          },
+          "memory_bandwidth": {
+            "notes": "Owning the full block gives the best chance to reduce window partition/unpartition, residual, LayerNorm, attention, and MLP intermediate traffic, though the tensor is very large and global memory bandwidth remains important.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "A broad fused implementation may need to stage LayerNorm stats, qkv/attention data, and MLP fragments; aggressive fusion can exceed practical register/shared-memory limits and should be decomposed into a few semantically exact kernels.",
+            "rating_0_to_10": 3.5,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_full_window_local_block",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This open family would attempt broad ownership of the Swin-style local block rather than isolating one subsystem, allowing kernels to be organized around exact block semantics and dataflow. It can still use multiple kernels internally, but the family boundary is end-to-end local-window block behavior.\n- bottleneck: mixed; correctness/integration risk first, then memory bandwidth from large activations and compute throughput for attention/MLP.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\nUPDATE_BELIEF:\n- what changed after eval_result? The failed norm-only attempt makes broad semantic ownership more attractive because partial rewrites can silently diverge from the reference and offer too little payoff even if correct. A full-block plan has higher difficulty but a better chance of both correctness control and meaningful speedup.\n- next bet: Prioritize an exact reference-equivalent full-window implementation, then selectively replace the hottest pieces with Triton while keeping refinements as children under this family rather than sibling variants.\nSELF_CHECK: This root child is mutually exclusive with norm-only, attention-only, and MLP-only ownership because it chooses the entire local-window block as the first optimization boundary.",
+        "overall_rating_0_to_10": 5.8,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": null,
+            "log_excerpt": "Correctness FAIL: output mismatch, max diff=3.777344e+00.",
+            "mean_vs_baseline_factor": null,
+            "reference_latency_ms": null,
+            "score": null,
+            "score_name": "speedup_over_eager",
+            "speedup_factor": null,
+            "status": "failed_correctness"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel for the W-MSA path after LN1: logical window partition, qkv projection, 16x16 softmax with relative position bias, value aggregation, output projection, and reverse-window residual output.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.02,
+          "rationale": "Attention has awkward small-window reshapes and softmax that eager PyTorch handles with multiple kernels and materialized tensors. Fusing this path is a focused way to reduce launch and memory overhead.",
+          "score_0_to_1": 0.31,
+          "title": "Prototype attention subsystem kernels"
+        },
+        "choice": "attention_subsystem_first",
+        "confidence_0_to_1": 0.63,
+        "decision": "first_iteration_scope",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "N=16,C=32,qkv=96 are small but perfectly fixed; one program per window or per few windows should provide large grid parallelism on Arc Pro B70.",
+            "notes": "Attention has more arithmetic and data reuse than LayerNorm, but C=32 and one head limit tensor-core style utilization; correctness risk around relative-position bias and exact layout remains high.",
+            "rating_0_to_10": 5.5,
+            "risk": "medium_high"
+          },
+          "memory_bandwidth": {
+            "notes": "Window partition/unpartition and qkv/proj traffic are significant, but local 4x4 attention has enough reuse that fusing qkv, bias, softmax, and value accumulation may reduce intermediate traffic.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "A 16-token by C=32 single-head attention tile is small, but holding q/k/v, logits, softmax statistics, and projection fragments can still pressure registers on XPU backends.",
+            "rating_0_to_10": 4.0,
+            "risk": "medium_high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_attention_subsystem",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This open family would own qkv, local 4x4 attention, softmax, relative-position bias, and projection while leaving the MLP and residual/norm framework-visible unless later fused. No valid solution is currently attached.\n- bottleneck: mixed compute and memory bandwidth, with correctness/layout integration risk.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\nUPDATE_BELIEF:\n- what changed after eval_result? The failed norm-only attempt increases the value of targeting a subsystem with real compute and intermediate-tensor elimination, but also raises concern that partial Swin reimplementation can easily diverge from the reference.\n- next bet: Attention-only remains plausible, but should start from exact reference state/layout behavior and only then fuse qkv/window attention/proj; do not spend effort on isolated LayerNorm speedups first.\nSELF_CHECK: This root child is mutually exclusive with norm-only, MLP-only, and full-window ownership because it chooses the attention stack as the first optimization boundary.",
+        "overall_rating_0_to_10": 4.4,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": "speedup_over_eager",
+            "status": "failed"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel for LN2, fc1, GELU, fc2, and final residual for blocks of tokens, while leaving the attention path initially unchanged.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.01,
+          "rationale": "The MLP has the largest dense compute share and creates a large hidden activation if evaluated eagerly. Token independence makes this a simpler first custom kernel than full attention.",
+          "score_0_to_1": 0.36,
+          "title": "Prototype MLP subsystem kernels"
+        },
+        "choice": "mlp_subsystem_first",
+        "confidence_0_to_1": 0.58,
+        "decision": "first_iteration_scope",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "fc1/fc2 dimensions 32->128->32 are more regular than attention and may map better to matrix hardware when batching many tokens per program.",
+            "notes": "The MLP has more regular dense compute than attention and may map better to matrix engines or optimized GEMM paths, though replacing PyTorch linear with custom Triton may be hard to beat.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "The MLP reads/writes the full 720x1280x32 activation and materializes a 4x hidden expansion; fusing bias/GELU or fc1/activation can save traffic, but linear layers still dominate.",
+            "rating_0_to_10": 4.5,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "GELU fusion is cheap, but blocking fc1/fc2 around hidden=128 may require careful tile sizes to avoid spills on Arc.",
+            "rating_0_to_10": 4.5,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_mlp_subsystem",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This open family would focus on the fc1/GELU/fc2 path, potentially fusing activation and reducing intermediate writes, while attention remains in framework code. No valid solution is currently attached.\n- bottleneck: compute with memory-bandwidth pressure from hidden expansion.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\nUPDATE_BELIEF:\n- what changed after eval_result? The norm/residual failure suggests that low-arithmetic subsystems are poor first targets; MLP has a higher performance ceiling because it owns the densest regular compute in the block. Correctness must still preserve the exact reference module ordering and state names.\n- next bet: Consider MLP if full-block attention ownership proves too risky, but avoid creating a sibling that is only an optimized variant of the same MLP design; refinements should be children.\nSELF_CHECK: This root child is mutually exclusive with norm-only, attention-only, and full-window ownership because it chooses the MLP stack as the first optimization boundary.",
+        "overall_rating_0_to_10": 4.9,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": "speedup_over_eager",
+            "status": "failed"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement dedicated Triton kernels for LN1 and LN2 with residual handling, keeping linear/attention/MLP operations in framework code for the first measurement.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.97,
+          "rationale": "LayerNorm over C=32 is small and likely launch/memory dominated in eager mode. A focused normalization/residual kernel is easy to validate and may reduce overhead, though speedup ceiling is limited.",
+          "score_0_to_1": 0.06,
+          "title": "Prototype norm and residual subsystem kernels"
+        },
+        "choice": "normalization_residual_first",
+        "confidence_0_to_1": 0.86,
+        "decision": "first_iteration_scope",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "C=32 reductions are tiny; this path does not stress XMX and depends mostly on scalar/vector EU throughput and memory coalescing on XPU.",
+            "notes": "The chosen implementation did not exercise the intended Triton kernels and leaves attention/MLP dominant work in PyTorch; small-row LayerNorm alone is a poor fit as the primary optimization target on Arc Pro B70.",
+            "rating_0_to_10": 2.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "LayerNorm over C=32 streams a very large NHWC tensor but arithmetic per byte is tiny; even a correct fused residual/LN path is mostly bandwidth and launch-overhead limited, with limited opportunity to beat optimized framework primitives.",
+            "rating_0_to_10": 3.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "C=32 reductions fit easily in registers; register pressure is not the blocker for this family.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_norm_residual_subsystem",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The current code defines Triton kernels for C=32 LayerNorm and add, but the Python wrappers bypass them and call torch.nn.functional.layer_norm and plain tensor addition. The model also reimplements a simplified Swin block around framework qkv/attention/proj/MLP operations.\n- bottleneck: other/correctness first; if corrected, expected bottleneck would be framework launch overhead plus memory bandwidth, not compute.\nFOLLOW_THROUGH:\n- aligned_with_intent: no\n- if_no: Expected intent was dedicated Triton kernels for LN1/LN2 with residual handling. What was actually implemented was mostly framework LayerNorm/add with unused Triton kernels, plus a simplified block that failed reference equivalence.\nUPDATE_BELIEF:\n- what changed after eval_result? Correctness failed with max diff around 3.88, so this path cannot be credited for performance and the norm-only subsystem is less attractive than predicted. The failure also shows that partial replacement is easy to misalign with the exact reference block semantics/state mapping.\n- next bet: Move priority away from norm-only replacement and toward a broader ownership plan that preserves full block semantics, or at minimum first implement exact reference-equivalent behavior before adding Triton kernels. Norm/residual alone is unlikely to provide enough speedup to justify further top-level focus.\nSELF_CHECK: This root child is mutually exclusive with attention-only, MLP-only, and full-window ownership because it chooses normalization/residual as the first optimization boundary.",
+        "overall_rating_0_to_10": 1.7,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "correctness": "failed",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "score": null,
+            "score_name": "speedup_over_eager",
+            "speedup_factor": null,
+            "status": "failed"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "The target is a fixed-shape simplified Swin block on NHWC fp16 input [1,720,1280,32] with 57,600 independent 4x4 windows, single-head N=16 attention, two C=32 LayerNorm reductions, and a token-wise 32->128->32 GELU MLP. The main opportunity is not changing asymptotic math but eliminating PyTorch eager temporaries and launches: qkv/proj/attention/MLP hidden tensors are much larger than the input/output and are repeatedly materialized. The likely best Triton direction is fixed-size fusion around either the window attention unit or the token-wise MLP, with a possible monolithic full-block kernel if register pressure on Intel Arc Pro B70 remains acceptable; correctness depends on fp32 LayerNorm/softmax reductions, fp16 outputs, exact rpe bias use, and GELU numerical compatibility.",
+  "open_questions": [
+    "What are the evaluator tolerances for fp16 output, especially for LayerNorm variance, softmax, and GELU differences versus PyTorch?",
+    "Does Triton on Intel Arc Pro B70 lower the relevant fp16 tl.dot shapes, especially 16x32x96 and token-block x32x128, to efficient XMX instructions?",
+    "Are model parameters guaranteed contiguous in the same layout as nn.Linear weights, and is rpe_bias stored as fp16 after model.half() in the evaluation harness?",
+    "What is the baseline latency split among LayerNorm, attention, projection, MLP, and memory-format reshapes on the target XPU?",
+    "Can ModelNew use a mix of Triton kernels and PyTorch operations, or is the score strongly penalized unless nearly all heavy operations are custom Triton?",
+    "Is torch.compile included as a competing baseline with fusion that may already remove some eager intermediate overhead?",
+    "What are the preferred Triton program sizes and occupancy limits for Intel Arc Pro B70 for kernels with many small independent windows?",
+    "Does the input always have B=1,H=720,W=1280,C=32 and window_size=[4,4], or should the implementation handle nearby dynamic shapes?"
+  ]
+}

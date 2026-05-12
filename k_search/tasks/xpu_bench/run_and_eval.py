@@ -78,6 +78,43 @@ def _load_module_from_file(path: str, module_name: str):
     return mod
 
 
+def _copy_weights(dst: torch.nn.Module, src: torch.nn.Module, dst_mod: Any | None = None) -> None:
+    """Copy reference parameters/buffers into the candidate model.
+
+    Candidate modules may expose state_dict_remap(src_state) when their module
+    layout differs from the reference implementation.
+    """
+    src_state = src.state_dict()
+    if not src_state:
+        return
+
+    remap = getattr(dst_mod, "state_dict_remap", None) if dst_mod is not None else None
+    if callable(remap):
+        src_state = remap(src_state)
+
+    dst_state = dst.state_dict()
+    filtered_state = {}
+    skipped_shape = []
+    for key, value in src_state.items():
+        dst_value = dst_state.get(key)
+        if dst_value is None:
+            continue
+        if tuple(dst_value.shape) != tuple(value.shape):
+            skipped_shape.append((key, tuple(value.shape), tuple(dst_value.shape)))
+            continue
+        filtered_state[key] = value
+
+    missing, unexpected = dst.load_state_dict(filtered_state, strict=False)
+    if missing:
+        print(f"[WARN] Missing keys when copying weights: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if unexpected:
+        print(f"[WARN] Unexpected keys when copying weights: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+    if skipped_shape:
+        preview = ", ".join(f"{k}: {src_shape}->{dst_shape}" for k, src_shape, dst_shape in skipped_shape[:5])
+        suffix = "..." if len(skipped_shape) > 5 else ""
+        print(f"[WARN] Skipped shape-mismatched weights: {preview}{suffix}")
+
+
 def _get_precision_dtype(precision: str) -> torch.dtype:
     return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
 
@@ -232,8 +269,6 @@ def evaluate(
         ref_model = ref_model.half()
     elif hasattr(ref_model, "bfloat16") and dtype == torch.bfloat16:
         ref_model = ref_model.bfloat16()
-    ref_model = ref_model.to(device)
-    ref_model.eval()
 
     # Wrap get_inputs to always produce tensors on the right device
     def ref_get_inputs():
@@ -252,7 +287,12 @@ def evaluate(
         new_model = new_model.half()
     elif hasattr(new_model, "bfloat16") and dtype == torch.bfloat16:
         new_model = new_model.bfloat16()
+
+    _copy_weights(new_model, ref_model, sol_mod)
+
+    ref_model = ref_model.to(device)
     new_model = new_model.to(device)
+    ref_model.eval()
     new_model.eval()
 
     # ---- Correctness ----

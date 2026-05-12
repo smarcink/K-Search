@@ -278,6 +278,43 @@ Then implement your optimized version.
                 tmp.write(code)
                 kernel_src_path = tmp.name
 
+            # -----------------------------------------------------------
+            # Pre-flight check: syntax + import validation in a subprocess
+            # to surface Triton compilation errors before they become SIGSEGV.
+            # -----------------------------------------------------------
+            preflight_code = (
+                "import sys\n"
+                "try:\n"
+                f"    compile(open('{kernel_src_path}').read(), '{kernel_src_path}', 'exec')\n"
+                "except SyntaxError as e:\n"
+                "    print(f'SyntaxError: {e}', file=sys.stderr)\n"
+                "    sys.exit(1)\n"
+                "import importlib.util\n"
+                f"spec = importlib.util.spec_from_file_location('_preflight', '{kernel_src_path}')\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "try:\n"
+                "    spec.loader.exec_module(mod)\n"
+                "except Exception as e:\n"
+                "    print(f'Import error: {type(e).__name__}: {e}', file=sys.stderr)\n"
+                "    sys.exit(1)\n"
+                "if not hasattr(mod, 'ModelNew'):\n"
+                "    print('Error: ModelNew class not defined', file=sys.stderr)\n"
+                "    sys.exit(1)\n"
+                "print('preflight OK')\n"
+            )
+            preflight_result = subprocess.run(
+                [sys.executable, "-c", preflight_code],
+                capture_output=True, text=True, timeout=120,
+                cwd=str(Path(__file__).parent.parent.parent),
+                env=os.environ.copy(),
+            )
+            if preflight_result.returncode != 0:
+                preflight_err = (preflight_result.stderr or preflight_result.stdout or "unknown error").strip()
+                return self._failed_eval(
+                    f"Pre-flight check failed (code does not import cleanly):\n{preflight_err[-2000:]}",
+                    round_num,
+                )
+
             repo_root = Path(__file__).parent.parent.parent
             if not (repo_root / "k_search").exists():
                 repo_root = Path.cwd()
@@ -288,6 +325,7 @@ Then implement your optimized version.
 
             cmd = [
                 sys.executable,
+                "-u",
                 "-m", "k_search.tasks.xpu_bench.run_and_eval",
                 f"--ref-path={self._ref_path}",
                 f"--kernel-src-path={kernel_src_path}",
@@ -331,7 +369,15 @@ Then implement your optimized version.
 
         if result.returncode != 0:
             excerpt = self._extract_error_excerpt(stdout, stderr)
-            return self._failed_eval(f"Evaluation failed:\n{excerpt}", round_num)
+            rc_info = f"(exit code {result.returncode})"
+            if result.returncode < 0:
+                import signal as _sig
+                try:
+                    sig_name = _sig.Signals(-result.returncode).name
+                    rc_info = f"(killed by {sig_name}, exit code {result.returncode})"
+                except (ValueError, AttributeError):
+                    rc_info = f"(killed by signal {-result.returncode})"
+            return self._failed_eval(f"Evaluation failed {rc_info}:\n{excerpt}", round_num)
 
         # Parse structured output
         speedup_eager = self._extract_metric(stdout, "Speedup over eager:", r"([0-9.]+)x")

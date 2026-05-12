@@ -16,57 +16,19 @@
             "name": "Compare Swin fp16 implementations",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/swin_fp16/compare_swin_fp16.py",
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "python": "${workspaceFolder}/.venv2/bin/python",
-            "justMyCode": true,
-            "args": [
-                "swin_fp16/swin_block_fp16.py",
-                "--warmup", "100",
-                "--iters", "2000", 
-                "--atol", "1e-2",
-                "--compile-mode", "default"
-            ]
-        },
-        {
-            "name": "Compare Conv Pooling fp16 implementations",
-            "type": "debugpy",
-            "request": "launch",
             "program": "${workspaceFolder}/compare_kernels.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "python": "${workspaceFolder}/.venv2/bin/python",
             "justMyCode": true,
             "args": [
-                "conv_pooling_fp16/conv_block_fp16.py",
-                "conv_pooling_fp16/triton_opus47_r12",
-                "conv_pooling_fp16/triton_opus47_tldot_r15",
+                "swin_fp16/swin_block_fp16_simplified.py",
+                "swin_fp16/triton_opus46_copy",
                 "--precision", "fp16",
-                "--compile-mode", "default",
                 "--warmup", "100",
-                "--iters", "2000",
+                "--iters", "1000", 
                 "--atol", "1e-2",
-            ]
-        },
-        {
-            "name": "Compare Conv Pooling SMALLER fp16 implementations",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/compare_kernels.py",
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "python": "${workspaceFolder}/.venv2/bin/python",
-            "justMyCode": true,
-            "args": [
-                "conv_pooling_fp16_smaller_spatial/conv_block_fp16.py",
-                "conv_pooling_fp16_smaller_spatial/opus47_triton_50r_kernel",
-                "conv_pooling_fp16_smaller_spatial/opus47_cuda_kernel",
-                "--precision", "fp16",
-                "--compile-mode", "default",
-                "--warmup", "100",
-                "--iters", "2000",
-                "--atol", "1e-2",
+                //"--compile-mode", "default"
             ]
         },
         {

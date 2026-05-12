@@ -2,6 +2,14 @@ import torch
 from torch import nn, Tensor
 
 
+def get_device():
+    if torch.xpu.is_available():
+        return "xpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 def _make_relative_position_bias(window_size, num_heads, dtype):
     Wh, Ww = window_size
     table = nn.init.trunc_normal_(
@@ -130,3 +138,23 @@ def state_dict_remap(src_state):
         bias = table[index.long()].view(N, N, num_heads).permute(2, 0, 1)
         out["rpe_bias"] = bias.unsqueeze(0).contiguous().to(table.dtype)
     return out
+
+
+if __name__ == "__main__":
+    device = get_device()
+    print(f"Device: {device}")
+    init_inputs = get_init_inputs()
+    model = Model(*init_inputs).to(device)
+    inputs = [t.to(device) for t in get_inputs()]
+    print(f"Input shape: {inputs[0].shape}, dtype: {inputs[0].dtype}")
+
+    with torch.no_grad():
+        out = model(*inputs)
+    print(f"Output shape: {out.shape}, dtype: {out.dtype}")
+
+    # Check reproducibility
+    with torch.no_grad():
+        out2 = model(*inputs)
+    max_diff = (out - out2).abs().max().item()
+    print(f"Determinism check (same input twice): max_diff={max_diff:.2e}")
+    print("OK")

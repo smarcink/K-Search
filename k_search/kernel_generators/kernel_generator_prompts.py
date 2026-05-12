@@ -8,7 +8,7 @@ from __future__ import annotations
 # Note: keep these hints generic (avoid naming specific low-level instructions).
 CUDA_OPTIMIZATION_HINTS = "** You MUST use MMA to utilize the tensor cores on H100! ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."
 
-# Intel XPU Triton hints (placeholder — refine with internal HW docs)
+# Intel XPU Triton hints
 XPU_TRITON_OPTIMIZATION_HINTS = """
 ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
 
@@ -25,6 +25,20 @@ Key Triton performance principles for Intel XPU:
   regardless of backend — the Intel XPU Triton backend compiles them automatically.
 - Fusing elementwise ops (bias, activation, pooling) into a matmul epilogue is where
   custom Triton kernels can beat torch.compile.
+
+CRITICAL Intel XPU Triton backend constraints (violations cause SIGSEGV or compilation failure):
+- tl.arange(start, end): the range (end - start) MUST be a power of 2 (e.g., 16, 32, 64, 128).
+  Non-power-of-2 ranges (e.g., 96, 48, 3) will cause a compilation error or crash.
+  If you need to work with non-power-of-2 dimensions (e.g., dim=96), round UP to the next
+  power of 2 (e.g., 128) and use a mask to guard out-of-bounds elements.
+- BLOCK sizes and tile dimensions used as constexpr MUST be powers of 2.
+- tl.dot(a, b) operands must have inner dimension that is a multiple of 16.
+  Minimum supported shapes: (M, 16) x (16, N). Smaller inner dims will crash.
+- Avoid complex control flow (nested if/else, dynamic loops) inside Triton kernels —
+  the Intel backend has limited support and may produce invalid SPIR-V, causing SIGSEGV.
+- Keep kernels simple and well-structured. If a kernel causes SIGSEGV, simplify it —
+  break fused operations into separate smaller kernels rather than one monolithic kernel.
+- torch.xpu.synchronize() instead of torch.cuda.synchronize().
 """
 
 # Triton-appropriate subset

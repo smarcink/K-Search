@@ -1,0 +1,16 @@
+{
+  "task": "swin_block_fp16_simplified",
+  "problem": "swin_block_fp16_simplified",
+  "device": "xpu:0",
+  "precision": "fp16",
+  "solutions": [
+    {
+      "solution": "gpt-5.5_swin_block_fp16_simplified_r30_20260511_124130_f09a784d",
+      "status": "failed",
+      "speedup_over_eager": null,
+      "latency_ms": null,
+      "score_name": "speedup_over_eager",
+      "score": null
+    }
+  ]
+}
