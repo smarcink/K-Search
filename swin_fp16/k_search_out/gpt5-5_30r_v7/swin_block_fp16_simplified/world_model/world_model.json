@@ -1,0 +1,212 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "no_measurements_yet_initial_world_model"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "root",
+    "nodes": [
+      {
+        "action": {
+          "description": "Root analysis node only; no implementation attached.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "Establish problem model before selecting the first implementation path.",
+          "score_0_to_1": 0.55,
+          "title": "World-model root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.72,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel XPU/Triton path should favor dense fp16 dot work with static C=32, N=16, hidden=128; XMX-friendly matmul shapes may matter, but very small K/N shapes risk underutilization.",
+            "notes": "The block is mostly many small dense linear projections plus small-window attention; total arithmetic is dominated by qkv/proj/MLP rather than the 16x16 attention softmax.",
+            "rating_0_to_10": 7.0,
+            "risk": "Small per-token channel dimension and fragmented windows may fail to saturate compute unless batched/tilized across many tokens/windows."
+          },
+          "memory_bandwidth": {
+            "notes": "NHWC input/output are dense and contiguous by channel; window attention loads are strided across rows but small. Weights are tiny and highly reusable. Eager reference likely pays launch/layout overhead and intermediate traffic for LN, qkv, attention, proj, LN, fc1, GELU, fc2.",
+            "rating_0_to_10": 8.0,
+            "risk": "A custom kernel that materializes large intermediates or rereads x repeatedly may become bandwidth/latency limited despite small weights."
+          },
+          "register_pressure": {
+            "notes": "Per-window attention can hold 16x32 q/k/v fragments and 16x16 scores/softmax in registers if mapped carefully; full MLP hidden=128 per token is larger and may need tiling over hidden dimension.",
+            "rating_0_to_10": 6.0,
+            "risk": "Over-fusing attention, projection, two LNs, and MLP in one kernel could exceed registers and reduce occupancy on Intel XPU."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: mixed dense linear algebra + normalization reductions + small-window attention/softmax + elementwise residual/GELU. Primary output is y[B,H,W,C] = fp16 tensor same shape as input. Reductions: LayerNorm over C=32, q/k/v and projection reductions over C=32, attention reductions over N=16, MLP reductions over C=32 and hidden=128. Access is mostly dense NHWC; window partition introduces regular strided loads, not sparse indirect.\n2) Canonical math: for each pixel token t, z1=LN32(x_t); for each 4x4 window w, Q,K,V=z1_w @ Wqkv^T + b, A=softmax(QK^T/sqrt(32)+RPE[16,16]), a=A V, p=a @ Wproj^T + bproj, r1=x+p. Then z2=LN32(r1); h=GELU(z2 @ Wfc1^T + b1); m=h @ Wfc2^T + b2; y=r1+m. Windows and tokens are independent except within each 4x4 attention window; online stable softmax possible over N=16 but full score matrix is small.\n3) Layout/access: input/output [1,720,1280,32] fp16 contiguous NHWC, 921600 tokens. Windows: nH=180,nW=320,Bw=57600,N=16,C=32. Weights: qkv [96,32], proj [32,32], fc1 [128,32], fc2 [32,128], biases fp16, rpe [1,1,16,16]. Dominant reads/writes are intermediate activations if not fused; weights fit cache/constant-like reuse. Per-window rows have stride 1280*32 elements; intra-pixel channels contiguous.\n4) Bottleneck hypotheses: Regime A eager/torch baseline is launch and intermediate-memory dominated because many small ops over huge token count. Regime B custom attention-only is latency/register dominated by small N=16 softmax and strided window loads; qkv/proj still significant. Regime C MLP-heavy path is compute dominated by two dense projections per token, but small K=32/128 may be shape-efficiency limited. Regime D full fusion may become register/occupancy limited but minimizes memory traffic.\n5) Design knobs: parallelize by window, by token tile, or hybrid; tile token rows and output channels; decide whether to materialize r1 and/or fc1 hidden; fp32 vs fp16 accumulation for LN/softmax/dots; exact GELU via erf vs approximation; specialize constants B=1,H=720,W=1280,C=32,N=16,hidden=128; exploit tiny reusable weights; choose number of Triton kernels vs fusion level.\n6) Skeleton: phase LN1 per token with fp32 mean/var, phase window qkv + attention + proj + residual, phase LN2 per token, phase fc1 + GELU + fc2 + residual. Registers hold C=32 vectors, LN stats, attention row scores/probabilities, small output fragments; shared/local staging may help q/k/v per window; synchronization only within a program instance if multiple lanes cooperate on one window/tile.\n7) Candidate families: full block spatial fusion for minimum traffic but high register risk; attention-centered window path for localized replacement of PyTorch's most layout-fragmented part; MLP/LN-centered token path for the largest arithmetic share with regular dense access.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a fixed-shape custom Triton path for the whole forward using a small number of kernels: one window-attention/residual stage and one token-MLP/residual stage, with LayerNorm fused into the consuming stage where practical.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.55,
+          "rationale": "The reference creates many large intermediates and launches many framework kernels. Specializing to B=1,H=720,W=1280,C=32,window=4x4,hidden=128 can remove layout reshapes, reduce memory traffic, and exploit tiny fixed reductions.",
+          "score_0_to_1": 0.78,
+          "title": "Build specialized full-block Triton forward"
+        },
+        "choice": "full_block_spatial_fusion",
+        "confidence_0_to_1": 0.58,
+        "decision": "first_implementation_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Best chance to batch enough independent windows/tokens for Intel XPU occupancy; fixed fp16 dot shapes C=32/N=16/hidden=128 can be tuned for XMX or SIMD lowering.",
+            "notes": "Covers all arithmetic in the block, including the dominant linear layers and attention. Static dimensions allow aggressive specialization.",
+            "rating_0_to_10": 8.0,
+            "risk": "If Triton lowering for the chosen small dot shapes is poor, the custom path may lose to optimized PyTorch linear kernels."
+          },
+          "memory_bandwidth": {
+            "notes": "Potentially minimizes global activation traffic by avoiding qkv/attn/fc1 materialization or at least limiting materialization to r1 between phases.",
+            "rating_0_to_10": 9.0,
+            "risk": "If implementation must spill q/k/v, attention, or hidden activations, much of the intended bandwidth advantage disappears."
+          },
+          "register_pressure": {
+            "notes": "Attention per window and MLP hidden tiles both require many live values; likely needs decomposition into at least two kernels or hidden-channel tiling.",
+            "rating_0_to_10": 4.0,
+            "risk": "Register spill and low occupancy are the primary failure modes for this family."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "full_block_spatial_fusion",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is an end-to-end replacement plan; it cannot be combined as the same first iteration with attention-only or MLP-only focus because it allocates the iteration budget to integration and global scheduling rather than isolating one subsystem.\nPlan emphasis: specialize all constants and preserve reference order/numerics closely, especially fp32 LayerNorm reductions and stable softmax.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement only the W-MSA region in Triton: consume norm1 output or fuse LN1, compute qkv, 16x16 softmax with RPE, projection, window reverse, and first residual; leave norm2 and MLP initially in PyTorch modules.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.75,
+          "rationale": "The attention path has awkward 4x4 window partitioning and several small operations where eager PyTorch overhead and intermediate traffic are likely high. Replacing it first gives a correctness-focused, localized kernel target.",
+          "score_0_to_1": 0.69,
+          "title": "Accelerate the window-attention subgraph first"
+        },
+        "choice": "attention_centered_window_path",
+        "confidence_0_to_1": 0.66,
+        "decision": "first_implementation_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Each window has N=16,C=32 and there are 57600 independent windows; parallelism is abundant but per-window work is small.",
+            "notes": "Targets qkv/proj and attention. The small score matrix fits in registers, and RPE is tiny.",
+            "rating_0_to_10": 7.0,
+            "risk": "Per-window programs may be too fine-grained, causing scheduling overhead and underutilized vector units unless grouped over multiple windows."
+          },
+          "memory_bandwidth": {
+            "notes": "Can remove qkv, attention-score, and window-partition intermediates; however MLP intermediates remain in PyTorch.",
+            "rating_0_to_10": 7.0,
+            "risk": "If LN1 is not fused, reading/writing norm1 output may limit the speedup."
+          },
+          "register_pressure": {
+            "notes": "16x16 score/probabilities plus q/k/v fragments are manageable compared with full-block fusion.",
+            "rating_0_to_10": 7.0,
+            "risk": "Holding all q/k/v for a window while also computing projection may still cause spills depending on program mapping."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "attention_centered_window_path",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is mutually exclusive as a first target with full-block or MLP-first plans because it keeps the second half of the block unchanged to isolate attention/window-layout benefits.\nPlan emphasis: validate window indexing, RPE dtype/layout, stable softmax, and residual placement before adding MLP fusion.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement the post-attention token MLP region in Triton: norm2 over C=32, fc1 to hidden=128, exact GELU, fc2 back to C=32, and final residual; initially call the reference attention path unchanged.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.8,
+          "rationale": "The MLP has the largest regular dense arithmetic share per token and avoids window-strided indexing. It is a lower-risk first kernel that can beat eager chains by fusing LayerNorm, GELU, and residual around the dense projections.",
+          "score_0_to_1": 0.72,
+          "title": "Accelerate the token MLP subgraph first"
+        },
+        "choice": "mlp_centered_token_path",
+        "confidence_0_to_1": 0.7,
+        "decision": "first_implementation_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Regular NHWC token stream with 921600 independent rows; dense fp16 projections with K=32 and hidden=128 are more regular than attention windows.",
+            "notes": "Targets the dominant MLP math and should map cleanly to tiled dot operations over token blocks and hidden/output channels.",
+            "rating_0_to_10": 8.0,
+            "risk": "PyTorch linear for large flattened [921600,32] x [32,128] may already be efficient, so fusion must compensate for any custom matmul inefficiency."
+          },
+          "memory_bandwidth": {
+            "notes": "Can avoid materializing norm2 and GELU/fc1 hidden if fc2 accumulation is streamed or tiled; otherwise still saves at least some elementwise traffic.",
+            "rating_0_to_10": 7.0,
+            "risk": "Materializing hidden [921600,128] would be very expensive and may erase gains."
+          },
+          "register_pressure": {
+            "notes": "LN state is tiny; the hidden=128 expansion is the main register/tile pressure and should be handled in chunks.",
+            "rating_0_to_10": 6.0,
+            "risk": "Streaming fc2 through GELU values increases live accumulators and may require careful tiling to avoid spills."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "mlp_centered_token_path",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is a first-target alternative to attention/full-block work because it deliberately avoids window attention complexity and spends the iteration on the regular dense MLP path.\nPlan emphasis: exact GELU compatibility, fp32 LayerNorm statistics, and avoiding a large hidden activation write are the key correctness/performance constraints.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This is a fixed-shape simplified Swin block on NHWC fp16 input [1,720,1280,32] with 57600 independent 4x4 windows, single-head attention N=16,C=32, and an MLP hidden size 128. The computation is mixed: fp32 LayerNorm reductions over 32 channels, dense qkv/proj/fc projections, a tiny stable softmax over 16 keys with RPE, exact GELU, and residual adds. The main optimization opportunity is reducing framework launch/layout/intermediate overhead while preserving reference numerics; dense weights are small and highly reusable, but custom Triton must avoid register spills and poor small-matmul utilization on Intel XPU.",
+  "open_questions": [
+    "What correctness tolerance is used by the evaluator for fp16 outputs, especially for LayerNorm accumulation, softmax, and GELU exactness?",
+    "Does Triton on Intel XPU generate efficient fp16 dot/XMX code for small K shapes such as 32 and 128, or should kernels favor scalar/vector reductions?",
+    "Is using some PyTorch modules inside ModelNew allowed for an initial hybrid solution, or must every major operation be custom Triton?",
+    "What is the actual baseline latency split among LayerNorm, qkv/proj, attention softmax, fc1/fc2, GELU, and reshape/permute overhead on Arc Pro B70?",
+    "Are model weights guaranteed contiguous fp16 with the same layout as nn.Linear weight [out,in], and is rpe_bias always pre-gathered contiguous fp16?",
+    "How does the Intel XPU backend handle tl.erf or exact GELU performance and accuracy compared with torch.nn.GELU default approximate='none'?",
+    "What launch overhead and occupancy behavior should be expected for many independent small-window Triton programs on this device?"
+  ]
+}

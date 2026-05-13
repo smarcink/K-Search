@@ -1,0 +1,314 @@
+{
+  "computed_signals": {
+    "round_index": 13,
+    "trace": {
+      "latency_ms": 12.6741,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 17.6801,
+      "speedup_factor": 1.395,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "attention_then_fused_mlp_tail",
+    "nodes": [
+      {
+        "action": {
+          "description": "Initial analysis node only; no implementation action attached.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.716,
+          "rationale": "Root captures problem structure, likely bottlenecks, and candidate first implementation scopes.",
+          "score_0_to_1": 0.66,
+          "title": "World model root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.74,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel XPU/Triton path must handle fp16 dot products, small fixed attention matrices, and very large NHWC activation tensors.",
+            "notes": "Overall block has moderate compute intensity due to small reusable weights, but attention submatrices are tiny and may be launch/overhead dominated in eager PyTorch.",
+            "rating_0_to_10": 7.0,
+            "risk": "Actual XPU tl.dot throughput for very small K/N shapes may differ significantly from CUDA-oriented intuition."
+          },
+          "memory_bandwidth": {
+            "notes": "Reference materializes several large intermediates over 921600 tokens plus window reshapes; avoiding global traffic is a major opportunity.",
+            "rating_0_to_10": 8.0,
+            "risk": "If oneDNN/PyTorch already fuses or reuses buffers well, memory-traffic savings may translate less directly to latency."
+          },
+          "register_pressure": {
+            "notes": "Per-window state includes 16x32 normalized tokens, q/k/v, 16x16 attention, and potentially 16x128 MLP hidden values.",
+            "rating_0_to_10": 5.0,
+            "risk": "End-to-end fusion can spill registers or reduce occupancy on Intel XPU."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "UPDATED_AFTER_EVAL: Attention-first passed with 12.6806 ms vs eager 17.7134 ms, matching the prior latency-factor estimate closely. Root belief shifts toward staged subgraph ownership rather than jumping directly to the full Swin block. Preserve root decision/choice as dummy.",
+        "overall_rating_0_to_10": 6.7,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a first Triton replacement for norm1 plus window attention plus output projection and first residual, keeping norm2 and MLP in existing PyTorch modules for the initial trial.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.717,
+          "rationale": "The 4x4 single-head attention path has tiny matrices and many windows, so PyTorch eager likely pays high overhead and materializes avoidable intermediates. A custom window-local path should be correctness-manageable and expose the most obvious gap.",
+          "score_0_to_1": 0.88,
+          "title": "Replace the window-attention subgraph first"
+        },
+        "choice": "attention_subgraph",
+        "confidence_0_to_1": 0.91,
+        "decision": "initial_implementation_scope",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "N=16,C=32,head=1 are fixed and small; one program can naturally own one or a small group of windows on XPU.",
+            "notes": "Small fixed 16-token attention and 32-channel projections fit the specialized Triton path well enough to deliver repeatable speedup.",
+            "rating_0_to_10": 7.0,
+            "risk": "low_medium"
+          },
+          "memory_bandwidth": {
+            "notes": "This family removes several attention-side tensor materializations and layout transforms, which is strongly beneficial for the large NHWC activation.",
+            "rating_0_to_10": 7.2,
+            "risk": "low_medium"
+          },
+          "register_pressure": {
+            "notes": "The 4x4-window single-head kernel is register-heavy but still viable; measured correctness and latency suggest the pressure is manageable.",
+            "rating_0_to_10": 6.3,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "attention_subgraph_first",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This family owns norm1 plus window attention in Triton and leaves the MLP tail to the framework unless refined by a child node. It is the best proven top-level ownership plan so far, around 1.40x over eager.\n- bottleneck: remaining compute and memory traffic in norm2/MLP, plus residual framework launches after attention.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\n- if_no: n/a\nUPDATE_BELIEF:\n- what changed after eval_result? The follow-up run confirmed that attention-first is robust, but the attempted MLP-tail refinement did not improve because it was not implemented. This increases confidence in attention-first as the correct family while reducing confidence in superficial tail-fusion claims.\n- next bet: Continue with a child refinement that truly owns norm2 and the MLP tail in Triton, while keeping the current attention kernel as the stable base.\nSELF_CHECK: This root child excludes mlp_subgraph_first and complete_block_first because it chooses attention ownership as the first milestone before any MLP or full-block ownership.",
+        "overall_rating_0_to_10": 8.6,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 12.6806,
+            "reference_latency_ms": 17.7134,
+            "score": 1.3969,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "5c0d43a329284c32a81f9bf9664eb59e6e2426e0"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton replacement for norm2 plus fc1/GELU/fc2 plus final residual over the flat token dimension, leaving norm1 and window attention in PyTorch for the initial trial.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.82,
+          "rationale": "The MLP is the largest arithmetic component, with 921600 independent tokens and small fixed channel sizes. A custom path can fuse normalization, activation, and residual to reduce global traffic, though it competes with optimized dense linear kernels.",
+          "score_0_to_1": 0.34,
+          "title": "Make the MLP subgraph the first milestone"
+        },
+        "choice": "mlp_subgraph",
+        "confidence_0_to_1": 0.62,
+        "decision": "initial_implementation_scope",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Shape is effectively M=921600 with K=32,Nhidden=128,Nout=32; fixed small K and N may be tile-specialized for XPU.",
+            "notes": "The MLP is compute-heavy and may fit XMX matmul paths, but beating tuned PyTorch Linear kernels from scratch is uncertain.",
+            "rating_0_to_10": 5.7,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "MLP-first could reduce LayerNorm/GELU/residual traffic, but it would not remove attention window partitioning and softmax overhead that has already shown a large gain.",
+            "rating_0_to_10": 5.2,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "A fused norm2/fc1/GELU/fc2 path has more live state and larger hidden dimension than the current attention kernel.",
+            "rating_0_to_10": 4.8,
+            "risk": "medium_high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "mlp_subgraph_first",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This remains an open alternative that would start by replacing norm2 and the MLP before owning attention. No solution is attached under this family yet.\n- bottleneck: compute-heavy dense layers with substantial activation traffic; potential launch overhead, but PyTorch GEMMs may already be competitive.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\n- if_no: n/a\nUPDATE_BELIEF:\n- what changed after eval_result? The failed MLP-tail follow-through under the attention family did not prove MLP fusion is bad, but it did show that simply targeting the MLP is harder than the label suggested. Since attention-first is already validated at 1.40x, MLP-first is now a lower-priority root alternative.\n- next bet: Do not spend the next round here unless the attention-chain MLP refinement fails; if revisited, use explicit tiled matmul stages rather than a monolithic elementwise kernel.\nSELF_CHECK: This root child excludes attention_subgraph_first and complete_block_first because it chooses MLP ownership as the first milestone.",
+        "overall_rating_0_to_10": 4.3,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a specialized end-to-end path for one 4x4 window at a time, covering both LayerNorms, attention, projection, MLP, and both residuals in a single logical custom path.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.7,
+          "rationale": "The entire problem shape is fixed and small in channel/window dimensions, so an end-to-end specialized path offers the largest opportunity to eliminate intermediate activation traffic and generic operator overhead.",
+          "score_0_to_1": 0.26,
+          "title": "Attempt full Swin block replacement as the first milestone"
+        },
+        "choice": "complete_block",
+        "confidence_0_to_1": 0.58,
+        "decision": "initial_implementation_scope",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Window-local attention is naturally scoped, but the MLP is per-token and weight-reuse-oriented; combining both stresses XPU occupancy/register balance.",
+            "notes": "The full block mixes small-window attention and large MLP GEMMs; finding one first-pass mapping that fits both well is unlikely.",
+            "rating_0_to_10": 5.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "A complete block could minimize round-trips to memory, but only if all subparts are scheduled correctly.",
+            "rating_0_to_10": 6.4,
+            "risk": "medium_high"
+          },
+          "register_pressure": {
+            "notes": "Combining attention, two normalizations, MLP hidden state, GELU, and residuals from the outset risks excessive live values and spills.",
+            "rating_0_to_10": 3.6,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "complete_block_first",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This open alternative would attempt ownership of attention and MLP together as the first implementation milestone. No solution is attached yet.\n- bottleneck: implementation complexity, register pressure, and mixed compute patterns rather than a single isolated bandwidth issue.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes\n- if_no: n/a\nUPDATE_BELIEF:\n- what changed after eval_result? The latest evidence favors incremental ownership: attention-first is proven, while even the narrower MLP-tail refinement was not actually completed. This makes complete-block-first less attractive as an exploration step.\n- next bet: Keep this as a long-range possibility only after attention and MLP subgraphs have independently validated schedules.\nSELF_CHECK: This root child excludes attention_subgraph_first and mlp_subgraph_first because it chooses full-block ownership as the first milestone.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.717,
+          "rationale": "",
+          "score_0_to_1": 0.39,
+          "title": "Measured attempt at fused MLP tail: attention is fused, MLP tail remains PyTorch"
+        },
+        "choice": "add_norm2_mlp_residual_triton",
+        "confidence_0_to_1": 0.86,
+        "decision": "next_refinement_after_attention",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "The current fused attention maps small 16x32 dot products acceptably, but the dominant MLP compute is still delegated to PyTorch GEMMs rather than a controlled Triton schedule.",
+            "rating_0_to_10": 6.2,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Attention fusion reduces intermediate window tensors and launch overhead, but the remaining LayerNorm plus two Linear MLP path still streams the full 720x1280x32 tensor multiple times.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "The fused attention kernel already carries q/k/v, softmax, projection, and residual state for a 16-token window; extending it directly to the MLP would likely exceed comfortable register pressure.",
+            "rating_0_to_10": 5.8,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "attention_then_fused_mlp_tail",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The current solution uses a Triton kernel for norm1, 4x4 window attention, projection, and the first residual add. It then returns to PyTorch for norm2, fc1, GELU, fc2, and the second residual add.\n- bottleneck: compute plus launch/memory traffic in the unfused MLP tail; attention fusion is no longer the only visible cost.\nFOLLOW_THROUGH:\n- aligned_with_intent: no\n- if_no: The intended action was to add a Triton norm2 plus MLP residual tail after fused attention. The actual implementation kept the entire MLP tail in PyTorch, so the measured result mostly validates the attention-only design rather than the advertised tail fusion.\nUPDATE_BELIEF:\n- what changed after eval_result? The solution still passes and remains essentially tied with the previous best at 12.6741 ms / 1.395x, but it did not realize the predicted 0.56x baseline factor. Observed effective factor is about 0.717x, so the expected gain from the advertised fused MLP tail was not achieved.\n- next bet: Preserve the proven fused-attention code and add a true, separate Triton MLP-tail refinement underneath it. The best next attempt should not merge the whole block into one giant kernel; it should use a composable Triton schedule for norm2/fc1/GELU/fc2/residual that can use XMX-friendly matmul shapes while avoiding extra framework launches.\nPERF_GAP:\n- expected_vs_observed: predicted expected_vs_baseline_factor was 0.56, while observed latency/reference is approximately 0.717.\n- hypothesized_reason: The MLP tail was not actually fused, so the run retained PyTorch LayerNorm/Linear/GELU overhead and memory traffic after the Triton attention kernel.",
+        "overall_rating_0_to_10": 4.7,
+        "parent_id": "attention_subgraph_first",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 12.6741,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 12.6741,
+              "ref_eager_time_ms": 17.6801,
+              "score": 1.395,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": null,
+              "speedup_over_eager": 1.395
+            },
+            "reference_latency_ms": 17.6801,
+            "speedup_factor": 1.395,
+            "status": "passed"
+          },
+          "parent_solution_id": "5c0d43a329284c32a81f9bf9664eb59e6e2426e0",
+          "solution_id": "25316dd799e10d5fec396a3dcd5d855399d0c92b"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.86,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "The current fused attention maps small 16x32 dot products acceptably, but the dominant MLP compute is still delegated to PyTorch GEMMs rather than a controlled Triton schedule.",
+            "rating_0_to_10": 6.2,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Attention fusion reduces intermediate window tensors and launch overhead, but the remaining LayerNorm plus two Linear MLP path still streams the full 720x1280x32 tensor multiple times.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "The fused attention kernel already carries q/k/v, softmax, projection, and residual state for a 16-token window; extending it directly to the MLP would likely exceed comfortable register pressure.",
+            "rating_0_to_10": 5.8,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 13,
+        "node_id": "node_swin_block_fp16_simplified_r13_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 4.7,
+        "parent_id": "attention_then_fused_mlp_tail",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "25316dd799e10d5fec396a3dcd5d855399d0c92b",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This is a fixed-shape fp16 Swin-style transformer block over NHWC input [1,720,1280,32] with 57600 independent 4x4 windows, single-head N=16 attention, two C=32 LayerNorm reductions, small dense projections, and a 32->128->32 GELU MLP. The likely optimization opportunity is reducing eager PyTorch overhead and global intermediate traffic for tiny window attention and normalization, while the MLP is the largest FLOP component but may already map well to optimized dense linear backends. Correctness hinges on fp32 LayerNorm/softmax-style accumulation, exact residual ordering, fixed RPE bias addition, PyTorch Linear weight orientation, and tolerating fp16 output differences on Intel XPU Triton.",
+  "open_questions": [
+    "What exact correctness tolerance is used for fp16 outputs, especially for LayerNorm variance, softmax, GELU, and accumulation-order differences?",
+    "Does the benchmark include Triton compilation time, and are warmup iterations sufficient to measure only steady-state latency?",
+    "How fast are Triton tl.dot and fp32 reductions on Intel Arc Pro B70 for very small fixed shapes such as 16x32x16 and 32x128?",
+    "Are all parameters guaranteed contiguous fp16 after state_dict loading, including LayerNorm weights/biases and rpe_bias, or can any remain fp32?",
+    "What are the torch eager and torch.compile reference latencies on this exact XPU, and which subgraph dominates in a profiler?",
+    "Does Triton XPU support the needed math functions and GELU approximation with acceptable numerical agreement and performance?",
+    "Will specializing to the exact input shape [1,720,1280,32] be accepted by the evaluator, or must ModelNew handle other compatible H/W values?"
+  ]
+}

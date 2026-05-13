@@ -272,11 +272,52 @@ Then implement your optimized version.
             code = re.sub(r"super\(Model,\s*self\)", "super()", code)
             code = re.sub(r"super\(Model,\s*cls\)", "super()", code)
 
+        # ------------------------------------------------------------------
+        # XPU Triton workaround: strip tl.constexpr from non-BLOCK params.
+        # The Intel XPU Triton backend (triton-xpu 3.7.x) segfaults with
+        # certain pointer-count + constexpr-count combinations.  Safe rule:
+        # only keep tl.constexpr on params whose names look like compile-time
+        # constants (BLOCK*, TILE*, NUM_WARPS, etc.); strip it from runtime
+        # shape/stride args (H, W, N, stride_*, etc.).
+        # ------------------------------------------------------------------
+        if "xpu" in self._cfg.device:
+            _SAFE_CONSTEXPR_RE = re.compile(
+                r'^(BLOCK|TILE|GROUP|UNROLL|NUM_|DEPTH|STAGES)',
+                re.IGNORECASE,
+            )
+            def _strip_unsafe_constexpr(m):
+                param_name = m.group(1)
+                if _SAFE_CONSTEXPR_RE.match(param_name):
+                    return m.group(0)  # keep it
+                return param_name  # strip ": tl.constexpr"
+            code_before = code
+            code = re.sub(
+                r'(\w+)\s*:\s*tl\.constexpr',
+                _strip_unsafe_constexpr,
+                code,
+            )
+            if code != code_before:
+                _n_stripped = code_before.count('tl.constexpr') - code.count('tl.constexpr')
+                print(f"[{self._name}] XPU workaround: stripped tl.constexpr from {_n_stripped} non-BLOCK params")
+
         kernel_src_path = None
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
                 tmp.write(code)
                 kernel_src_path = tmp.name
+
+            # Save a persistent copy of every kernel for post-mortem debugging
+            try:
+                if self._ksearch_artifacts_dir:
+                    _dbg_dir = Path(self._ksearch_artifacts_dir) / self._name / "debug_kernels"
+                else:
+                    _dbg_dir = Path("debug_kernels") / self._name
+                _dbg_dir.mkdir(parents=True, exist_ok=True)
+                _dbg_path = _dbg_dir / f"round_{round_num or 0:03d}.py"
+                _dbg_path.write_text(code)
+                print(f"[{self._name}] Saved debug kernel: {_dbg_path}")
+            except Exception:
+                pass
 
             # -----------------------------------------------------------
             # Pre-flight check: syntax + import validation in a subprocess
@@ -352,6 +393,61 @@ Then implement your optimized version.
                 cwd=str(repo_root),
                 env=env,
             )
+
+            # ----------------------------------------------------------
+            # XPU SIGSEGV retry: if the kernel crashed due to the Intel
+            # XPU Triton backend bug (chaotic crash pattern based on
+            # n_ptrs × n_constexpr × body complexity), try progressively
+            # more aggressive workarounds.
+            # ----------------------------------------------------------
+            if (
+                result.returncode == -11
+                and "xpu" in self._cfg.device
+                and "@triton.jit" in code
+            ):
+                _xpu_retries = [
+                    ("constexpr_pad_7", lambda c: self._xpu_pad_triton_constexpr(c, 7)),
+                    ("constexpr_pad_2", lambda c: self._xpu_pad_triton_constexpr(c, 2)),
+                    ("constexpr_pad_4", lambda c: self._xpu_pad_triton_constexpr(c, 4)),
+                    ("constexpr_pad_1", lambda c: self._xpu_pad_triton_constexpr(c, 1)),
+                    ("constexpr_pad_6", lambda c: self._xpu_pad_triton_constexpr(c, 6)),
+                    ("strip_all_constexpr", lambda c: self._xpu_strip_all_constexpr(c)),
+                ]
+                for _retry_name, _retry_fn in _xpu_retries:
+                    _retry_code = _retry_fn(code)
+                    if _retry_code == code:
+                        continue
+                    print(f"[{self._name}] XPU SIGSEGV: retrying with {_retry_name}")
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="w", suffix=".py", delete=False
+                        ) as _rtmp:
+                            _rtmp.write(_retry_code)
+                            _retry_path = _rtmp.name
+                        _retry_cmd = [
+                            c.replace(kernel_src_path, _retry_path) if kernel_src_path in c else c
+                            for c in cmd
+                        ]
+                        _retry_result = subprocess.run(
+                            _retry_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=self._cfg.timeout + 60,
+                            cwd=str(repo_root),
+                            env=env,
+                        )
+                        os.unlink(_retry_path)
+                        if _retry_result.returncode != -11:
+                            print(f"[{self._name}] XPU SIGSEGV workaround '{_retry_name}' succeeded (rc={_retry_result.returncode})")
+                            result = _retry_result
+                            break
+                        print(f"[{self._name}] XPU SIGSEGV persists with '{_retry_name}' (rc={_retry_result.returncode})")
+                    except Exception as _e:
+                        print(f"[{self._name}] XPU retry '{_retry_name}' error: {_e}")
+                        try:
+                            os.unlink(_retry_path)
+                        except Exception:
+                            pass
 
         except subprocess.TimeoutExpired:
             return self._failed_eval(f"Evaluation timed out after {self._cfg.timeout} seconds", round_num)
@@ -491,6 +587,207 @@ Then implement your optimized version.
             "num_perf_trials": self._cfg.num_perf_trials,
             "timeout": self._cfg.timeout,
         }
+
+    # ------------------------------------------------------------------
+    # XPU SIGSEGV workarounds
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _xpu_pad_triton_constexpr(code: str, n_pad: int) -> str:
+        """Add dummy tl.constexpr params to all @triton.jit kernel functions.
+
+        The Intel XPU Triton backend (triton-xpu 3.7.x on BMG/Xe2) has a
+        SPIR-V codegen bug that causes SIGSEGV for certain combinations of
+        (n_ptrs, n_regular, n_constexpr) parameters when the kernel body
+        is non-trivial.  Padding the constexpr count can shift the parameter
+        layout out of the crash zone.
+
+        This modifies both the function signature AND the kernel launch call
+        sites by inserting ``_XPU_PAD_N: tl.constexpr`` / ``_XPU_PAD_N=0``.
+        """
+        if "triton.jit" not in code and "triton.jit" not in code:
+            return code
+
+        # 1. Find @triton.jit function names
+        jit_func_pattern = re.compile(
+            r'@triton\.jit\s*\n\s*def\s+(\w+)\s*\(', re.MULTILINE
+        )
+        func_names = jit_func_pattern.findall(code)
+        if not func_names:
+            return code
+
+        pad_params = ", ".join(f"_XPU_PAD_{i}: tl.constexpr" for i in range(n_pad))
+        pad_kwargs = ", ".join(f"_XPU_PAD_{i}=0" for i in range(n_pad))
+
+        result = code
+
+        for fname in func_names:
+            # 2. Insert padding params at end of function signature.
+            # Find the closing ')' of the def statement.  Handle multi-line
+            # signatures by counting parentheses from the 'def fname(' match.
+            def_pattern = re.compile(
+                rf'(def\s+{re.escape(fname)}\s*\()', re.MULTILINE
+            )
+            m = def_pattern.search(result)
+            if not m:
+                continue
+
+            start = m.end()  # right after the opening '('
+            depth = 1
+            pos = start
+            while pos < len(result) and depth > 0:
+                if result[pos] == '(':
+                    depth += 1
+                elif result[pos] == ')':
+                    depth -= 1
+                pos += 1
+            if depth != 0:
+                continue  # unbalanced parens, skip
+
+            close_paren = pos - 1  # index of the matching ')'
+
+            # Insert padding before the closing ')'
+            # Handle trailing comma / whitespace
+            before = result[start:close_paren].rstrip()
+            if before and not before.endswith(','):
+                sep = ",\n        "
+            else:
+                sep = "\n        "
+            result = result[:close_paren] + sep + pad_params + ",\n    " + result[close_paren:]
+
+            # 3. Insert padding kwargs at kernel launch call sites.
+            # Pattern: funcname[grid](..., num_warps=...) or funcname[grid](..., )
+            # We insert _XPU_PAD_N=0 before num_warps= or num_stages= or at
+            # the end of the arg list.
+            call_pattern = re.compile(
+                rf'({re.escape(fname)}\s*\[.*?\]\s*\()', re.DOTALL
+            )
+            search_start = 0
+            while True:
+                cm = call_pattern.search(result, search_start)
+                if not cm:
+                    break
+
+                # Find closing ')' of the call
+                call_start = cm.end()
+                depth = 1
+                pos = call_start
+                while pos < len(result) and depth > 0:
+                    ch = result[pos]
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                    elif ch in ('"', "'"):
+                        # skip strings
+                        q = ch
+                        pos += 1
+                        while pos < len(result) and result[pos] != q:
+                            if result[pos] == '\\':
+                                pos += 1
+                            pos += 1
+                    pos += 1
+                if depth != 0:
+                    search_start = pos
+                    continue
+
+                call_close = pos - 1
+
+                # Try to insert before num_warps= or num_stages=
+                call_body = result[call_start:call_close]
+                nw_match = re.search(r'(\s*num_warps\s*=)', call_body)
+                ns_match = re.search(r'(\s*num_stages\s*=)', call_body)
+
+                if nw_match:
+                    insert_pos = call_start + nw_match.start()
+                elif ns_match:
+                    insert_pos = call_start + ns_match.start()
+                else:
+                    # Insert before closing ')'
+                    insert_pos = call_close
+
+                # Build the insertion text
+                before_insert = result[:insert_pos].rstrip()
+                if before_insert and not before_insert.endswith(','):
+                    insert_text = ",\n                " + pad_kwargs + ",\n                "
+                else:
+                    insert_text = "\n                " + pad_kwargs + ",\n                "
+
+                result = result[:insert_pos] + insert_text + result[insert_pos:]
+                # Advance past this call to avoid re-matching
+                search_start = insert_pos + len(insert_text) + 100
+
+        return result
+
+    @staticmethod
+    def _xpu_strip_all_constexpr(code: str) -> str:
+        """Strip ALL tl.constexpr annotations, inlining literal values
+        throughout kernel bodies so that tl.arange, tl.zeros, tl.full,
+        tl.static_range, etc. still receive compile-time constants.
+
+        Strategy: for each constexpr param, find its launch-site value,
+        then replace EVERY occurrence of the param name (word-boundary)
+        inside the kernel function body with the literal value.  The param
+        is kept in the signature as a regular (unused) arg so the call
+        site doesn't need changes.
+        """
+        if "tl.constexpr" not in code:
+            return code
+
+        # 1. Collect constexpr param names per @triton.jit function
+        constexpr_names = re.findall(r'(\w+)\s*:\s*tl\.constexpr', code)
+        if not constexpr_names:
+            return code
+
+        # 2. Build name → literal value mapping from call sites (named kwargs)
+        name_to_val: dict[str, str] = {}
+        for name in constexpr_names:
+            val_match = re.search(rf'\b{re.escape(name)}\s*=\s*(\d+)', code)
+            if val_match:
+                name_to_val[name] = val_match.group(1)
+
+        # 3. Strip the ": tl.constexpr" annotations from signatures
+        result = re.sub(r'(\w+)\s*:\s*tl\.constexpr', r'\1', code)
+
+        # 4. For each @triton.jit function, inline values in the body
+        #    We locate each 'def fname(...):' and replace param names
+        #    with literal values inside the body (up to the next top-level
+        #    def/class or end of file).
+        jit_func_re = re.compile(
+            r'@triton\.jit\s*\n\s*def\s+(\w+)\s*\(', re.MULTILINE
+        )
+        for jit_match in jit_func_re.finditer(result):
+            # Find the end of the function signature (the ':' after ')')
+            sig_start = jit_match.end()
+            depth = 1
+            pos = sig_start
+            while pos < len(result) and depth > 0:
+                if result[pos] == '(':
+                    depth += 1
+                elif result[pos] == ')':
+                    depth -= 1
+                pos += 1
+            # pos is now just after the closing ')' of the signature
+            # Find the ':' that ends 'def f(...):'
+            colon_pos = result.find(':', pos)
+            if colon_pos == -1:
+                continue
+            body_start = colon_pos + 1
+
+            # Find end of function body: next top-level def/class/@ or EOF
+            body_end_match = re.search(
+                r'\n(?=\S)',  # next line starting at column 0
+                result[body_start:],
+            )
+            body_end = body_start + body_end_match.start() if body_end_match else len(result)
+
+            # Extract body, do replacements, put it back
+            body = result[body_start:body_end]
+            for name, val in name_to_val.items():
+                body = re.sub(rf'\b{re.escape(name)}\b', val, body)
+            result = result[:body_start] + body + result[body_end:]
+
+        return result
 
     # ------------------------------------------------------------------
     # Internal helpers

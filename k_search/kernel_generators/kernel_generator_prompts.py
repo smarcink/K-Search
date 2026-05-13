@@ -38,7 +38,20 @@ CRITICAL Intel XPU Triton backend constraints (violations cause SIGSEGV or compi
   the Intel backend has limited support and may produce invalid SPIR-V, causing SIGSEGV.
 - Keep kernels simple and well-structured. If a kernel causes SIGSEGV, simplify it —
   break fused operations into separate smaller kernels rather than one monolithic kernel.
+- WORKAROUND (triton-xpu bug): Do NOT use tl.constexpr for runtime shape/stride parameters
+  like H, W, nH, nW, stride_*, M, N, K, etc. Only use tl.constexpr for BLOCK/TILE size
+  constants (e.g. BLOCK_M: tl.constexpr, TILE_K: tl.constexpr) that control tl.arange
+  or loop bounds and are powers of 2. Certain pointer-count + constexpr-count combinations
+  cause SIGSEGV in the Intel XPU Triton backend. Safe pattern:
+    def my_kernel(ptr0, ptr1, ptr2, H, W, stride_h,  # regular args
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):  # constexpr only for tile sizes
+  Unsafe pattern (WILL SEGFAULT):
+    def my_kernel(ptr0, ptr1, ptr2, ptr3, ptr4, ptr5,
+                  H: tl.constexpr, W: tl.constexpr, NH: tl.constexpr, NW: tl.constexpr):
 - torch.xpu.synchronize() instead of torch.cuda.synchronize().
+- tl.tanh() does NOT exist in triton.language. For GELU activation, use:
+    gelu = 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
+  or the approximate version with tl.sigmoid.
 """
 
 # Triton-appropriate subset
