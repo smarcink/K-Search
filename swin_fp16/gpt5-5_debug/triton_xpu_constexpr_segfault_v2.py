@@ -163,38 +163,24 @@ print("OK")
 # Test cases
 # ---------------------------------------------------------------------------
 
-SECTION_1 = "SECTION 1: Simple body (1D load/store) — crash depends ONLY on arg counts"
+SECTION_1 = "SECTION 1: Simple body (1D load/store) — non-monotonic arg-count pattern"
 SECTION_1_TESTS = [
     # (n_ptrs, n_reg, n_cex, expected_note)
-    (4, 0, 3, "CRASH"),
-    (6, 0, 3, "CRASH"),
-    (7, 0, 3, "OK"),
-    (8, 0, 3, "OK"),
-    (4, 2, 3, "CRASH"),
-    (8, 2, 3, "OK"),  # passes with simple body!
-    (4, 0, 0, "OK"),
-    (4, 2, 0, "CRASH"),
-    (4, 2, 4, "OK"),  # adding 1 more constexpr fixes it
-    (1, 5, 3, "OK"),  # few ptrs + many regular → OK
+    (4, 0, 3, "OK — baseline: 4 ptrs + 3 constexpr"),
+    (7, 0, 3, "CRASH — 3 more ptrs triggers crash"),
+    (8, 0, 3, "CRASH — still crashes"),
+    (8, 2, 3, "OK — adding 2 regular args fixes it!"),
+    (4, 0, 0, "OK — no constexpr at all"),
 ]
 
-SECTION_2 = "SECTION 2: Complex body (fused LN+MLP) — same arg counts, different results"
+SECTION_2 = "SECTION 2: Complex body (fused LN+MLP with 2x tl.dot + tl.erf)"
 SECTION_2_TESTS = [
     # (n_ptrs, n_reg, n_cex, expected_note)
-    (8, 2, 3, "CRASH — passes with simple body, crashes with complex!"),
-    (8, 2, 0, "OK"),
-    (8, 0, 0, "OK"),
-    (10, 2, 3, "OK — 2 extra dummy ptrs fixes it"),
-    (8, 2, 8, "OK — 5 extra dummy constexpr fixes it"),
-    (8, 5, 0, "OK — converting constexpr to regular fixes it"),
-]
-
-SECTION_3 = "SECTION 3: Workaround demonstrations"
-SECTION_3_WORKAROUNDS = [
-    ("ORIGINAL (crashes)", 8, 2, 3, False),
-    ("WORKAROUND: +5 dummy constexpr", 8, 2, 8, False),
-    ("WORKAROUND: +2 dummy pointers", 10, 2, 3, False),
-    ("WORKAROUND: constexpr → regular", 8, 5, 0, False),
+    (8, 2, 3, "may CRASH — body complexity shifts the crash zone"),
+    (8, 2, 0, "OK — removing constexpr avoids crash"),
+    (8, 0, 0, "OK — minimal signature"),
+    (10, 2, 3, "OK — 2 extra dummy ptrs as workaround"),
+    (8, 2, 8, "OK — 5 extra dummy constexpr as workaround"),
 ]
 
 
@@ -251,17 +237,12 @@ if __name__ == "__main__":
         print(f"  [{status:>8s}]  {label:45s}  ({note})")
     print()
 
-    # Section 3
-    print(f"--- {SECTION_3} ---")
-    for desc, n_ptrs, n_reg, n_cex, _ in SECTION_3_WORKAROUNDS:
-        code = make_complex_kernel(n_ptrs, n_reg, n_cex)
-        status = run_test(code, f"s3_{desc[:30]}")
-        print(f"  [{status:>8s}]  {desc}")
-    print()
-
     print("KEY OBSERVATIONS:")
     print("  1. The crash depends on (n_pointer_args, n_constexpr_args, body_complexity)")
-    print("  2. Pattern is NON-MONOTONIC: more args can fix OR cause crashes")
-    print("  3. Same arg signature can PASS with simple body, CRASH with complex body")
+    print("  2. Pattern is NON-MONOTONIC: adding ptrs can CAUSE a crash (4→7) or FIX one (8→10)")
+    print("  3. Same arg signature can behave differently with simple vs complex body")
     print("  4. num_warps / num_stages changes do NOT help")
     print("  5. Workarounds: pad constexpr count, pad pointer count, or strip constexpr")
+    print()
+    print("NOTE: This bug is non-deterministic across Triton cache states and driver versions.")
+    print("      If all cases PASS, clear ~/.triton/cache and re-run.")
