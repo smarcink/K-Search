@@ -1,0 +1,269 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n_attn_fused",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090Mobile: Blackwell, fp16 tensor cores; window N=16 too small for efficient tl.dot on tensor cores by itself but batched across windows (B*nH*nW=57600 windows) is huge.",
+            "notes": "Attention is tiny per window (N=16, C=32). MLP hidden=128, dim=32. All matmuls have small inner dims; fp16 accum in fp32. Batching across all tokens for fc1/fc2 is fine (B*H*W=921600).",
+            "rating_0_to_10": 7.0,
+            "risk": "tl.dot requires M,N,K >= 16; N=16,C=32 OK but careful with shapes."
+          },
+          "memory_bandwidth": {
+            "notes": "Input tensor (1,720,1280,32) fp16 = ~59MB. LN/MLP are memory bound. Attention per window is tiny and likely benefits from fusion.",
+            "rating_0_to_10": 7.0,
+            "risk": "Multiple kernel launches in reference cause redundant HBM round trips; fusing LN+QKV+attn+proj+residual and LN+fc1+gelu+fc2+residual would save bandwidth."
+          },
+          "register_pressure": {
+            "notes": "Window working set: 16 tokens x 32 channels = 512 fp16 elements per window for x, q, k, v. Weights qkv (32x96=3072), proj (32x32=1024). Fits easily in shared memory; per-window fully fusable.",
+            "rating_0_to_10": 8.0,
+            "risk": "MLP hidden=128: fc1 weight 32x128=4096, fc2 weight 128x32=4096. Per-token MLP fusion needs to load weights per block; broadcast via shared memory."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: Simplified Swin block fp16. Input (1,720,1280,32). window=4x4 (N=16), heads=1, dim=32, mlp_ratio=4 (hidden=128). Pipeline: LN1->QKV linear->scaled attn with rpe_bias->softmax->@V->proj->residual; LN2->fc1->GELU->fc2->residual. ANALYSIS: (1) Classification: mixed attention+MLP, fp16, small per-window dims, dense. (2) Reductions: LN (mean/var over C=32), softmax over N=16, dot products. (3) Layout: NHWC, contiguous. Window partition is a reshape/permute - can be folded into index arithmetic. (4) Regimes: A) attention path bandwidth-bound (small matmuls); B) MLP path bandwidth-bound (hidden=128 small); C) full fusion compute-bound on softmax/exp. (5) Knobs: tile size in tokens, fuse LN with next op, keep weights in shared mem, online softmax. (6) Skeleton: Kernel1 fused attention block per window (4x4=16 tokens) producing residual-added output; Kernel2 fused MLP block per row tile producing final residual-added output. Weights small enough to live in shared mem broadcast. (7) Families: (a) Two big fused kernels (attn-block, mlp-block) - top candidate since per-window state tiny. (b) Three kernels (LN+QKV, attn-core+proj+res, LN+MLP+res). (c) Single megakernel covering both blocks per spatial tile - risky due to residual dependency across windows aligning with MLP tiles. Choosing (a) as primary.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_started"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Write a single Triton kernel that processes one 4x4 window per program: loads 16x32 fp16 tile, applies LN1, computes QKV via tl.dot with weights staged in shared mem, computes Q@K^T + rpe_bias (16x16), softmax, @V, proj linear, adds residual, writes result. Avoids 4 separate HBM passes.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.5,
+          "rationale": "Per-window working set is tiny (16x32 = 1KB fp16). Fusing eliminates ~4 HBM round trips of the activation tensor (~59MB each). Tensor cores via tl.dot for QKV and proj matmuls.",
+          "score_0_to_1": 0.75,
+          "title": "Fused attention-block kernel (LN1+QKV+attn+proj+residual)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "M=16,N=32,K=32 dot products are at minimum tensor-core tile sizes; should still leverage MMA.",
+            "notes": "Multiple small matmuls fused into one kernel; weights pulled once.",
+            "rating_0_to_10": 7.0,
+            "risk": "Small M=16 means low tensor-core utilization per window; many windows (57600) compensate via concurrency."
+          },
+          "memory_bandwidth": {
+            "notes": "Saves ~4 reads+writes of activation tensor vs separate kernels.",
+            "rating_0_to_10": 9.0,
+            "risk": "Need to load qkv weights, proj weights, rpe_bias per block but they are tiny and can be cached in L1/shared."
+          },
+          "register_pressure": {
+            "notes": "16x32 tile + intermediates fit comfortably.",
+            "rating_0_to_10": 8.0,
+            "risk": "Softmax stable form needs row max/sum; 16x16 is trivial."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_attn_fused",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative siblings split attention into 2+ kernels; cannot combine with them since they describe different fusion granularity.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.1257,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 1.1257,
+              "ref_eager_time_ms": 9.061,
+              "score": 8.0491,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": null,
+              "speedup_over_eager": 8.0491
+            },
+            "reference_latency_ms": 9.061,
+            "speedup_factor": 8.0491,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "4da970a6e6cc553625a04ca1b10797798d3059bf"
+        }
+      },
+      {
+        "action": {
+          "description": "Write a Triton kernel that, per tile of tokens (e.g., 64 or 128 rows of C=32), loads attention output, applies LN2, computes fc1 (32->128) via tl.dot, GELU, fc2 (128->32) via tl.dot, adds residual, writes output. fc1/fc2 weights staged in shared memory once per block.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.6,
+          "rationale": "MLP weights are small (32*128 + 128*32 = 8192 fp16 = 16KB) and fit in shared memory. Fusing LN2+fc1+GELU+fc2+residual eliminates 3 HBM round trips of activations.",
+          "score_0_to_1": 0.7,
+          "title": "Fused MLP-block kernel (LN2+fc1+GELU+fc2+residual)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.65,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "BLOCK_M tokens x K=32 -> hidden=128 -> 32. tl.dot tiles map well to tensor cores when BLOCK_M>=16.",
+            "notes": "Two matmuls fused; weights reused across tokens via shared mem.",
+            "rating_0_to_10": 8.0,
+            "risk": "Choice of BLOCK_M affects occupancy vs reuse."
+          },
+          "memory_bandwidth": {
+            "notes": "Reads activation+residual once, writes once.",
+            "rating_0_to_10": 9.0,
+            "risk": "LN requires reading row once for mean/var then again to normalize unless cached in registers."
+          },
+          "register_pressure": {
+            "notes": "Per-block hidden tile BLOCK_M x 128 in fp32 accumulators is feasible up to BLOCK_M=64.",
+            "rating_0_to_10": 7.0,
+            "risk": "Large BLOCK_M increases register pressure for hidden buffer."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_mlp_fused",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: complementary in pipeline to attention kernel - both are needed; treated as separate decisions because each can be tuned independently.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Pre-fold qkv weight, proj weight, fc1/fc2 weights and rpe_bias into fp16 contiguous buffers at __init__; precompute LN affine combined with following linear where safe. Provide a forward that calls the two fused kernels in sequence.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.9,
+          "rationale": "Reduces overhead and ensures kernels see ideal layouts; small but pure win.",
+          "score_0_to_1": 0.5,
+          "title": "Weight preprocessing and forward orchestration"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "No HW impact directly.",
+            "notes": "Improves kernel inputs; no algorithmic change.",
+            "rating_0_to_10": 5.0,
+            "risk": "None."
+          },
+          "memory_bandwidth": {
+            "notes": "Cached weights in HBM with correct layout; minor.",
+            "rating_0_to_10": 5.0,
+            "risk": "Folding LN affine into linear may slightly change numerics; keep separate for correctness."
+          },
+          "register_pressure": {
+            "notes": "No impact.",
+            "rating_0_to_10": 5.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_orchestration",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: prerequisite/companion to fused kernels; cannot replace them.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Alternative: fuse attention block at the granularity of multiple windows per program (e.g., 4 windows = 64 tokens) to amortize weight loads and increase tensor-core M dimension; keep softmax per-window.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.45,
+          "rationale": "M=64 better utilizes tensor cores than M=16; weights cached once for 4 windows. Softmax stays independent per 16x16 sub-block.",
+          "score_0_to_1": 0.65,
+          "title": "Multi-window attention fusion (BLOCK_W>1)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Tensor core M=64,K=32 is healthier; softmax still per 16-token segment.",
+            "notes": "Better MMA utilization; more shared-mem reuse.",
+            "rating_0_to_10": 8.0,
+            "risk": "Softmax must be done per-window block; need careful masking or per-window loops."
+          },
+          "memory_bandwidth": {
+            "notes": "Fewer redundant weight loads.",
+            "rating_0_to_10": 8.0,
+            "risk": "Slightly larger per-block footprint."
+          },
+          "register_pressure": {
+            "notes": "Larger Q,K,V tiles in registers/shared.",
+            "rating_0_to_10": 6.0,
+            "risk": "Could spill if BLOCK_W too large."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_attn_multiwin",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative to n_attn_fused (different tile granularity). Cannot trivially combine; choose one tiling.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin transformer block in fp16: LayerNorm -> windowed self-attention (4x4 windows, single head, dim=32, with relative position bias) -> residual -> LayerNorm -> 2-layer MLP (hidden=128, GELU) -> residual on a (1,720,1280,32) NHWC tensor. The reference performs many small ops causing redundant HBM traffic of a ~59MB activation tensor. Per-window working set (16 tokens x 32 channels) and all weights (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32) are tiny and fit easily in shared memory, so the natural strategy is two heavily fused Triton kernels: (1) fused attention-block per window or multi-window tile, (2) fused MLP-block per token tile, both using tl.dot for tensor-core matmuls and inline LN/softmax/GELU/residual. Key constraints: tl.dot minimum tile sizes (M,N,K>=16), stable softmax over N=16, fp32 accumulation for LN/matmul, NHWC contiguous layout, must beat torch.compile baseline.",
+  "open_questions": [
+    "What is torch.compile's baseline latency on RTX5090Mobile for this exact shape \u2014 does it already fuse LN+linear?",
+    "Does tl.dot achieve good utilization at M=16,K=32,N=32, or should we batch multiple windows per program?",
+    "Best BLOCK_M for the MLP kernel given hidden=128 accumulator and register budget on Blackwell SM?",
+    "Should the rpe_bias (1,1,16,16) be broadcast-loaded inside the attention kernel or pre-added into a different form?",
+    "Is LN's fp32 accumulation required for numerical match within tolerance, or is fp16 accumulation acceptable?",
+    "Should attention output be written to HBM as an intermediate, or can we further fuse it with MLP via persistent kernels across spatial tiles?",
+    "Are window count divisibilities exact (720/4=180, 1280/4=320) so we can avoid boundary masking? Yes by shape, confirm.",
+    "What is the cost of layout permutes (window partition) \u2014 can we encode them purely via index arithmetic in the kernel?"
+  ]
+}
