@@ -19,13 +19,11 @@
             "program": "${workspaceFolder}/compare_kernels.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "python": "${workspaceFolder}/.venv2/bin/python",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "justMyCode": true,
             "args": [
                 "swin_fp16/swin_block_fp16_simplified.py",
-                "swin_fp16/triton_opus46_copy",
-                "swin_fp16/opus47_v1",
-                "swin_fp16/gpt5-5_fix",
+                "swin_fp16/opus47_v2_compile",
                 "--precision", "fp16",
                 "--warmup", "100",
                 "--iters", "1000", 
@@ -40,7 +38,7 @@
             "program": "${workspaceFolder}/compare_kernels.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "python": "${workspaceFolder}/.venv2/bin/python",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "justMyCode": true,
             "args": [
                 "conv_pooling_fp16/conv_block_fp16.py",
@@ -59,7 +57,7 @@
             "program": "${workspaceFolder}/compare_kernels.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "python": "${workspaceFolder}/.venv2/bin/python",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "justMyCode": true,
             "args": [
                 "elementwise_add_fp16/elementwise_add_fp16.py",  // path to reference

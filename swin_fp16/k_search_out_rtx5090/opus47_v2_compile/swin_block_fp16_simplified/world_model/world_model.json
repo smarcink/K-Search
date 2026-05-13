@@ -1,0 +1,631 @@
+{
+  "computed_signals": {
+    "round_index": 25,
+    "trace": {
+      "latency_ms": 6.4411,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 51.0971,
+      "speedup_factor": 7.1658,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n_full_fusion_tc",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090Mobile (Blackwell-class) with tensor cores. fp16 MMA via tl.dot. Window N=16, head dim C=32, hidden=128, image 720x1280.",
+            "notes": "Most ops are small-matmul-heavy with tiny N=16; tensor cores underutilized unless we fuse multiple windows into a tile dimension. MLP fc1/fc2 (32->128->32) per pixel is the heaviest cost.",
+            "rating_0_to_10": 5.0,
+            "risk": "Small inner dim (32) keeps tensor core utilization low; need to fuse over batch/spatial."
+          },
+          "memory_bandwidth": {
+            "notes": "Input is 1x720x1280x32 fp16 = ~58MB. Multiple round-trips between LN/attn/MLP dominate. Full fusion of (LN1->attn->residual->LN2->MLP->residual) can save several full-tensor reads/writes.",
+            "rating_0_to_10": 6.0,
+            "risk": "Weight matrices (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32) are tiny (~50KB total) and fit in shared/registers easily."
+          },
+          "register_pressure": {
+            "notes": "Per-window working set: 16 tokens x 32 channels = 512 fp16 values, plus 128-hidden MLP intermediate = 16x128 = 2048 fp16. Manageable per CTA.",
+            "rating_0_to_10": 6.0,
+            "risk": "If we try to keep entire windows + MLP hidden in registers, may exceed budget; shared memory staging is fine."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) CLASSIFICATION: Mixed kernel \u2014 LayerNorm (reduction), windowed self-attention (small-matmul + softmax), residual add, LayerNorm, MLP (two GEMMs + GELU), residual add. Window=4x4=16 tokens, C=32, num_heads=1, mlp_ratio=4 -> hidden=128. Input (1,720,1280,32) fp16. nH=180, nW=320 -> 57600 windows. 2) MATH: y=x+Proj(Softmax(QK^T/sqrt(C)+rpe)V) on LN1(x); y=y+fc2(GELU(fc1(LN2(y)))). All reductions are per-token (LN over C=32) or per-window (softmax over N=16). 3) LAYOUT: Input NHWC, weights small enough to live in shared mem / constant. Window partition is a reshape/permute \u2014 can be expressed by index math. RPE bias (1,1,16,16)=256 fp16 constants. 4) REGIMES: (a) Memory-bound full-pipeline traversal \u2014 likely dominant due to ~58MB tensor traversed many times in reference. (b) Compute-bound on MLP if fused (32x128 matmul x 921600 tokens \u2248 7.5 GFLOPs fp16 \u2014 small). (c) Small-matmul attention regime where tensor cores underutilized for N=16. 5) KNOBS: per-CTA = one window (16 tokens) or block of windows; staging of QKV/proj/fc1/fc2 in shared; whether to fuse attn+MLP or split; tl.dot with BLOCK_M>=16; vectorized loads on C=32 (one float4 per token). 6) SKELETON: Grid over windows (and possibly groups of windows). Each CTA: load 16x32 tile, apply LN1, compute QKV via tl.dot using shared weights, compute attn (16x16) + softmax + V proj (16x32), apply proj linear, add residual, LN2, fc1 (16x128), GELU, fc2 (16x32), add residual, store. 7) FAMILIES: F1 (TOP) Full-fusion single kernel \u2014 entire block per window CTA; working set: x(16x32=1KB)+hidden(16x128=4KB)+weights(qkv=6KB, proj=2KB, fc1=8KB, fc2=8KB)+rpe(0.5KB) \u2248 30KB shared, fits easily. Strength: one HBM read + one HBM write of activations. Weakness: weight broadcast to every CTA (cached in L2 ~50KB, fine). F2 Two-kernel split: attn-fused-kernel then MLP-fused-kernel, simpler but extra round-trip of 58MB. F3 Hybrid: fuse LN+attn+proj+residual+LN2 first, then fc1+GELU+fc2+residual, sharing nothing \u2014 same drawback as F2. Choose F1.\n\nKey constraints: num_heads=1, shift=(0,0), window=4x4, dim=32, hidden=128, fp16 throughout. LN uses fp32 accumulation. RPE is a learned constant buffer.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single Triton kernel that processes one (or a small group of) 4x4 window per program. The kernel loads the 16x32 tile, runs LN1, computes QKV via tl.dot with weights cached from shared memory, performs 16x16 attention with RPE + softmax, multiplies by V, applies output projection, adds the residual, runs LN2, fc1 (32->128) + GELU + fc2 (128->32), adds the second residual, and stores back. Weights are loaded once per CTA from globals (relying on L2 reuse).",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.4,
+          "rationale": "Eliminates ~5 full-tensor round trips through HBM (LN1 out, qkv out, attn out, proj out, LN2 out, fc1 out, fc2 out). Working set fits in shared memory. Tensor cores can be used for fc1/fc2 by grouping multiple windows along M.",
+          "score_0_to_1": 0.82,
+          "title": "Fully fused per-window Swin-block kernel (F1)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Use BLOCK_M = group of windows (e.g., 4 windows -> M=64 tokens) so tl.dot tiles hit 64x32x128 etc. for tensor cores.",
+            "notes": "M=64 (WPP=4) enables tensor cores; further gains possible with larger M and better stage pipelining.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Single HBM read of X and single write of Y per window-group; weights loaded once per program.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Holds all weight tiles (QKV, proj, fc1[128x32], fc2[32x128]) + activations in registers; likely high but tractable at WPP=4.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion",
+        "node_type": "decision",
+        "notes": "CURRENT: does=single Triton kernel per (group of) 4x4 windows that fuses LN1+QKV+attn+proj+LN2+FC1(GELU)+FC2 with residuals, loading all weights once, WINDOWS_PER_PROG=4 for tensor-core friendly M=64. bottleneck=now compute/MMA throughput on small N=64, K up to 128/512; HBM mostly amortized. FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: passed with 4.42x over compile / 6.91x over eager at 1.28ms \u2014 fusion paid off as predicted. Next bet: tune WINDOWS_PER_PROG (8/16) and num_warps/num_stages, and split rpe/mask compute to reduce register pressure to push MMA utilization further.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.2842,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 1.2842,
+              "ref_eager_time_ms": 8.8793,
+              "score": 4.4192,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 4.4192,
+              "speedup_over_eager": 6.9141
+            },
+            "reference_latency_ms": 8.8793,
+            "speedup_factor": 4.4192,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "6bc2d17732b7cd0a05e695154996f27da154c1d9"
+        }
+      },
+      {
+        "action": {
+          "description": "Two specialized fused kernels: (K1) LN1 + windowed attention (QKV + softmax + V + proj) + residual; (K2) LN2 + fc1 + GELU + fc2 + residual. Activations between kernels are written to HBM. Simpler to implement and debug; each kernel can be independently tuned.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.7,
+          "rationale": "Easier to get correct quickly; still removes most internal round-trips. Likely beats torch.compile for the attention kernel where small N=16 hurts vendor BLAS. Risk: still pays one extra HBM round-trip of the 58MB activation between kernels.",
+          "score_0_to_1": 0.1,
+          "title": "Two fused kernels: attention block + MLP block (F2)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "MLP kernel naturally tensor-core friendly when tiled over tokens (M=128 e.g.).",
+            "notes": "Both kernels have manageable working sets; weights fit in shared.",
+            "rating_0_to_10": 6.0,
+            "risk": "Extra HBM round-trip costs roughly 58MB read+write at fp16."
+          },
+          "memory_bandwidth": {
+            "notes": "Two HBM round-trips of the activation tensor instead of one.",
+            "rating_0_to_10": 6.0,
+            "risk": "On a memory-bound problem this could be the deciding factor vs full fusion."
+          },
+          "register_pressure": {
+            "notes": "Lower per-kernel register pressure than full fusion; each kernel is smaller.",
+            "rating_0_to_10": 8.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_split_attn_mlp",
+        "node_type": "decision",
+        "notes": "DEPRIORITIZED further: fused kernel at 17.62x makes splitting clearly dominated (would reintroduce HBM traffic). Keep as cold fallback.",
+        "overall_rating_0_to_10": 2.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.057,
+          "rationale": "",
+          "score_0_to_1": 0.97,
+          "title": "Tune WINDOWS_PER_PROG + warps/stages for MMA throughput"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.95,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion_tc",
+        "node_type": "decision",
+        "notes": "Best node so far: 17.6x over compile, 3.21ms. Block-diag NTOTxNTOT attention exploits TensorCore sizes better than per-window NxN. Children should keep this attention shape and refine epilogues/MLP tiling.",
+        "overall_rating_0_to_10": 9.5,
+        "parent_id": "n_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 3.2068,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 3.2068,
+              "ref_eager_time_ms": 55.2556,
+              "score": 17.6155,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 17.6155,
+              "speedup_over_eager": 17.2306
+            },
+            "reference_latency_ms": 55.2556,
+            "speedup_factor": 17.6155,
+            "status": "passed"
+          },
+          "parent_solution_id": "6bc2d17732b7cd0a05e695154996f27da154c1d9",
+          "solution_id": "f6c78786824024f1d623e17b9de750ccf188f221"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.34,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Simplify intra-window attention (drop cross-window mask, precompute RPE tile)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion_attn_simplify",
+        "node_type": "decision",
+        "notes": "CHILD of F1. Since each program holds WPP independent windows, do per-window NxN attention (N=16) instead of NTOTxNTOT with masking. Removes the same_win mask, halves attn FLOPs, frees registers. SELF_CHECK: composes with n_full_fusion_tc; not an alternative to F1.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6bc2d17732b7cd0a05e695154996f27da154c1d9",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.18,
+          "rationale": "",
+          "score_0_to_1": 0.25,
+          "title": "Per-window attention (drop cross-window masked MMA, NxN instead of NTOTxNTOT)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Tiny NxN=16x16 MMAs underutilize tensor cores vs NTOTxNTOT batched MMA.",
+            "rating_0_to_10": 3.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "Same HBM traffic as parent.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Smaller attn matrices but reshape may cost regs.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fft_per_window_attn",
+        "node_type": "decision",
+        "notes": "CURRENT: Fully fused Swin block, autotuned WPP/warps/stages, attention done as block-diag NTOTxNTOT MMA (no per-window split). Bottleneck: compute/MMA utilization across fused epilogues. FOLLOW_THROUGH: aligned_with_intent=no \u2014 current_code still does big NTOTxNTOT attention with rpe broadcast, did NOT switch to per-window (B,N,C) reshape attention path as the intent specified. UPDATE_BELIEF: regression from 17.6x->7.17x; likely the per-window variant reduced MMA size below TC efficient range (N=16, C=tiny) and lost throughput. Next bet: revert and instead pursue epilogue/bias folding + MLP block tiling on top of the 17.6x kernel. PERF_GAP: expected 0.18x baseline, observed ~0.06x of baseline (7.17x vs 17.6x parent) \u2014 per-window MMA is too small for TC.",
+        "overall_rating_0_to_10": 4.0,
+        "parent_id": "n_full_fusion_tc",
+        "solution_ref": {
+          "eval": {
+            "score": 7.1658,
+            "score_name": "speedup_over_compile",
+            "status": "passed"
+          },
+          "parent_solution_id": "f6c78786824024f1d623e17b9de750ccf188f221",
+          "solution_id": "per_window_attn_r16"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.28,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Fold LN affine + biases into matmul epilogues to cut registers"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fft_bias_fold",
+        "node_type": "decision",
+        "notes": "CHILD refinement: precompute fused (W,b) so q/k/v/proj/fc1/fc2 epilogues need fewer separate add/scale ops, lowering register pressure and possibly enabling larger WPP or more stages. SELF_CHECK: distinct from n_fft_per_window_attn (register/epilogue focus vs attention shape change); composable with it.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n_full_fusion_tc",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "f6c78786824024f1d623e17b9de750ccf188f221",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.05,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Tile FC1/FC2 along HIDDEN to reduce register pressure and enable better MMA pipelining"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fft_mlp_block_tile",
+        "node_type": "decision",
+        "notes": "CHILD of best leaf. MLP GEMMs (C x HIDDEN and HIDDEN x C) are the dominant compute. Tiling HIDDEN dimension into chunks (e.g., HIDDEN/2 or HIDDEN/4) may relieve register pressure on NTOT x HIDDEN intermediate and allow better warp scheduling/stages. SELF_CHECK: excludes sibling n_fft_bias_fold because it targets MLP compute, not LN/bias folding.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n_full_fusion_tc",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "f6c78786824024f1d623e17b9de750ccf188f221",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.055,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Fold biases into LN-affine and pre-transpose weights at module init"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_swin_block_fp16_simplified_r25_1",
+        "node_type": "decision",
+        "notes": "CHILD of best leaf. Pre-transpose q/k/v/proj/fc1/fc2 weights so tl.trans is avoided; fold q/k/v biases into projection-time add via packed constants; precompute LN-affine combined params. Small but free win. SELF_CHECK: excludes n_fft_mlp_block_tile because it targets bias/affine/weight layout, not MLP tile shape.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n_full_fusion_tc",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "f6c78786824024f1d623e17b9de750ccf188f221",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.05,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Tile MLP (fc1/fc2) along HIDDEN to cut register pressure"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_mlp_tile_split",
+        "node_type": "decision",
+        "notes": "CHILD of best. Split HIDDEN (e.g. 4*C) GEMMs into K chunks accumulating in fp32, reducing live registers and enabling higher occupancy / more WPP. SELF_CHECK: orthogonal to attention shape; composes with NTOTxNTOT MMA.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n_full_fusion_tc",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "f6c78786824024f1d623e17b9de750ccf188f221",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.05,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Keep weights in registers/SMEM across windows via larger WPP + prefetch stages"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_persist_weights_smem",
+        "node_type": "decision",
+        "notes": "CHILD of best. Re-sweep WPP up to 64/128 with num_stages=4 to amortize weight loads (q/k/v/proj/fc1/fc2) per program. SELF_CHECK: pure scheduling tweak, orthogonal to MLP tiling sibling.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n_full_fusion_tc",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "f6c78786824024f1d623e17b9de750ccf188f221",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.05,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Fold LN affine into qkv/proj/fc1/fc2 weights+bias to drop epilogue ops"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "same MMA shapes",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "same weight sizes",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "fewer live LN scale/bias regs",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fft_epilogue_fold",
+        "node_type": "decision",
+        "notes": "CHILD of best (17.6x). Pre-fuse LN gamma into following Linear weights and add LN beta @ W into bias at module init. Reduces per-tile mul/add and register pressure inside kernel. SELF_CHECK: distinct from sibling 'n_fft_mlp_block_tile' which targets MLP tiling, not weight folding.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n_full_fusion_tc",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "f6c78786824024f1d623e17b9de750ccf188f221",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Tiny NxN=16x16 MMAs underutilize tensor cores vs NTOTxNTOT batched MMA.",
+            "rating_0_to_10": 3.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "Same HBM traffic as parent.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Smaller attn matrices but reshape may cost regs.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 25,
+        "node_id": "node_swin_block_fp16_simplified_r25_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 4.0,
+        "parent_id": "n_fft_per_window_attn",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "per_window_attn_r16",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin transformer block in fp16 over a (1,720,1280,32) NHWC tensor with 4x4 non-shifted windows, single head, dim=32, mlp_ratio=4 (hidden=128). The block is LayerNorm -> windowed self-attention (QKV linear, scaled dot-product with relative position bias, softmax, V multiply, output projection) + residual -> LayerNorm -> MLP (fc1 32->128, GELU, fc2 128->32) + residual. The reference issues many small ops, traversing the 58MB activation tensor multiple times through HBM, and the small inner dims (C=32, N=16) make tensor cores underutilized in vendor kernels. The kernel is primarily memory-bandwidth bound at the block level and small-matmul/tensor-core-utilization bound at the op level. Key constraints: num_heads=1, shift=(0,0), window=[4,4], weights are tiny (~50KB total) and fit in shared memory, LN must accumulate mean/var in fp32 for fp16 stability, RPE bias is a constant (1,1,16,16) buffer. The biggest performance lever is fusing the entire block into a single Triton kernel so activations stay on-chip; the second lever is grouping multiple windows per program to raise tl.dot tile sizes for tensor cores.",
+  "open_questions": [
+    "What is the exact register budget on RTX5090Mobile per Triton program, and at what BLOCK_M does the fully-fused kernel begin to spill?",
+    "Can we group adjacent windows along nW to keep window-partitioned tokens contiguous in memory, avoiding scatter/gather, given the (B,nH,Wh,nW,Ww,C) reshape?",
+    "Is fp16 sufficient for softmax accumulation across N=16, or do we need fp32 max/sum to match reference tolerance?",
+    "Does folding LN affine into the next Linear cause unacceptable fp16 drift relative to the reference (which keeps LN affine separate)?",
+    "What tolerance is used for correctness checking \u2014 does it accept fp16-internal MLP matmuls or require fp32 accumulation in tl.dot?",
+    "Is torch.compile's baseline already fusing LN+attn or LN+MLP via inductor \u2014 i.e., what is the realistic baseline latency to beat?",
+    "Should the kernel be one program per window (57600 programs) or grouped (e.g., 14400 programs of 4 windows) for best occupancy on RTX5090Mobile?",
+    "Are the weights guaranteed contiguous in the expected layout, and can we transpose qkv weights once at init to maximize coalesced loads inside the kernel?"
+  ]
+}

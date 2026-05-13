@@ -334,9 +334,20 @@ def evaluate(
         num_trials=num_perf_trials,
     )
 
-    # torch.compile baseline — disabled: compilation can exceed subprocess timeout
-    # on large tensors (Inductor tracing/codegen alone can take > 300s).
+    # torch.compile baseline
     compile_time: float | None = None
+    try:
+        compiled_model = torch.compile(ref_model)
+        compile_time = _measure_latency(
+            model=compiled_model,
+            get_inputs_fn=ref_get_inputs,
+            device=device,
+            dtype=dtype,
+            num_warmup=num_warmup,
+            num_trials=num_perf_trials,
+        )
+    except Exception as e:
+        print(f"[WARN] torch.compile failed: {e}")
 
     speedup_eager = ref_time / kernel_time if kernel_time > 0 else 0.0
     speedup_compile = (compile_time / kernel_time) if (compile_time and kernel_time > 0) else None
