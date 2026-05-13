@@ -1,0 +1,599 @@
+{
+  "computed_signals": {
+    "round_index": 29,
+    "trace": {
+      "latency_ms": 4.1501,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 3.9295,
+      "speedup_factor": 0.9468,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n_fused_opt",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.4,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 (Xe-HPG). Triton XPU backend. fp16 input, conv 3x3 stride1 pad1, 16->32 channels, then ReLU, then AvgPool2d(2). Input 1x16x720x1280.",
+            "notes": "Conv 3x3 with small C_in=16, C_out=32; pool reduces spatial 2x. Output 1x32x360x640. MACs per output pixel of conv = 16*9=144. Fusion of conv+relu+avgpool to reduce intermediate writes is attractive.",
+            "rating_0_to_10": 6.0,
+            "risk": "tl.dot fp16 support and shape constraints on XPU; alignment of 16/32 channel dims"
+          },
+          "memory_bandwidth": {
+            "notes": "Conv reads 1*16*720*1280*2B ~= 29.5MB, weights tiny (16*32*9*2B). Conv output before pool 1*32*720*1280*2B ~=59MB. Fusing pool avoids writing this intermediate.",
+            "rating_0_to_10": 7.0,
+            "risk": "Memory bound likely; tiling over 2x2 pool window must align with conv tiles"
+          },
+          "register_pressure": {
+            "notes": "Small C_in=16, C_out=32 keeps weight tile fully in registers/SLM (16*32*9 = 4608 elements ~9KB fp16).",
+            "rating_0_to_10": 4.0,
+            "risk": "If tile output 32 channels x large spatial, register usage may grow"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS:\n1) Classification: Fused 2D conv (3x3, stride1, pad1) + ReLU + AvgPool2d(2). Dense regular access, no indirect indexing. Spatial reduction in pool. fp16.\n2) Math: y[n,oc,h,w] = sum_{ic,kh,kw} x[n,ic,h+kh-1,w+kw-1]*W[oc,ic,kh,kw] + b[oc]; r = relu(y); out[n,oc,oh,ow] = avg of r over 2x2. Pool stride 2 means each output pixel needs 2x2 conv outputs.\n3) Layout: x NCHW fp16 contiguous (1,16,720,1280); W fp16 (32,16,3,3); bias (32) fp16; out (1,32,360,640) fp16. Reuse: each input pixel feeds up to 9 output positions; weights reused across all spatial. Pool fusion saves writing full conv output.\n4) Regimes: (a) Memory-bound for large HxW (current case) - bandwidth dominates; (b) compute-bound if Cin/Cout grow; (c) small-spatial (latency/launch). Current case is regime (a).\n5) Knobs: tile size in (oh,ow); process all 32 oc per tile (since small); fuse pool by producing 2x2 conv block per output pixel; use tl.dot for inner GEMM (reshape conv as matmul over ic*kh*kw); cache input rows in shared/registers; precompute padding masks.\n6) Skeleton: program per (oh_tile, ow_tile); load 32 oc weights (constant); for each output pixel, load needed input window (or for tile, load input tile of size (2*BH+2, 2*BW+2) x 16 ic), compute conv outputs for 2x2 region per output pixel summed/averaged, apply relu before avg (relu of mean != mean of relu; correct: relu then avg). Bias added before relu.\n7) Families: F1 fused conv+relu+avgpool single kernel; F2 separate optimized conv kernel + fused relu+pool; F3 im2col + tl.dot matmul + epilogue.\nOpen actions: implement F1 fused tile-based; alternative F3 matmul-style; baseline simple call to torch ops with channels_last/contiguous and torch.compile fallback as safety.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Write a single Triton kernel that fuses conv2d (3x3, stride1, pad1) + bias + ReLU + AvgPool2d(2). Each program computes a tile of pooled outputs for all 32 output channels. Iterate over input channels and kernel positions inside the kernel; accumulate in fp32; apply bias+ReLU per conv output; average 2x2 conv outputs into pooled output.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "Largest win comes from eliminating the 59MB intermediate write and reading input once per tile. Small Cin=16, Cout=32 means weights fit in registers and full output channel reduction can be vectorized.",
+          "score_0_to_1": 0.4,
+          "title": "Fused conv3x3+bias+ReLU+AvgPool2d kernel"
+        },
+        "choice": "fused_single_kernel",
+        "confidence_0_to_1": 0.5,
+        "decision": "implement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Use tl.dot if shapes permit; otherwise manual MACs over 9 kernel positions x 16 ic.",
+            "notes": "K=16 too small for XMX efficiency",
+            "rating_0_to_10": 3.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "9x redundant input loads; intermediate elimination not enough",
+            "rating_0_to_10": 3.0,
+            "risk": "high"
+          },
+          "register_pressure": {
+            "notes": "32x64x32 fp32 accumulator = 64KB likely spilling",
+            "rating_0_to_10": 4.0,
+            "risk": "med"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused",
+        "node_type": "decision",
+        "notes": "Superseded by n_fused_opt (single-dot im2col) which reached 0.95x. Keep as historical baseline; do not re-explore 9-dot loop variant.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 10.9604,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 10.9604,
+              "ref_eager_time_ms": 3.9004,
+              "score": 0.3559,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.1568,
+              "speedup_over_eager": 0.3559
+            },
+            "reference_latency_ms": 3.9004,
+            "speedup_factor": 0.3559,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "18dd06c38c081d25b8acb83ba6191d1480cdf6c6"
+        }
+      },
+      {
+        "action": {
+          "description": "Express conv as implicit GEMM: each output pixel is a dot product of a (Cin*Kh*Kw=144)-vector with W (32x144). Use tl.dot over tiles of output positions x output channels. Then fuse bias/ReLU/avgpool in a small follow-up kernel or in epilogue.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "tl.dot on XPU may be efficient for small K=144, N=32 if tile of M (spatial positions) is large. However K is small and N is tiny, so dot may be underutilized.",
+          "score_0_to_1": 0.45,
+          "title": "Implicit-GEMM (im2col-in-register) + single tl.dot K=Cin*9"
+        },
+        "choice": "implicit_gemm",
+        "confidence_0_to_1": 0.4,
+        "decision": "consider",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "tl.dot shapes typically require M,N,K multiples of 16/32; N=32 ok, K=144 not multiple of 16 cleanly (need pad to 160).",
+            "notes": "Padding K wastes some compute; small N hurts utilization of systolic.",
+            "rating_0_to_10": 5.0,
+            "risk": "tl.dot performance unknown on Arc XPU; shape constraints"
+          },
+          "memory_bandwidth": {
+            "notes": "Still requires materializing or recomputing im2col patches; if recomputed in registers per tile, fine.",
+            "rating_0_to_10": 7.0,
+            "risk": "If im2col is materialized in memory, huge bandwidth penalty"
+          },
+          "register_pressure": {
+            "notes": "Accumulator tile M x 32 fp32 plus weight tile 144x32 fp16.",
+            "rating_0_to_10": 6.0,
+            "risk": "Weight tile fits; M tile size limited"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_gemm",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: mutually exclusive with n_fused family. With n_fused_opt at 0.95x, implicit-gemm may only marginally win; defer unless n_fused_opt children plateau.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "",
+          "score_0_to_1": 0.95,
+          "title": "Refine fused kernel: load input tile once, single tl.dot with K=Cin*9"
+        },
+        "choice": "single_dot_im2col",
+        "confidence_0_to_1": 0.8,
+        "decision": "implement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "single dot maps to XMX if dtypes are fp16 inputs with fp32 acc",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "weights/input reloaded per tile; weights small enough to be cache-resident",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "M=16*128=2048 rows by K_PAD=256 may stress registers; lowering K_PAD helps",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused_opt",
+        "node_type": "decision",
+        "notes": "Best leaf: 0.95x eager, 4.13ms. Plateau near oneDNN reference. Children should target either (a) autotune tile shapes, (b) fp16 store-side / accumulator tweaks, or (c) actual Cout split impl. Keep as active best.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n_fused",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 4.1344,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 4.1344,
+              "ref_eager_time_ms": 3.9294,
+              "score": 0.9504,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.4146,
+              "speedup_over_eager": 0.9504
+            },
+            "reference_latency_ms": 3.9294,
+            "speedup_factor": 0.9504,
+            "status": "passed"
+          },
+          "parent_solution_id": "18dd06c38c081d25b8acb83ba6191d1480cdf6c6",
+          "solution_id": "8e80fb6d7e399e87622d676dba42c363e1bcc222"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.35,
+          "title": "Tighten K_PAD to round(Cin*9,16) and ensure fp16 inputs to tl.dot for XMX"
+        },
+        "choice": "fp16_dot_tight_kpad",
+        "confidence_0_to_1": 0.5,
+        "decision": "implement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "XMX used but K padding hurts util",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "K masked loads cost BW",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "large M*K tile",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused_opt_xmx",
+        "node_type": "decision",
+        "notes": "CURRENT: does=fused conv3x3+bias+ReLU+avgpool2 via single tl.dot with im2col; fp16 inputs, fp32 accum, K_PAD=256. bottleneck=compute/dot K dimension padding overhead and redundant masked loads. FOLLOW_THROUGH: aligned_with_intent=yes (fp16 dot, K_PAD set to 256 which is round_up(Cin*9,16) for Cin=27ish? Actually Cin var; K is statically 256). UPDATE_BELIEF: eval shows 0.94x vs 0.95x prior \u2014 no improvement, slight regression within noise. The K_PAD=256 is much larger than typical Cin*9 (e.g. Cin=16 -> 144 padded to 256 wastes 43% of K). next bet: shrink K_PAD per actual Cin (autotune K_PAD in {64,128,144,160,256}) OR re-layout weights to remove masking on K, and try larger BLOCK_H to amortize weight loads.",
+        "overall_rating_0_to_10": 4.5,
+        "parent_id": "n_fused_opt",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 4.1599,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 4.1599,
+              "ref_eager_time_ms": 3.9299,
+              "score": 0.9447,
+              "score_name": "speedup_over_eager",
+              "speedup_over_compile": 0.4123,
+              "speedup_over_eager": 0.9447
+            },
+            "reference_latency_ms": 3.9299,
+            "speedup_factor": 0.9447,
+            "status": "passed"
+          },
+          "parent_solution_id": "8e80fb6d7e399e87622d676dba42c363e1bcc222",
+          "solution_id": "44f71616b412e072182403043d5ae785cad31594"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Autotune BLOCK_H/BLOCK_W/num_warps for output tile shape"
+        },
+        "choice": "autotune_block_hw",
+        "confidence_0_to_1": 0.5,
+        "decision": "consider",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused_opt_tiles",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n_fused_opt. Mutually exclusive with n_fused_opt_xmx only as a single-PR change; explores (8,64),(16,32),(8,32) x warps 4/8/16 to fit Arc B70 SIMD/XMX. Cheap to try after K_PAD fix.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n_fused_opt",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "8e80fb6d7e399e87622d676dba42c363e1bcc222",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Fuse 2x2 pool via reshape+sum in fp16 path; skip fp32 cast where safe"
+        },
+        "choice": "reduce_pool_in_regs",
+        "confidence_0_to_1": 0.45,
+        "decision": "consider",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused_opt_fp16store",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n_fused_opt focused on epilogue; mutually exclusive with siblings only as a single edit. Risk: precision drift; gate behind tolerance check.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n_fused_opt",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "8e80fb6d7e399e87622d676dba42c363e1bcc222",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.2,
+          "rationale": "",
+          "score_0_to_1": 0.3,
+          "title": "Tile Cout (e.g., COUT_BLK=16) and loop within kernel to reduce reg pressure, enabling larger M"
+        },
+        "choice": "cout_tiling_loop",
+        "confidence_0_to_1": 0.4,
+        "decision": "consider",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "XMX prefers contiguous K and larger M; Cout loop can enable larger M.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Weight reload per Cout tile adds BW if implemented.",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Cout tiling reduces accumulator regs, allowing larger M.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused_opt_cout_split",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Active code is still the single-dot im2col kernel (no Cout split applied); fused conv3x3+bias+ReLU+avgpool with BLOCK_H=8,BLOCK_W=64,COUT=32,K_PAD=256. bottleneck=compute/latency-bound on tl.dot with K=Cin*9 padded to 256. FOLLOW_THROUGH: aligned_with_intent=no; expected intent was to add COUT_BLK inner loop to lower register pressure and enable larger M tile, actual code unchanged from n_fused_opt. UPDATE_BELIEF: eval matches parent (~0.95x), confirming no change landed; next bet=pursue autotune over (BLOCK_H,BLOCK_W,num_warps) which is lower risk than restructuring the dot, and consider fp16 accumulate in epilogue.",
+        "overall_rating_0_to_10": 4.0,
+        "parent_id": "n_fused_opt",
+        "solution_ref": {
+          "eval": {
+            "score": 0.9468,
+            "score_name": "speedup_over_eager",
+            "status": "passed"
+          },
+          "parent_solution_id": "8e80fb6d7e399e87622d676dba42c363e1bcc222",
+          "solution_id": "da46559fc51c24b29d5c491b5954e95bd378aa54"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.5,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "XMX used but K padding hurts util",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "K masked loads cost BW",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "large M*K tile",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 24,
+        "node_id": "node_conv_block_fp16_r24_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 4.5,
+        "parent_id": "n_fused_opt_xmx",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "44f71616b412e072182403043d5ae785cad31594",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Triton autotune over (BLOCK_H,BLOCK_W,num_warps,num_stages) for fused kernel"
+        },
+        "choice": "autotune_tiles_warps",
+        "confidence_0_to_1": 0.6,
+        "decision": "implement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Finds best XMX-friendly shape.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Larger tiles may spill.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused_opt_autotune",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n_fused_opt; mutually exclusive with cout_split and fp16store as a single PR since they all modify launch/kernel shape. Cheap, high EV: try (8,32)/(8,64)/(16,32)/(16,64) x warps {4,8,16} x stages {2,3}. CURRENT bottleneck likely XMX util at current (8,64,w8,s2).",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n_fused_opt",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "8e80fb6d7e399e87622d676dba42c363e1bcc222",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Sweep num_warps in {4,8,16} and num_stages in {1,2,3} for the single-dot kernel"
+        },
+        "choice": "tune_warps_stages",
+        "confidence_0_to_1": 0.55,
+        "decision": "consider",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_fused_opt_warps_autotune",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n_fused_opt (not a sibling family). Mutually exclusive with n_fused_opt_cout_split only as a single PR; cheapest knob to try first. Risk: low; could swing 5-15%.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n_fused_opt",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "8e80fb6d7e399e87622d676dba42c363e1bcc222",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.4,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "XMX prefers contiguous K and larger M; Cout loop can enable larger M.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Weight reload per Cout tile adds BW if implemented.",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Cout tiling reduces accumulator regs, allowing larger M.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 29,
+        "node_id": "node_conv_block_fp16_r29_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 4.0,
+        "parent_id": "n_fused_opt_cout_split",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "da46559fc51c24b29d5c491b5954e95bd378aa54",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused 3x3 stride-1 padded conv (Cin=16 -> Cout=32) followed by ReLU and AvgPool2d(2) on a fp16 NCHW tensor of shape (1,16,720,1280) producing (1,32,360,640). Dense regular access with small channel counts and large spatial extent makes the workload memory-bound on Intel Arc Pro B70. Key opportunity: fuse conv+bias+ReLU+pool in one Triton kernel to avoid the ~59MB intermediate write and exploit the tiny weight tensor (32x16x3x3) by keeping it in registers/SLM. Constraints: padding handling, fp16 accumulation must be in fp32 for correctness, tl.dot shape/dtype support on XPU is uncertain, and tile sizing must balance halo reloads against register pressure.",
+  "open_questions": [
+    "Does Triton on Intel Arc Pro B70 support tl.dot with fp16 inputs/fp32 accumulator, and what are the minimum M/N/K shape constraints?",
+    "What is the optimal spatial tile size (pooled output tile) to balance halo reload overhead and register pressure given 32 oc accumulators?",
+    "Is NCHW the most efficient layout, or should we transpose to NHWC for vectorized channel-fast loads on XPU?",
+    "How does QConv2D behave when quantize=False \u2014 is it bit-exact with nn.Conv2d in fp16, including bias dtype?",
+    "What absolute/relative tolerance does the harness use for fp16 correctness, and is fp32 accumulation strictly required?",
+    "Does torch.xpu support channels_last memory_format efficiently with f.conv2d as a fallback path?",
+    "Are there alignment requirements (e.g., 32-byte) for global loads on the XPU backend that constrain tile widths?",
+    "What is the launch overhead per Triton kernel on XPU, and does it favor fewer large kernels over multiple small ones?"
+  ]
+}

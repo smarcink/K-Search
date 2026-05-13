@@ -140,6 +140,17 @@ Create an optimized implementation in a class called `ModelNew` that:
 - Triton kernels should use standard Triton primitives — they will be compiled for the Intel XPU backend.
 - Do NOT reference cuDNN, cuBLAS, CUTLASS, or any NVIDIA-specific libraries.
 
+## CRITICAL: No Silent Fallbacks
+- Your `ModelNew.forward()` MUST always execute your custom kernel code path.
+- Do NOT wrap your kernel call in `try/except` that falls back to the reference PyTorch
+  implementation (e.g. `nn.Conv2d`, `nn.Linear`, etc.) when the kernel fails.
+  If your kernel crashes or produces errors, the evaluation MUST see that failure —
+  hiding it behind a fallback means the kernel is never actually tested.
+- Do NOT copy the reference Model's forward() as a "fallback" path that gets used
+  when your kernel has issues. If you need a fallback for unsupported configurations
+  (e.g. integer_forward mode), that is fine, but the PRIMARY code path that is being
+  benchmarked must always run your optimized kernel.
+
 ## Format
 {format_text}
 
@@ -273,14 +284,28 @@ Then implement your optimized version.
             code = re.sub(r"super\(Model,\s*cls\)", "super()", code)
 
         # ------------------------------------------------------------------
+        # Detect silent-fallback antipattern: if the generated code wraps
+        # the kernel call in try/except that falls back to the reference
+        # implementation, the kernel is never actually tested. Warn loudly.
+        # ------------------------------------------------------------------
+        if re.search(
+            r'except\s.*:\s*\n\s*return\s+self\._fallback',
+            code,
+        ):
+            print(f"[{self._name}] WARNING: Generated code contains try/except fallback to reference impl — "
+                  f"kernel errors will be silently hidden. Consider removing the fallback.")
+
+        # ------------------------------------------------------------------
         # XPU Triton workaround: strip tl.constexpr from non-BLOCK params.
         # The Intel XPU Triton backend (triton-xpu 3.7.x) segfaults with
         # certain pointer-count + constexpr-count combinations.  Safe rule:
         # only keep tl.constexpr on params whose names look like compile-time
         # constants (BLOCK*, TILE*, NUM_WARPS, etc.); strip it from runtime
         # shape/stride args (H, W, N, stride_*, etc.).
+        # Disable with: KSEARCH_XPU_NO_WORKAROUND=1
         # ------------------------------------------------------------------
-        if "xpu" in self._cfg.device:
+        _xpu_workaround_disabled = os.environ.get("KSEARCH_XPU_NO_WORKAROUND", "") == "1"
+        if "xpu" in self._cfg.device and not _xpu_workaround_disabled:
             _SAFE_CONSTEXPR_RE = re.compile(
                 r'^(BLOCK|TILE|GROUP|UNROLL|NUM_|DEPTH|STAGES)',
                 re.IGNORECASE,
@@ -323,8 +348,10 @@ Then implement your optimized version.
             # Pre-flight check: syntax + import validation in a subprocess
             # to surface Triton compilation errors before they become SIGSEGV.
             # -----------------------------------------------------------
+            _ref_dir = str(Path(self._ref_path).resolve().parent)
             preflight_code = (
                 "import sys\n"
+                f"sys.path.insert(0, '{_ref_dir}')\n"
                 "try:\n"
                 f"    compile(open('{kernel_src_path}').read(), '{kernel_src_path}', 'exec')\n"
                 "except SyntaxError as e:\n"
@@ -379,10 +406,11 @@ Then implement your optimized version.
 
             env = os.environ.copy()
             src_path = str(repo_root)
+            _ref_dir = str(Path(self._ref_path).resolve().parent)
             if "PYTHONPATH" in env:
-                env["PYTHONPATH"] = f"{src_path}:{env['PYTHONPATH']}"
+                env["PYTHONPATH"] = f"{_ref_dir}:{src_path}:{env['PYTHONPATH']}"
             else:
-                env["PYTHONPATH"] = src_path
+                env["PYTHONPATH"] = f"{_ref_dir}:{src_path}"
 
             print(f"[{self._name}] Running evaluation: {' '.join(cmd)}")
             result = subprocess.run(
@@ -404,6 +432,7 @@ Then implement your optimized version.
                 result.returncode == -11
                 and "xpu" in self._cfg.device
                 and "@triton.jit" in code
+                and not _xpu_workaround_disabled
             ):
                 _xpu_retries = [
                     ("constexpr_pad_7", lambda c: self._xpu_pad_triton_constexpr(c, 7)),
@@ -480,22 +509,40 @@ Then implement your optimized version.
         speedup_compile = self._extract_metric(stdout, "Speedup over torch.compile:", r"([0-9.]+)x")
         kernel_time = self._extract_metric(stdout, "Custom Kernel exec time:", r"([0-9.]+) ms")
         ref_eager_time = self._extract_metric(stdout, "PyTorch Reference Eager exec time:", r"([0-9.]+) ms")
+        compile_time = self._extract_metric(stdout, "torch.compile exec time:", r"([0-9.]+) ms")
+
+        # Use speedup over torch.compile as the primary score when available,
+        # since that's the real baseline to beat (not eager mode).
+        primary_speedup = speedup_compile if speedup_compile and speedup_compile > 0 else speedup_eager
+        primary_score_name = "speedup_over_compile" if (speedup_compile and speedup_compile > 0) else "speedup_over_eager"
 
         if speedup_eager and speedup_eager > 0:
-            self._last_round_trace_logs_for_prompt = f"Speedup: {speedup_eager:.2f}x over eager"
+            # Build informative trace log for LLM prompts
+            trace_parts = [f"Custom kernel: {kernel_time:.4f} ms"]
+            if ref_eager_time:
+                trace_parts.append(f"PyTorch eager: {ref_eager_time:.4f} ms (speedup: {speedup_eager:.2f}x)")
+            if compile_time and speedup_compile:
+                trace_parts.append(f"torch.compile: {compile_time:.4f} ms (speedup: {speedup_compile:.2f}x)")
+                if speedup_compile < 1.0:
+                    trace_parts.append(f"*** Your kernel is SLOWER than torch.compile ({speedup_compile:.2f}x) — you need to beat {compile_time:.4f} ms")
+            self._last_round_trace_logs_for_prompt = "\n".join(trace_parts)
             self._last_round_passed_count = 1
             self._last_round_total_workloads = 1
+
+            log_line = f"Speedup: {speedup_eager:.2f}x over eager"
+            if speedup_compile:
+                log_line += f", {speedup_compile:.2f}x over torch.compile"
 
             er = EvalResult(
                 status="passed",
                 latency_ms=kernel_time,
                 reference_latency_ms=ref_eager_time,
                 mean_vs_baseline_factor=None,
-                speedup_factor=speedup_eager,
-                log_excerpt=f"Speedup: {speedup_eager:.2f}x",
+                speedup_factor=primary_speedup,
+                log_excerpt=log_line,
                 metrics={
-                    "score_name": "speedup_over_eager",
-                    "score": float(speedup_eager),
+                    "score_name": primary_score_name,
+                    "score": float(primary_speedup) if primary_speedup else None,
                     "speedup_over_eager": speedup_eager,
                     "speedup_over_compile": speedup_compile,
                     "kernel_time_ms": kernel_time,
@@ -847,11 +894,20 @@ Then implement your optimized version.
         if passed:
             speedup = er.speedup_factor or 0
             latency = er.latency_ms or 0
-            self._last_round_summary_line = (
-                f"[{self._name}] Round {rn}: status={status} | "
-                f"speedup={speedup:.2f}x | latency={latency:.4f}ms | "
-                f"device={self._cfg.device}"
-            )
+            metrics = er.metrics or {}
+            sp_eager = metrics.get("speedup_over_eager")
+            sp_compile = metrics.get("speedup_over_compile")
+            parts = [
+                f"[{self._name}] Round {rn}: status={status}",
+                f"speedup={speedup:.2f}x",
+                f"latency={latency:.4f}ms",
+            ]
+            if sp_eager:
+                parts.append(f"vs_eager={sp_eager:.2f}x")
+            if sp_compile:
+                parts.append(f"vs_compile={sp_compile:.2f}x")
+            parts.append(f"device={self._cfg.device}")
+            self._last_round_summary_line = " | ".join(parts)
         else:
             self._last_round_summary_line = (
                 f"[{self._name}] Round {rn}: status={status} | "

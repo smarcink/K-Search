@@ -1,0 +1,16 @@
+{
+  "task": "conv_block_fp16",
+  "problem": "conv_block_fp16",
+  "device": "xpu:0",
+  "precision": "fp16",
+  "solutions": [
+    {
+      "solution": "claude-opus-4-7_conv_block_fp16_r16_20260513_091808_26b60ff5",
+      "status": "passed",
+      "speedup_over_eager": 0.9414,
+      "latency_ms": 4.1746,
+      "score_name": "speedup_over_eager",
+      "score": 0.9414
+    }
+  ]
+}

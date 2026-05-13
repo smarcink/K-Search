@@ -34,6 +34,25 @@
             ]
         },
         {
+            "name": "Compare Conv Polling fp16 implementations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/compare_kernels.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv2/bin/python",
+            "justMyCode": true,
+            "args": [
+                "conv_pooling_fp16/conv_block_fp16.py",
+                "conv_pooling_fp16/opus47_1",
+                "--precision", "fp16",
+                "--warmup", "100",
+                "--iters", "1000", 
+                "--atol", "1e-2",
+                "--compile-mode", "default"
+            ]
+        },
+        {
             "name": "Compare Elementwise ADD fp16 implementations",
             "type": "debugpy",
             "request": "launch",
