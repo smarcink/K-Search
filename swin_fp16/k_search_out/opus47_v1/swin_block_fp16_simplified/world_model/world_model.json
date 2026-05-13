@@ -1,0 +1,501 @@
+{
+  "computed_signals": {
+    "round_index": 29,
+    "trace": {
+      "latency_ms": 13.1615,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 17.6717,
+      "speedup_factor": 0.9598,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1_child2",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc Pro B70 (Xe2/Battlemage), supports fp16 well; Triton XPU backend; subgroup size typically 16. tl.dot supports fp16 inputs with fp32 accum.",
+            "notes": "Mixed kernel: LN (reduction), QKV linear (GEMM), attention (small NxN with N=16 -> tiny matmul + softmax), proj linear (GEMM), LN, FC1 (GEMM C->4C), GELU, FC2 (GEMM 4C->C). Window N=16, C=32, hidden=128. Many tokens: 1*720*1280 = 921600 tokens, in windows of 16 -> 57600 windows.",
+            "rating_0_to_10": 6.0,
+            "risk": "Small inner dims (C=32, N=16) mean tl.dot may be inefficient; need to coalesce many windows into a single tile."
+          },
+          "memory_bandwidth": {
+            "notes": "Activations dominate; fusing LN+QKV and LN+MLP+residual reduces global memory traffic substantially. Tensor size 1*720*1280*32*2B = ~56MB per activation.",
+            "rating_0_to_10": 7.0,
+            "risk": "If we don't fuse, we re-read/write huge activation tensors many times."
+          },
+          "register_pressure": {
+            "notes": "C=32, hidden=128 are small; QKV concat is 96. Tiles per window are small enough to hold in registers per-window batch.",
+            "rating_0_to_10": 6.0,
+            "risk": "Need to be careful with FC1->GELU->FC2 fusion: hidden=128 intermediate per row in registers (small)."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: fused transformer block (Swin-W-MSA + MLP). Mix of GEMM-like ops (Linear), reductions (LayerNorm, softmax), and elementwise (GELU, residual). N=16 (window), C=32 (channels), hidden=128. nWindows=57600, B=1. 2) Canonical math: y1=x+Proj(Attn(LN1(x))); y2=y1+FC2(GELU(FC1(LN2(y1)))). Attention: per-window 16x16 softmax((q@kT)/sqrt(C)+rpe)@v. 3) Layout: input (1,720,1280,32) row-major last-dim=C. Window partition reshapes 4x4 blocks of HxW into windows. With Wh=Ww=4 and contiguous C=32, each window's 16 tokens are NOT contiguous (stride along W). We can iterate windows by (b,nh,nw) and gather 16 tokens of 32 floats each = 16*32*2=1024B per window per pass. 4) Regimes: a) memory-bound (whole block end-to-end) -> fuse aggressively; b) small-matmul regime per window -> coalesce many windows per program; c) softmax reduction over N=16 -> trivial in registers. 5) Knobs: tile = group of windows per program; fuse LN+QKV; fuse attention+proj+residual; fuse LN2+FC1+GELU+FC2+residual; numerics: fp32 accum for LN/softmax. 6) Skeleton: Kernel A: LN1+QKV+Attention+Proj+residual writing y1 with window-reverse. Kernel B: LN2+FC1+GELU+FC2+residual to produce y. Possibly split QKV from attention if register pressure too high. 7) Families: F1 fully fused two-kernel design (per-window programs); F2 sub-fused (LN+QKV separate; attention+proj fused; LN2+MLP fused); F3 reuse torch matmul for linears, custom kernel only for attention+softmax+RPE.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "pending"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement one Triton kernel that, per program, processes a tile of M windows. For each window: load 16x32 tokens, compute LN1 (fp32 reduction), compute QKV via small fused matmul (32->96), split into q,k,v (16x32 each), compute attn = softmax(q@k^T * scale + rpe), compute o=attn@v, apply proj (32->32) + bias, add residual, write back in window-reverse layout. Use fp32 accumulation for LN and softmax; tl.dot for matmuls or manual broadcast multiplies given small dims.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "Fusing all attention-side ops avoids 4-5 round-trips through global memory of the 56MB activation tensor.",
+          "score_0_to_1": 0.6,
+          "title": "Fused attention block kernel (LN1+QKV+Attn+Proj+Residual)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "N=16, C=32: tl.dot with BLOCK_M=16, BLOCK_N=16, BLOCK_K=32 fits; can group multiple windows along M for better dot utilization.",
+            "notes": "Tiny 16x32x32 dots underutilize Arc XMX; consider grouping windows per program.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Removed several HxWxC round-trips on attn side, but MLP still streams 56MB tensor multiple times.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Per-window tiles small (16x32); fits but many weight loads.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=single Triton kernel per 4x4 window fusing LN1+QKV+attn+softmax+proj+residual. bottleneck=compute/dot small tiles. UPDATE_BELIEF: passes at 0.96x (slightly slower than reference). Chain with MLP failed due to indexing bug; need to fix child.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 13.1832,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 13.1832,
+              "ref_eager_time_ms": 17.7338,
+              "score": 0.9602,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 0.9602,
+              "speedup_over_eager": 1.3452
+            },
+            "reference_latency_ms": 17.7338,
+            "speedup_factor": 0.9602,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "493427212e52ea1f16aa3d5c345553867f4c629a"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement one Triton kernel that, per program, processes a tile of rows of y1 (B*H*W rows of C=32). Compute LN2 (fp32), FC1 (32->128), GELU (tanh approx matching nn.GELU default), FC2 (128->32), add residual, write y. Weights for FC1/FC2 are reused across rows in a tile; can be cached in registers/SLM.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "MLP path is purely elementwise+small-GEMM; one fused pass instead of LN+matmul+gelu+matmul+add.",
+          "score_0_to_1": 0.2,
+          "title": ""
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Inner dims 32 and 128 small; row-tiling with BLOCK_M=64-256 rows feasible. Weights only 32*128 + 128*32 fp16 = ~16KB total, fit in registers/SLM.",
+            "notes": "tl.dot on XPU with K=32 small; may be unsupported shape causing SIGSEGV",
+            "rating_0_to_10": 4.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "Fuses 5 ops, removes intermediate writes",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_M*H=16*128 fp32 accumulator tile is fine",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: dominated by n1 path (fused attention) which already achieves 1.34x over eager. Deprioritized.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Pre-permute weights and pre-pad/reshape the input so that window-partition becomes a contiguous view (B*nW, 16, C). Then write two simple Triton kernels: (a) fused LN+QKV+Attention+Proj+Residual operating on contiguous (Bw, 16, C); (b) fused LN+FC1+GELU+FC2+Residual on flattened (M, C). Skip torch reshape overhead by exposing strides directly to the kernel.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "Avoid PyTorch permute+reshape materialization between sub-ops; pass strides into kernels and do window indexing inside the kernel.",
+          "score_0_to_1": 0.25,
+          "title": ""
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Index math is cheap; saves a permute+reshape pass.",
+            "notes": "Compute unchanged; just removes layout ops.",
+            "rating_0_to_10": 7.0,
+            "risk": "Index arithmetic complexity could obscure compiler vectorization."
+          },
+          "memory_bandwidth": {
+            "notes": "Eliminates intermediate permuted tensor read/write between attn-output and the residual write.",
+            "rating_0_to_10": 8.0,
+            "risk": "Strided loads/stores along W dimension still strided; coalescing along C is preserved."
+          },
+          "register_pressure": {
+            "notes": "Same as fused kernels.",
+            "rating_0_to_10": 6.0,
+            "risk": "None new."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Direct-stride indexing already used in n1; marginal gain. Deprioritized.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.4,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Fix MLP kernel crash: avoid tl.dot, manual matmul with BLOCK_M=32"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2a",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Child refinement of n2 to fix segfault; not a sibling alternative. Replace tl.dot with explicit reduction (C=32, H=128 small enough): for FC1 use tl.sum over C dim using broadcast; for FC2 sum over H. Use BLOCK_M=32, ensure fp16 loads with explicit .to and contiguous weight transposes precomputed in __init__.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n2",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.4,
+          "rationale": "",
+          "score_0_to_1": 0.2,
+          "title": "Add fused MLP kernel on top of fused attention (chain)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.3,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "two small GEMMs per tile, fp16 dot fits XMX",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "fused MLP reduces traffic but indexing bug caused OOB",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_M=32xHID=128 tile uses sizable regs",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_child1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=adds fused_mlp_kernel (LN2+FC1+GELU+FC2+residual) chained after fused attention; BLOCK_M=32,C=32,HID=128. bottleneck=likely OOB/illegal-access causing SIGSEGV (memory). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: eval crashed with SIGSEGV during correctness; suspect fc2_w stride layout (used C*HID stride with HID=128, but nn.Linear weight is [out=C, in=HID] -> stride should be HID for rows of out, not C), and/or row-major load offsets for fc1_w transposed indexing. Need to fix weight indexing to match contiguous nn.Linear layouts and guard with masks. next bet: re-derive fc1_w/fc2_w offsets carefully (fc1.weight is [HID,C] contig: offset h*C + c; fc2.weight is [C,HID] contig: offset c*HID + h). Also verify x_flat contiguity. PERF_GAP: expected 1.4x but eval failed (segfault), gap is correctness not perf.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "493427212e52ea1f16aa3d5c345553867f4c629a",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Fix MLP kernel: correct fc1 weight transpose + reduce BLOCK_M to 8"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_child1_fix1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Direct debug of the crashed sibling design; mutually exclusive vs split-kernel fallback. Load fc1_w as [C,H] tile (no tl.trans) since nn.Linear stores [out,in]=[H,C] so a transposed-load equivalent is needed; verify both fc1 and fc2 indexings. Drop BLOCK_M to 8 to relieve register pressure on Arc Pro B70.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1_child1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Fallback: split MLP into two kernels (LN2+FC1+GELU) and (FC2+Residual)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_child1_fix2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Mutually exclusive vs fix1 (single fused kernel). Safer for register pressure: each kernel holds only one GEMM tile; still saves LN2 fusion and one residual round-trip vs eager.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1_child1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.35,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Fix fused MLP weight indexing (fc1[HID,C]: h*C+c; fc2[C,HID]: c*HID+h) and re-chain"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_child2",
+        "node_type": "decision",
+        "notes": "CURRENT: does=fused attention kernel (LN1+QKV+Attn+Proj+Residual) per 4x4 window; MLP still runs via PyTorch (norm2+fc1+gelu+fc2+residual). bottleneck=launch+MLP path remains unfused; matmul tiles (16x32) are tiny so compute is sync/launch dominated. FOLLOW_THROUGH: aligned_with_intent=no; expected: implement fused MLP kernel with corrected weight indexing chained after attention; actual: current_code still calls self._mlp via torch, no fused_mlp_kernel present. UPDATE_BELIEF: eval shows 0.96x (same as parent n1), confirming MLP fusion was not actually applied. next bet: implement fused_mlp_kernel (LN2+FC1[32->128]+GELU+FC2[128->32]+residual) with correct indexing fc1_w[h*C+c], fc2_w[c*HID+h], BLOCK_M=16 to match attention window tile and avoid extra kernel launches. PERF_GAP: expected 1.35x vs observed 0.96x \u2014 root cause: code not updated to include MLP fusion.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 13.1615,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 13.1615,
+              "ref_eager_time_ms": 17.6717,
+              "score": 0.9598,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 0.9598,
+              "speedup_over_eager": 1.3427
+            },
+            "reference_latency_ms": 17.6717,
+            "speedup_factor": 0.9598,
+            "status": "passed"
+          },
+          "parent_solution_id": "493427212e52ea1f16aa3d5c345553867f4c629a",
+          "solution_id": "cd6000b79b74c15c1552fc13292c2dc91fce25a9"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Actually implement fused_mlp_kernel (LN2+FC1+GELU+FC2+Residual) chained after attention with correct indexing"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_child2_a",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n1_child2 \u2014 actually writes the fused MLP kernel which was missing. does: per-window (16 tokens) load x, compute LN2, matmul fc1 (32->128) with fc1_w indexed as h*C+c, GELU, matmul fc2 (128->32) with fc2_w indexed as c*HID+h, add residual, store. bottleneck target: reduce kernel launches (1 instead of 4) and intermediate HBM writes. next: tune BLOCK_M=16, HID=128 tiled fully in regs.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1_child2",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "cd6000b79b74c15c1552fc13292c2dc91fce25a9",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin block at fp16 on a (1,720,1280,32) input with single-head W-MSA over 4x4 windows (N=16, C=32) followed by an MLP with hidden=128. The block is composed of two LayerNorms, three Linears (QKV 32->96, Proj 32->32, FC1 32->128, FC2 128->32), an attention with relative position bias, softmax, GELU, and two residual adds. Activation tensor is ~56MB so the workload is heavily memory-bandwidth bound; the natural plan is to write two fused Triton kernels \u2014 one for LN1+QKV+Attention+Proj+Residual (per-window) and one for LN2+FC1+GELU+FC2+Residual (per-row) \u2014 using fp32 accumulation for LN/softmax. Small inner dims (16/32/128) and small weight matrices favor weight caching in registers/SLM and grouping multiple windows/rows per program. Target: beat torch.compile by reducing global memory round-trips and fusing reshape/permute layout ops.",
+  "open_questions": [
+    "Does Triton's XPU backend support tl.dot efficiently at these small K=32 dims, or is manual broadcast-multiply-reduce faster?",
+    "What is the exact GELU formulation used by nn.GELU here (exact erf vs tanh approx) at fp16 \u2014 required for tolerance?",
+    "How costly are strided loads when gathering 4x4 windows from the (H,W,C) tensor on Arc Pro B70's memory hierarchy?",
+    "Are LayerNorm weight/bias and Linear bias all fp16 in this configuration, and is fp32 accumulation needed to match reference numerics?",
+    "What's the best windows-per-program (M tile) to balance occupancy vs register pressure on Xe2 subgroup size 16?",
+    "Can we keep FC1/FC2 weights (32x128 + 128x32 fp16, ~16KB) resident in registers across an entire program tile?",
+    "Does torch.compile already fuse the MLP path effectively on XPU, so the speedup must come primarily from attention fusion?",
+    "Is rpe_bias broadcast across all windows correctly and small enough (1x1x16x16) to load once per program?"
+  ]
+}

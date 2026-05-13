@@ -1,0 +1,17 @@
+{
+  "task": "swin_block_fp16_simplified",
+  "problem": "swin_block_fp16_simplified",
+  "device": "xpu:0",
+  "precision": "fp16",
+  "solutions": [
+    {
+      "solution": "claude-opus-4-7_swin_block_fp16_simplified_r6_20260513_104646_40ee85af",
+      "status": "passed",
+      "speedup_over_eager": 1.3419,
+      "speedup_over_compile": 0.9492,
+      "latency_ms": 13.2139,
+      "score_name": "speedup_over_compile",
+      "score": 0.9492
+    }
+  ]
+}
