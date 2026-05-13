@@ -243,9 +243,9 @@ def main():
     parser.add_argument("--local", required=False, default=None, help="Path to flashinfer-trace dataset root (flashinfer only)")
     parser.add_argument(
         "--task-source",
-        choices=["flashinfer", "gpumode", "kernelbench", "cuda_kernel", "xpu_bench"],
+        choices=["flashinfer", "gpumode", "kernelbench", "cuda_kernel", "device_bench", "xpu_bench", "cuda_bench"],
         default="flashinfer",
-        help="Task backend to use.",
+        help="Task backend to use. 'xpu_bench' and 'cuda_bench' are aliases for 'device_bench'.",
     )
     parser.add_argument(
         "--task-path",
@@ -345,16 +345,26 @@ def main():
         help="dtype for KernelBench eval (model+inputs are cast to this; allclose tolerance is 1e-4 for fp32, 1e-2 for fp16/bf16)",
     )
 
-    # XPU Bench options
-    parser.add_argument("--xpu-bench-device", default="xpu:0", help="XPU device string (e.g. xpu:0, xpu:1)")
+    # Device Bench options (unified for CUDA / XPU / any accelerator)
+    parser.add_argument("--device-bench-device", default=None,
+                        help="Device string (e.g. cuda:0, xpu:0). Auto-detected from task-source alias if omitted.")
     parser.add_argument(
-        "--xpu-bench-precision",
+        "--device-bench-precision",
         default="fp16",
         choices=["fp32", "fp16", "bf16"],
-        help="dtype for XPU Bench eval",
+        help="dtype for Device Bench eval",
     )
-    parser.add_argument("--xpu-bench-num-correct-trials", type=int, default=5, help="Number of correctness trials for XPU Bench")
-    parser.add_argument("--xpu-bench-num-perf-trials", type=int, default=100, help="Number of performance trials for XPU Bench")
+    parser.add_argument("--device-bench-num-correct-trials", type=int, default=5, help="Number of correctness trials")
+    parser.add_argument("--device-bench-num-perf-trials", type=int, default=100, help="Number of performance trials")
+    # Legacy aliases (mapped to --device-bench-* internally)
+    parser.add_argument("--xpu-bench-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--xpu-bench-precision", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--xpu-bench-num-correct-trials", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--xpu-bench-num-perf-trials", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--cuda-bench-device", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--cuda-bench-precision", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--cuda-bench-num-correct-trials", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--cuda-bench-num-perf-trials", type=int, default=None, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -429,17 +439,30 @@ def main():
             atol=args.atol,
             artifacts_dir=args.artifacts_dir,
         )
-    elif task_source == "xpu_bench":
-        from k_search.tasks.xpu_bench_task import XpuBenchTask
+    elif task_source in ("device_bench", "xpu_bench", "cuda_bench"):
+        from k_search.tasks.device_bench_task import DeviceBenchTask
 
         if not task_path:
-            raise ValueError("--task-path is required for --task-source=xpu_bench (path to reference .py file with Model class)")
-        task = XpuBenchTask(
+            raise ValueError(f"--task-path is required for --task-source={task_source} (path to reference .py file with Model class)")
+
+        # Resolve device: explicit --device-bench-device > legacy --xpu/cuda-bench-device > alias default
+        _alias_defaults = {"xpu_bench": "xpu:0", "cuda_bench": "cuda:0", "device_bench": "cuda:0"}
+        _device = (
+            args.device_bench_device
+            or args.xpu_bench_device
+            or args.cuda_bench_device
+            or _alias_defaults[task_source]
+        )
+        _precision = args.device_bench_precision or args.xpu_bench_precision or args.cuda_bench_precision or "fp16"
+        _correct = args.device_bench_num_correct_trials or args.xpu_bench_num_correct_trials or args.cuda_bench_num_correct_trials or 5
+        _perf = args.device_bench_num_perf_trials or args.xpu_bench_num_perf_trials or args.cuda_bench_num_perf_trials or 100
+
+        task = DeviceBenchTask(
             ref_path=task_path,
-            device=args.xpu_bench_device,
-            precision=args.xpu_bench_precision,
-            num_correct_trials=args.xpu_bench_num_correct_trials,
-            num_perf_trials=args.xpu_bench_num_perf_trials,
+            device=_device,
+            precision=_precision,
+            num_correct_trials=_correct,
+            num_perf_trials=_perf,
             artifacts_dir=args.artifacts_dir,
         )
     else:
