@@ -163,24 +163,29 @@ print("OK")
 # Test cases
 # ---------------------------------------------------------------------------
 
-SECTION_1 = "SECTION 1: Simple body (1D load/store) — non-monotonic arg-count pattern"
+SECTION_1 = "SECTION 1: Simple body — crashes when n_ptrs∈{7,8} AND n_reg+n_cex=3"
 SECTION_1_TESTS = [
-    # (n_ptrs, n_reg, n_cex, expected_note)
-    (4, 0, 3, "OK — baseline: 4 ptrs + 3 constexpr"),
-    (7, 0, 3, "CRASH — 3 more ptrs triggers crash"),
-    (8, 0, 3, "CRASH — still crashes"),
-    (8, 2, 3, "OK — adding 2 regular args fixes it!"),
-    (4, 0, 0, "OK — no constexpr at all"),
+    # Exhaustive crash map from sweep (n_ptrs 1-12, n_reg 0-4, n_cex 0-6):
+    # ALL 8 crashes occur at total_args=10 or 11, with exactly 3 non-pointer args.
+    (7, 0, 3, "CRASH"),
+    (7, 1, 2, "CRASH"),
+    (7, 2, 1, "CRASH"),
+    (7, 3, 0, "CRASH"),
+    (8, 0, 3, "CRASH"),
+    (8, 1, 2, "CRASH"),
+    (8, 2, 1, "CRASH"),
+    (8, 3, 0, "CRASH"),
 ]
 
-SECTION_2 = "SECTION 2: Complex body (fused LN+MLP with 2x tl.dot + tl.erf)"
+SECTION_2 = "SECTION 2: Complex body (fused LN+MLP with 2x tl.dot + tl.erf) — crash zone shifts"
 SECTION_2_TESTS = [
-    # (n_ptrs, n_reg, n_cex, expected_note)
-    (8, 2, 3, "may CRASH — body complexity shifts the crash zone"),
-    (8, 2, 0, "OK — removing constexpr avoids crash"),
-    (8, 0, 0, "OK — minimal signature"),
-    (10, 2, 3, "OK — 2 extra dummy ptrs as workaround"),
-    (8, 2, 8, "OK — 5 extra dummy constexpr as workaround"),
+    # Exhaustive crash map from sweep (n_ptrs 8-12, n_reg 0-3, n_cex 0-5):
+    # Body complexity moves/adds crash zones compared to simple body.
+    (8, 0, 3, "CRASH — also crashes with simple body"),
+    (8, 1, 2, "CRASH — also crashes with simple body"),
+    (8, 1, 3, "CRASH — NEW: passes with simple body!"),
+    (9, 2, 3, "CRASH — NEW: 9 ptrs never crashed with simple body"),
+    (9, 2, 4, "CRASH — NEW: complex body unlocks new crash zones"),
 ]
 
 
@@ -237,12 +242,8 @@ if __name__ == "__main__":
         print(f"  [{status:>8s}]  {label:45s}  ({note})")
     print()
 
-    print("KEY OBSERVATIONS:")
-    print("  1. The crash depends on (n_pointer_args, n_constexpr_args, body_complexity)")
-    print("  2. Pattern is NON-MONOTONIC: adding ptrs can CAUSE a crash (4→7) or FIX one (8→10)")
-    print("  3. Same arg signature can behave differently with simple vs complex body")
-    print("  4. num_warps / num_stages changes do NOT help")
-    print("  5. Workarounds: pad constexpr count, pad pointer count, or strip constexpr")
-    print()
-    print("NOTE: This bug is non-deterministic across Triton cache states and driver versions.")
-    print("      If all cases PASS, clear ~/.triton/cache and re-run.")
+    print("KEY OBSERVATIONS (from exhaustive sweep):")
+    print("  Simple body: crashes IFF n_ptrs ∈ {7,8} AND n_reg + n_cex == 3")
+    print("  Complex body: crash zone SHIFTS — new crashes at (8,1,3), (9,2,3), (9,2,4)")
+    print("  Pattern is NON-MONOTONIC and depends on (n_ptrs, n_reg, n_cex, body_complexity)")
+    print("  Workarounds: pad args to escape crash zone, or split complex kernels")
