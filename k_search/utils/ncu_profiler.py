@@ -7,7 +7,9 @@ Gracefully returns None if ncu is unavailable or profiling fails.
 from __future__ import annotations
 
 import csv
+import glob
 import io
+import os
 import shutil
 import subprocess
 import sys
@@ -19,7 +21,21 @@ from typing import Any, Optional
 # Availability check
 # ---------------------------------------------------------------------------
 
-NCU_PATH: Optional[str] = shutil.which("ncu")
+def _find_ncu() -> Optional[str]:
+    """Find the best available ncu binary, preferring newer versions."""
+    # Check common install paths for newer ncu versions first
+    ncu_search_paths = sorted(
+        glob.glob("/opt/nvidia/nsight-compute/*/ncu"),
+        reverse=True,  # newest version first
+    )
+    for path in ncu_search_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    # Fall back to PATH
+    return shutil.which("ncu")
+
+
+NCU_PATH: Optional[str] = _find_ncu()
 NCU_AVAILABLE: bool = NCU_PATH is not None
 
 
@@ -101,6 +117,7 @@ def run_ncu_profile(
     *,
     timeout: int = 120,
     kernel_name_filter: str | None = None,
+    verbose: bool = False,
 ) -> NcuMetrics | None:
     """Run ncu on the given command and parse metrics.
 
@@ -108,11 +125,14 @@ def run_ncu_profile(
         cmd: Command to profile (e.g. [sys.executable, "eval_script.py", ...])
         timeout: Max seconds for profiling to complete
         kernel_name_filter: If set, only profile kernels matching this substring
+        verbose: If True, print diagnostic info on failure
 
     Returns:
         NcuMetrics on success, None on any failure (ncu not found, timeout, parse error)
     """
     if not NCU_AVAILABLE:
+        if verbose:
+            print("[ncu] SKIPPED: ncu binary not found on PATH")
         return None
 
     ncu_cmd = [
@@ -129,6 +149,9 @@ def run_ncu_profile(
     ncu_cmd.append("--")
     ncu_cmd.extend(cmd)
 
+    if verbose:
+        print(f"[ncu] Running: {' '.join(ncu_cmd)}")
+
     try:
         result = subprocess.run(
             ncu_cmd,
@@ -137,12 +160,24 @@ def run_ncu_profile(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        if verbose:
+            print(f"[ncu] FAILED: timed out after {timeout}s")
         return None
-    except Exception:
+    except Exception as e:
+        if verbose:
+            print(f"[ncu] FAILED: exception: {e}")
         return None
 
+    if verbose:
+        print(f"[ncu] Return code: {result.returncode}")
+        if result.stderr.strip():
+            print(f"[ncu] stderr (last 2000 chars):\n{result.stderr[-2000:]}")
+        if not result.stdout.strip():
+            print(f"[ncu] stdout: (empty)")
+        else:
+            print(f"[ncu] stdout length: {len(result.stdout)} chars")
+
     if result.returncode != 0:
-        # ncu failed — don't block the pipeline
         return None
 
     csv_output = result.stdout

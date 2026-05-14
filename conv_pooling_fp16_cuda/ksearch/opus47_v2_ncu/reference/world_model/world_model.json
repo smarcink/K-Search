@@ -1,0 +1,213 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "root",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): high BW HBM/GDDR7, large L2, fp16 tensor cores, lots of SMs. Output spatial 360x640=230400 per channel, 32 out ch, batch=1.",
+            "notes": "Conv3x3 with Cin=16, Cout=32, K=3 -> 16*3*3=144 MACs per output pixel. Weights total = 32*16*9 = 4608 fp16 = 9KB, easily fits in shared/constant memory.",
+            "rating_0_to_10": 7.0,
+            "risk": "Low arithmetic intensity, mostly memory-bound; ReLU+AvgPool fuse trivially."
+          },
+          "memory_bandwidth": {
+            "notes": "Input 1*16*720*1280*2B = ~29MB; output after pool 1*32*360*640*2B = ~14.7MB. Conv intermediate (before pool) would be 1*32*720*1280*2B = ~59MB if materialized.",
+            "rating_0_to_10": 8.0,
+            "risk": "Materializing intermediates kills BW; must fuse Conv+ReLU+AvgPool into one kernel."
+          },
+          "register_pressure": {
+            "notes": "Weights small (9KB) fit in shared. Per-thread accumulators for 2x2 pool block * Cout tile manageable.",
+            "rating_0_to_10": 6.0,
+            "risk": "If tiling Cout fully per thread, regs may spill; tile Cout in chunks."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: fused stencil (3x3 conv) + elementwise (ReLU) + reduction (2x2 avg pool). Dense, contiguous NCHW fp16. 2) Math: out[n,co,oh,ow] = avg_{2x2}( relu( sum_{ci,kh,kw} in[n,ci,2oh+kh-?,2ow+kw-?] * W[co,ci,kh,kw] + b[co] ) ). Conv stride1 pad1 then 2x2 avgpool stride2 => each output pixel needs a 4x4 input neighborhood per Cin channel (2x2 conv windows that share rows/cols). 3) Layout: NCHW fp16 contiguous. Input [1,16,720,1280]; weights [32,16,3,3] tiny -> shared/constant; output [1,32,360,640]. Heavy reuse across 2x2 pool window and across Cout. 4) Regimes: (a) memory-bound full image (current) \u2014 BW limited, fusion critical; (b) weight-reuse limited if Cout tile small \u2014 recompute conv 4x; (c) register-spill regime if tile too large. 5) Knobs: output tile (OHxOW per block), Cout tile per thread/block, shared-mem caching of input halo, vectorized fp16x2 loads, tensor-core MMA for 16->32 reduction, async copies. 6) Skeleton: one kernel; each block computes a tile of pooled outputs for a Cout-tile; loads input halo (tile*2+2 in each dim) into shared once across all Cout; loops Cin inside, accumulates conv into per-thread 2x2 buffer, ReLU then averages, writes pooled output. 7) Families: (A) Fully-fused shared-memory conv+pool with Cin-loop in registers (TOP \u2014 full working set fits: weights 9KB + halo tile ~few KB); (B) Tensor-core MMA fused (im2col-on-the-fly within shared); (C) Two-pass (conv->relu fused, then pool) \u2014 rejected as wastes BW.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single fused CUDA kernel: each block produces a tile of pooled outputs (e.g., 16x32 pooled pixels = 32x64 conv pixels) for ALL 32 output channels. Load input halo (34x66 per Cin) into shared memory, iterate Cin=16, compute 2x2 conv outputs per thread, apply ReLU, average into 1 pooled output. Weights in constant or shared memory. Use fp16 arithmetic with fp32 accumulators.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "Eliminates intermediate writes; weights are tiny so full Cout fusion is trivial; halo reuse across 2x2 pool reduces redundant input reads by ~4x vs naive.",
+          "score_0_to_1": 0.8,
+          "title": "Fully-fused Conv+ReLU+AvgPool single kernel with shared-mem halo"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 abundant SMs; 230400 pooled pixels / tile_size blocks. Cout=32 maps to warp-friendly sizes.",
+            "notes": "Good occupancy; can use FMA on fp16x2.",
+            "rating_0_to_10": 8.0,
+            "risk": "Register pressure if all 32 Cout accums per thread; may need Cout sub-tiling."
+          },
+          "memory_bandwidth": {
+            "notes": "Input read once per tile (with halo reuse), weights cached, output written once at pooled resolution.",
+            "rating_0_to_10": 9.0,
+            "risk": "Halo overlap between blocks adds ~10-20% extra reads."
+          },
+          "register_pressure": {
+            "notes": "Per thread: 2x2 conv outputs \u00d7 Cout tile. If Cout tile=8, 32 fp32 regs for accums \u2014 fine.",
+            "rating_0_to_10": 6.0,
+            "risk": "Need to tile Cout (e.g., 8 or 16 per thread group)."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_full_fusion",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is the foundational fused kernel. Siblings explore alternative parallelization/compute strategies that cannot coexist with this exact mapping.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Variant of full fusion using __half2 vectorized loads/stores and HFMA2 for the Cin reduction. Pair Cin channels two-at-a-time; load input as half2 along channel dim (after a small layout shuffle or via two pointers). Weights packed as half2 per (ci,ci+1) pair. Accumulate in float for stability.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 2.5,
+          "rationale": "Doubles effective compute throughput on fp16 ALU path; halves shared-memory bank pressure for weights.",
+          "score_0_to_1": 0.65,
+          "title": "Vectorized half2 fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "HFMA2 throughput high on Blackwell; pairs along Cin natural since Cin=16 even.",
+            "notes": "Better ALU utilization but kernel mostly BW-bound so gain may be modest.",
+            "rating_0_to_10": 7.0,
+            "risk": "Compute may not be the bottleneck."
+          },
+          "memory_bandwidth": {
+            "notes": "Same global traffic as n1; possibly better shared throughput.",
+            "rating_0_to_10": 8.0,
+            "risk": "Layout shuffle could add overhead."
+          },
+          "register_pressure": {
+            "notes": "Similar to n1.",
+            "rating_0_to_10": 6.0,
+            "risk": "Same as n1."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2_half2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Different from n1 because it changes the inner-loop datatype/packing strategy; cannot trivially combine without redesigning the Cin loop.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use tensor-core WMMA/MMA to perform the Cin reduction. Treat each output spatial tile as M dim, Cout=32 as N, Cin*Kh*Kw=144 as K. Build an implicit-GEMM where shared-memory holds an im2col-ish patch tile (computed on the fly from halo) and weights tile; fuse ReLU+AvgPool in epilogue.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 2.2,
+          "rationale": "Tensor cores provide highest fp16 throughput; Cout=32 fits one warp's MMA-N dimension nicely. Epilogue fusion preserves BW savings.",
+          "score_0_to_1": 0.5,
+          "title": "WMMA implicit-GEMM fused conv+relu+pool"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "WMMA m16n16k16 fp16; K=144 not multiple of 16 -> pad. Cin=16 aligns well.",
+            "notes": "High peak FLOPs but small problem may not saturate tensor cores; setup overhead non-trivial.",
+            "rating_0_to_10": 7.0,
+            "risk": "Implementation complexity high; problem may be BW-bound making compute speedup moot."
+          },
+          "memory_bandwidth": {
+            "notes": "Same as fused approach if epilogue done correctly.",
+            "rating_0_to_10": 8.0,
+            "risk": "im2col staging may inflate shared memory."
+          },
+          "register_pressure": {
+            "notes": "WMMA fragments use registers heavily.",
+            "rating_0_to_10": 5.0,
+            "risk": "Occupancy drop."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3_wmma",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Different compute path (tensor cores vs CUDA cores). Cannot be combined with n1/n2 inner-loop structure.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused Conv2d(3x3, pad=1) -> ReLU -> AvgPool2d(2x2) on fp16 NCHW input [1,16,720,1280] producing [1,32,360,640]. Weights are tiny (32x16x3x3 = 9KB) so they fully fit in shared/constant memory. The kernel is dominated by global memory bandwidth for the input (~29MB) and pooled output (~14.7MB); the conv intermediate (~59MB) must NOT be materialized. Full fusion is mandatory and feasible: each thread block computes a tile of pooled outputs for all 32 output channels, loads an input halo into shared memory once, iterates over Cin=16, applies ReLU, and writes the 2x2-averaged result. Key constraints: fp16 precision (tol 0.01), NCHW contiguous, batch=1, kernel must match reference outputs.",
+  "open_questions": [
+    "Optimal output-tile size (pooled pixels per block) balancing shared-memory halo size, occupancy, and reuse?",
+    "Should weights live in __constant__ memory (9KB fits) or shared memory loaded once per block?",
+    "Is fp32 accumulation required to stay within rtol/atol=0.01, or does fp16 accumulation suffice given small Cin=16?",
+    "Best Cout sub-tiling (8 vs 16 vs 32 per thread) to avoid register spill while maximizing weight reuse?",
+    "Can WMMA tensor cores beat CUDA-core HFMA2 given this is likely memory-bound, or is the setup cost prohibitive?",
+    "Are async copies (cp.async) on Blackwell worth using to overlap halo loads with compute for this small kernel?",
+    "Does the input need any layout transform (e.g., channels-last or half2-packed along C) to maximize coalesced loads?",
+    "How much does halo overlap between adjacent blocks inflate total input reads, and can we mitigate via larger tiles?"
+  ]
+}
