@@ -1,0 +1,41 @@
+{
+  "claude-opus-4-7_reference_cuda_optimized_r15_20260514_122225_74f490cc": {
+    "status": "passed",
+    "latency_ms": 0.4984639883041382,
+    "reference_latency_ms": 4.852575778961182,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 9.735057883460136,
+    "log_excerpt": "PASSED: latency=0.498ms ref=4.853ms speedup=9.74x",
+    "metrics": {},
+    "profiler_metrics": {
+      "kernels": [
+        {
+          "sm_occupancy_pct": 47.67,
+          "compute_throughput_pct": 78.01,
+          "memory_throughput_pct": 6.9,
+          "l1_hit_rate_pct": 16.2,
+          "l2_hit_rate_pct": 93.24,
+          "achieved_bandwidth_gb_s": 39.68,
+          "tensor_core_utilization_pct": 0.0,
+          "registers_per_thread": 80,
+          "shared_mem_per_block_bytes": 2448,
+          "top_stall_reasons": [
+            [
+              "not_selected",
+              2.03
+            ],
+            [
+              "math_pipe_throttle",
+              1.66
+            ],
+            [
+              "long_scoreboard",
+              1.47
+            ]
+          ],
+          "kernel_name": "fused_conv_relu_pool_kernel(const __half *, __half *, int, int, int, int, int, int)"
+        }
+      ]
+    }
+  }
+}

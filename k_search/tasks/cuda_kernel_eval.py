@@ -186,41 +186,31 @@ def measure_ref_latency(model, get_inputs_fn, dtype, num_trials: int) -> float:
 def _try_pass_params(module, model):
     """Try to pass reference model weights to the compiled kernel module.
 
-    Strategies:
-    1. If module has set_params(), find the first Conv2d in the model and pass its weight/bias.
+    Strategies (tried in order):
+    1. If module has set_params(), pass ALL model.parameters() in declaration order.
     2. Store model on __main__ so try_autoload_from_python() in C++ code can find it.
     """
     import __main__ as _main_mod
 
     # Strategy 2: Make model discoverable by try_autoload_from_python()
     _main_mod.model_instance = model
-    # Also try common attribute names the C++ code might scan for
     if not hasattr(_main_mod, "model"):
         _main_mod.model = model
 
-    # Strategy 1: Explicitly call set_params if available
+    # Strategy 1: Pass all model parameters in declaration order
     if hasattr(module, "set_params"):
-        # Find first Conv2d layer in reference model
-        for m in model.modules():
-            if hasattr(m, "weight") and hasattr(m.weight, "dim") and m.weight.dim() == 4:
-                w = m.weight.data
-                b = m.bias.data if m.bias is not None else torch.empty(0)
-                try:
-                    module.set_params(w, b)
-                except Exception:
-                    pass
+        params = [p.data for p in model.parameters()]
+        if params:
+            try:
+                module.set_params(*params)
                 return
-        # Fallback: try named parameters with 'weight' in the name
-        for name, param in model.named_parameters():
-            if "weight" in name and param.dim() == 4:
-                # Look for matching bias
-                bias_name = name.replace("weight", "bias")
-                bias = dict(model.named_parameters()).get(bias_name, torch.empty(0))
-                try:
-                    module.set_params(param.data, bias.data if hasattr(bias, "data") else bias)
-                except Exception:
-                    pass
-                return
+            except TypeError:
+                # Arity mismatch — maybe kernel expects named/grouped params differently.
+                # Fall through to let try_autoload_from_python handle it.
+                pass
+            except Exception as e:
+                print(f"[cuda_kernel_eval] set_params failed: {e}", file=sys.stderr)
+                pass
 
 
 def _run_profile_only(args):

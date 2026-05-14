@@ -1,0 +1,344 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n2",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): high SM count, large register file/SMEM, fp16 tensor cores (wmma/mma). Input dims: B=1,H=720,W=1280,C=32, window=4x4, N=16, heads=1, mlp_ratio=4 -> hidden=128.",
+            "notes": "Per-window working set is tiny: 16 tokens x 32 channels = 512 fp16 = 1KB activations; weights qkv (32x96), proj (32x32), fc1 (32x128), fc2 (128x32) total ~22KB fp16. Fits easily in shared memory per block; full fusion is feasible.",
+            "rating_0_to_10": 7.0,
+            "risk": "Tensor-core utilization low at N=16,C=32; mma 16x16x16 fits but limited speedup over CUDA cores at this size."
+          },
+          "memory_bandwidth": {
+            "notes": "Input/output 1*720*1280*32*2B = ~59MB read + 59MB write. Likely memory-bandwidth bound if fully fused; weights are reused across 720*1280/16 = 57600 windows.",
+            "rating_0_to_10": 8.0,
+            "risk": "Bandwidth ceiling on RTX5090 ~1.7 TB/s; want to minimize global memory traffic to ~2x input size."
+          },
+          "register_pressure": {
+            "notes": "Per-window state: 16 tokens of 32 ch (residual) + qkv intermediates + attn matrix 16x16 + mlp hidden 16x128. Hidden 16x128 fp16 = 4KB per window \u2014 fits in SMEM.",
+            "rating_0_to_10": 6.0,
+            "risk": "Holding full mlp hidden in regs would blow occupancy; use SMEM for hidden tile."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS: (1) Classification: Fused transformer block (LN+QKV+attn+softmax+proj+residual+LN+MLP+residual) with small window attention. Mixed GEMM + reductions + elementwise. (2) Canonical: per 4x4 window of 32-ch, compute LN, qkv linear (32->96), attn QK^T (16x16) + RPE bias + softmax, AV, proj (32->32), add residual, LN, fc1 (32->128), GELU, fc2 (128->32), add residual. Each window independent. (3) Layout: input (1,720,1280,32) contiguous, can be viewed as (180,320,4,4,32) for windows. Weights small enough to be broadcast/cached. (4) Regimes: small batch (current B=1, 57600 windows) -> memory BW bound; many SMs available; weight reuse high. (5) Knobs: one-block-per-window vs multiple windows per block; SMEM vs register staging of activations/weights; use mma.m16n16k16 for QKV/proj/FC; fp32 accumulation for stability of LN/softmax; vectorize loads as half8/uint4. (6) Skeleton: load 16x32 tile + weights (preloaded into constant SMEM via set_params), compute LN (warp reduce), qkv matmul, attn (small 16x16), softmax (row reduce), AV, proj, add residual stored in regs/SMEM, LN2, fc1->GELU->fc2, add residual, store. (7) Families: A) Full single-kernel fusion per window (TOP, fits comfortably); B) Two-kernel split attn vs mlp (worse, extra global RT of ~59MB); C) cuBLAS-based multi-kernel baseline (simplest, slower). Weights bound via set_params and cached in __constant__ or persistent SMEM.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "init"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused CUDA kernel where each thread block processes one or a few 4x4 windows entirely: load 16x32 input tile into SMEM, perform LN1 with warp reductions in fp32, QKV linear (32->96) using thread-parallel MAC over channels, compute 16x16 attention scores + RPE bias + row-softmax, multiply by V, apply proj (32->32), add first residual, LN2, fc1 (32->128) + GELU, fc2 (128->32), add second residual, write back. Weights stored in __constant__ memory or persistent SMEM populated via set_params(). Use fp16 storage, fp32 accumulation. Vectorize global loads/stores as half2/uint4.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 3.0,
+          "rationale": "All operations fit in SMEM/regs per window; eliminates ~5 intermediate global-memory round-trips of the reference. Memory traffic reduces to roughly input+output. Weights reused 57600 times so caching is essentially free.",
+          "score_0_to_1": 0.2,
+          "title": "Full single-kernel fusion (one window per block)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.25,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Use 1 warp (32 threads) per window: 32 threads x 16 tokens parallelism easily covers C=32 and hidden=128 work. Could pack 2-4 windows per block to amortize launch overhead and improve occupancy.",
+            "notes": "Scalar fp32 MACs per thread; no tensor cores; underutilizes RTX5090",
+            "rating_0_to_10": 4.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "All weights in constant, activations in SMEM",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Large unrolled loops + per-thread row[16] may spill",
+            "rating_0_to_10": 4.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single fused kernel; one warp (16 threads) per window, all stages in SMEM with __syncwarp. bottleneck=compute/latency (serial fp32 MACs per thread; QKV/FC1/FC2 dominate).\nFOLLOW_THROUGH: aligned_with_intent=yes; implements full fusion as intended.\nUPDATE_BELIEF: Correctness failed with max_diff=3.01 \u2014 likely __syncwarp insufficient across the 2D block (threadIdx.y groups are independent warps only if x-dim=32; here block=(16,WPB) so 4 windows share warps of 32 threads \u2192 __syncwarp synchronizes ACROSS windows partially and tokens within a window are split across two warps when WPB=2+). Specifically with block dim (16,4)=64 threads, lanes for win0 tokens 0-15 + win1 tokens 0-15 share warp0; __syncwarp is fine intra-warp but s_attn/s_v reads across tokens of same window need full coverage. The bug is mixing two windows in one warp: token reductions read other window's data via shared indexing but indices use win_in_block so that's fine \u2014 however __syncwarp masks all 32 lanes which is OK. More likely: register array `row[N_TOK]` plus heavy unrolled loops cause register spills, but that wouldn't cause wrong values. The real issue: WPB=4 with block(16,4)=64 threads \u2192 2 warps; __syncwarp only syncs within a warp, but each warp contains 2 windows (lanes 0-15 win0, lanes 16-31 win1). Token i of win0 reads s_attn[0][i][*] written by same lane \u2014 OK. But the LN/QKV writes to s_x[win][tok][c] and the next stage reads s_q/s_k cross-token within same window \u2014 tokens 0..15 of win0 are all in warp0 lanes 0..15, so __syncwarp(0xFFFFFFFF) syncs them. Should work. Need to reduce WPB to 1 or use __syncthreads, and verify rpe_bias layout & qkv weight layout match reference. Debug rounds exhausted (5/5).\nnext bet: Switch active branch to n2 (two-kernel split) which is less risky for correctness; defer n1.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Split into two fused kernels: (K1) LN1 + window-partition + QKV + attention + softmax + AV + proj + residual1, writing the intermediate (B,H,W,C) tensor; (K2) LN2 + fc1 + GELU + fc2 + residual2. Allows simpler per-kernel design and easier validation; intermediate tensor is 59MB extra traffic.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "Easier to implement and debug. Each kernel still amortizes weight loads. However an extra 118MB of intermediate memory traffic compared to full fusion limits the speedup.",
+          "score_0_to_1": 0.45,
+          "title": "Two-kernel split (attention block + MLP block)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Each kernel still one-block-per-window. Lower SMEM pressure than full fusion.",
+            "notes": "small GEMMs underutilize tensor cores; fp32 accum in smem",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "intermediate tensor write/read between kernels adds BW pressure",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "split keeps per-kernel register use modest",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Mutually exclusive with n1 (single fused) and n3 (cuBLAS). Splits at residual1 boundary; easier to validate piecewise. Preferred next active branch given n1's correctness failure.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Reference-faithful CUDA scaffolding that calls cuBLAS gemms for qkv/proj/fc1/fc2, and writes small custom kernels for LN, window partition/reverse, softmax+RPE, and GELU. Serves as correctness baseline and integration test for set_params.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "Quick to make correct; establishes the pybind/set_params plumbing and validates numerics before attempting fused kernels.",
+          "score_0_to_1": 0.25,
+          "title": "cuBLAS+small-kernels baseline"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "cuBLAS GEMMs at N=16, K=32 are inefficient (tiny shapes); many launches.",
+            "notes": "Will likely be slower than PyTorch reference due to per-window launches; could batch as 57600x16xC GEMM though.",
+            "rating_0_to_10": 4.0,
+            "risk": "Many kernel launches dominate latency."
+          },
+          "memory_bandwidth": {
+            "notes": "Many global round-trips, similar to PyTorch reference.",
+            "rating_0_to_10": 3.0,
+            "risk": "No improvement over baseline."
+          },
+          "register_pressure": {
+            "notes": "Not a concern.",
+            "rating_0_to_10": 9.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Mutually exclusive with n1/n2. Oracle for correctness only; unlikely to beat baseline at C=32 (too small for cuBLAS efficiency).",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 3.0,
+          "rationale": "",
+          "score_0_to_1": 0.8,
+          "title": "Fix host glue & kernel.h signature to make n1 compile"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.75,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "CHILD of n1: chain refinement, not alternative. Ensure launch_swin_block prototype matches kernel.h, add Torch extension binding, verify __half* pointers from at::Tensor.data_ptr<at::Half>(). SELF_CHECK: only child of n1 so trivially exclusive.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 4.0,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Use WMMA tensor cores for QKV/proj/FC1/FC2 GEMMs"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b",
+        "node_type": "decision",
+        "notes": "CHILD of n1 (after n1a compiles): replace scalar fp32 MAC loops with 16x16x16 wmma fp16 fragments for the four GEMMs; keep softmax/LN in fp32. SELF_CHECK: sibling to n1a but n1a is prerequisite \u2014 they're sequential not alternative; mark as exclusive-with-n1c only.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Fix host binding: unify set_params/run for two-kernel split"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2a",
+        "node_type": "decision",
+        "notes": "CHILD of n2: refinement. Fix the Python module wrapper so set_params stores all 13 tensors (x not included; ln1_w/b, qkv_w/b, proj_w/b, rpe, ln2_w/b, fc1_w/b, fc2_w/b) and run(x) launches attn_kernel then mlp_kernel with the stored params. Root cause of failure is missing/incorrect set_params plumbing, not kernel logic. SELF_CHECK: only child under n2, addresses the specific eval failure.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n2",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin transformer block at fp16: LayerNorm -> window-partitioned single-head self-attention (window 4x4, C=32) with relative position bias -> proj+residual -> LayerNorm -> MLP (32->128->32 with GELU) -> residual. Input is (1,720,1280,32) fp16 giving 57600 independent 4x4 windows of 16 tokens. Per-window working set (activations + all weights ~22KB) easily fits in SMEM/registers, so full single-kernel fusion is strongly preferred. Bottleneck is global memory bandwidth (~118MB minimum I/O); compute per window is tiny. Key constraints: numerically stable LN/softmax in fp32, RPE bias addition, weight delivery via set_params/pybind, tolerance rtol=atol=0.01.",
+  "open_questions": [
+    "Best block geometry: 1 window/block (1 warp) vs 2-4 windows/block to improve SM occupancy on RTX5090?",
+    "Should QKV/proj/FC use mma.m16n16k16 tensor cores or plain FMA given the small shapes and fp16 inputs?",
+    "Where to store weights: __constant__ memory (limited to 64KB), persistent SMEM populated per block, or just global with L1/L2 caching?",
+    "Is fp16 accumulation sufficient anywhere within tolerance 0.01, or must all matmuls/reductions accumulate in fp32?",
+    "Does the evaluator reuse the workspace tensor across runs (does set_params get called once or every iteration)?",
+    "Exact LayerNorm epsilon and behavior matching torch.nn.LayerNorm (default eps=1e-5, fp32 stats) \u2014 must match.",
+    "GELU variant \u2014 PyTorch nn.GELU defaults to 'none' (exact erf-based); approximate tanh form would violate 0.01 tolerance only marginally; need to confirm."
+  ]
+}

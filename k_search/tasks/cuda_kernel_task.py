@@ -169,6 +169,16 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
 IMPORTANT: If the reference model has learnable parameters (weights, biases, etc.),
 your implementation MUST expose a `set_params` function via pybind11 so the evaluator
 can pass the model's trained parameters to your kernel before calling `run()`.
+
+The evaluator will call `set_params` with ALL of the model's parameters as positional
+arguments, in the same order as `model.parameters()` (i.e. the declaration order of
+nn.Parameter / submodule parameters in the Model class). For example, if the model has:
+  norm.weight, norm.bias, linear.weight, linear.bias
+then `set_params` will be called as:
+  set_params(norm_weight, norm_bias, linear_weight, linear_bias)
+
+Each argument is a `torch::Tensor` already on CUDA with the appropriate dtype.
+Your `set_params` must store these tensors (or copies) for use in subsequent `run()` calls.
 """
 
     def get_code_format_text(self, *, language: str, target_gpu: str) -> str:

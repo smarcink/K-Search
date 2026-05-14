@@ -30,6 +30,8 @@ def _cuda_xml_and_guidelines_block(*, target_gpu: str) -> str:
 - Move CPU data to GPU, execute kernels, and return results to CPU
 - MUST include PyTorch C++ extension bindings using PYBIND11_MODULE
 - The "run" function must be exposed to Python through the binding
+- If the model has learnable parameters, expose a "set_params" function that accepts
+  ALL model parameters as torch::Tensor positional args (in model.parameters() order)
 - Include proper tensor type conversion between PyTorch tensors and CUDA pointers
 - Include all necessary PyTorch headers: #include <torch/extension.h>
 </cpp_file>
