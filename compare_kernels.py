@@ -224,13 +224,39 @@ def diff(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
 
 
 def _try_set_params(module, ref_model: nn.Module) -> None:
-    """Pass reference model's conv weights/bias to a CUDA module via set_params()."""
+    """Pass reference model weights to a CUDA module via set_params()."""
+    # Method 1: Conv2d shortcut (for conv-based tasks)
     for m in ref_model.modules():
         if isinstance(m, nn.Conv2d):
             w = m.weight.data
             b = m.bias.data if m.bias is not None else torch.Tensor()
             module.set_params(w, b)
             return
+
+    # Method 2: Try passing all state (multiple orderings)
+    buffers = [b.data for b in ref_model.buffers()]
+    params = [p.data for p in ref_model.parameters()]
+
+    # Try buffers + params (common for kernels that expect bias tables first)
+    try:
+        module.set_params(*(buffers + params))
+        return
+    except TypeError:
+        pass
+
+    # Try params + buffers (state_dict default order)
+    try:
+        module.set_params(*(params + buffers))
+        return
+    except TypeError:
+        pass
+
+    # Try just params (no buffers)
+    try:
+        module.set_params(*params)
+        return
+    except TypeError:
+        pass
 
 
 def main():
