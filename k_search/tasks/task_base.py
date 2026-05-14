@@ -177,21 +177,30 @@ class EvalResult:
         try:
             from k_search.utils.ncu_profiler import NcuMetrics, render_profiler_summary
 
-            # Reconstruct NcuMetrics from the flat dict
-            m = NcuMetrics(
-                sm_occupancy_pct=self.profiler_metrics.get("sm_occupancy_pct"),
-                compute_throughput_pct=self.profiler_metrics.get("compute_throughput_pct"),
-                memory_throughput_pct=self.profiler_metrics.get("memory_throughput_pct"),
-                l1_hit_rate_pct=self.profiler_metrics.get("l1_hit_rate_pct"),
-                l2_hit_rate_pct=self.profiler_metrics.get("l2_hit_rate_pct"),
-                achieved_bandwidth_gb_s=self.profiler_metrics.get("achieved_bandwidth_gb_s"),
-                tensor_core_utilization_pct=self.profiler_metrics.get("tensor_core_utilization_pct"),
-                registers_per_thread=self.profiler_metrics.get("registers_per_thread"),
-                shared_mem_per_block_bytes=self.profiler_metrics.get("shared_mem_per_block_bytes"),
-                top_stall_reasons=self.profiler_metrics.get("top_stall_reasons", []),
-                kernel_name=self.profiler_metrics.get("kernel_name", ""),
-            )
-            rendered = render_profiler_summary(m)
+            # New format: {"kernels": [{...}, {...}, ...]}
+            kernel_dicts = self.profiler_metrics.get("kernels", [])
+            if not kernel_dicts:
+                # Legacy single-kernel format (backward compat)
+                kernel_dicts = [self.profiler_metrics]
+
+            kernel_list: list[NcuMetrics] = []
+            for kd in kernel_dicts:
+                m = NcuMetrics(
+                    sm_occupancy_pct=kd.get("sm_occupancy_pct"),
+                    compute_throughput_pct=kd.get("compute_throughput_pct"),
+                    memory_throughput_pct=kd.get("memory_throughput_pct"),
+                    l1_hit_rate_pct=kd.get("l1_hit_rate_pct"),
+                    l2_hit_rate_pct=kd.get("l2_hit_rate_pct"),
+                    achieved_bandwidth_gb_s=kd.get("achieved_bandwidth_gb_s"),
+                    tensor_core_utilization_pct=kd.get("tensor_core_utilization_pct"),
+                    registers_per_thread=kd.get("registers_per_thread"),
+                    shared_mem_per_block_bytes=kd.get("shared_mem_per_block_bytes"),
+                    top_stall_reasons=kd.get("top_stall_reasons", []),
+                    kernel_name=kd.get("kernel_name", ""),
+                )
+                kernel_list.append(m)
+
+            rendered = render_profiler_summary(kernel_list)
             return rendered.splitlines() if rendered else []
         except Exception:
             return []

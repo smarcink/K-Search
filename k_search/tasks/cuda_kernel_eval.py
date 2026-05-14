@@ -224,7 +224,13 @@ def _try_pass_params(module, model):
 
 
 def _run_profile_only(args):
-    """Profile-only mode: compile kernel, load ref model, run kernel once for ncu profiling."""
+    """Profile-only mode: compile kernel, load ref model, run kernel once for ncu profiling.
+
+    Uses CUDA profiler API markers (cudaProfilerStart/Stop) to delimit the
+    region of interest.  ncu is invoked with --profile-from-start off so it
+    only captures kernels launched between the markers.  This correctly handles
+    LLM-generated code that launches multiple CUDA kernels per module.run().
+    """
     model, get_inputs_fn, dtype = load_reference(args.ref_path, args.precision)
     module = compile_cuda_kernel(args.kernel_dir)
     _try_pass_params(module, model)
@@ -233,13 +239,20 @@ def _run_profile_only(args):
     inputs = get_inputs_fn()
     inputs = [x.to(dtype=dtype, device="cuda") if isinstance(x, torch.Tensor) else x for x in inputs]
 
-    # Warmup (minimal — ncu will instrument the run call below)
+    # Warmup: allocates GPU resources, triggers any lazy init.
+    # NOT profiled because profiling hasn't started yet (--profile-from-start off).
     module.run(*inputs)
     torch.cuda.synchronize()
 
-    # Profiled run: ncu captures this kernel launch
+    # Start profiling region — ncu captures all kernel launches after this.
+    torch.cuda.cudart().cudaProfilerStart()
+
+    # Profiled run: ALL kernels launched here are captured by ncu.
     module.run(*inputs)
     torch.cuda.synchronize()
+
+    # Stop profiling region.
+    torch.cuda.cudart().cudaProfilerStop()
 
 
 def main():

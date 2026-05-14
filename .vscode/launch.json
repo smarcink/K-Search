@@ -63,7 +63,7 @@
                 "conv_pooling_fp16_cuda/reference.py",
                 "conv_pooling_fp16_cuda/opus47_v0",
                 "conv_pooling_fp16_cuda/opus47_v1",
-                //"conv_pooling_fp16_cuda/opus47_v1_cont",
+                "conv_pooling_fp16_cuda/opus47_v2_ncu",
                 "--precision", "fp16",
                 "--warmup", "100",
                 "--iters", "1000", 

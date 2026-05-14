@@ -1,0 +1,571 @@
+{
+  "computed_signals": {
+    "round_index": 18,
+    "trace": {
+      "latency_ms": 0.25279998779296875,
+      "mean_vs_baseline_factor": null,
+      "profiler": {
+        "achieved_bandwidth_gb_s": 57.39,
+        "compute_throughput_pct": 95.61,
+        "kernel_name": "fused_conv_relu_avgpool_kernel(const __half *, __half *, int, int, int, int)",
+        "l1_hit_rate_pct": 9.21,
+        "l2_hit_rate_pct": 63.33,
+        "memory_throughput_pct": 9.97,
+        "registers_per_thread": 56,
+        "shared_mem_per_block_bytes": 19584,
+        "sm_occupancy_pct": 62.1,
+        "tensor_core_utilization_pct": 0.0,
+        "top_stall_reasons": [
+          [
+            "not_selected",
+            2.23
+          ],
+          [
+            "math_pipe_throttle",
+            0.57
+          ],
+          [
+            "long_scoreboard",
+            0.39
+          ]
+        ]
+      },
+      "reference_latency_ms": 4.242976188659668,
+      "speedup_factor": 16.783925607363816,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1b_wmma_inner",
+    "nodes": [
+      {
+        "action": {
+          "description": "Root dummy node",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "Root container",
+          "score_0_to_1": 0.0,
+          "title": "root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell, sm_120): high HBM/GDDR7 BW (~1.8TB/s), large L2, abundant SMs, strong fp16 tensor cores. Problem size: N=1, Cin=16, Cout=32, H=720, W=1280. Conv3x3 fp16 with 16->32 ch is small enough that whole filter (32*16*9 = 4608 halves = 9KB) easily fits in shared memory or registers.",
+            "notes": "Pipeline: Conv2d(3x3,pad=1,16->32) + ReLU + AvgPool2x2 on 1x16x720x1280 fp16. Output: 1x32x360x640. Conv FLOPs ~ 2*16*32*9*720*1280 \u2248 8.5 GFLOPs (small). Memory: input 28.8MB, output (post pool) 14.7MB. Likely memory-bound for input streaming; full fusion (conv+relu+avgpool) eliminates intermediate 29.5MB write/read.",
+            "rating_0_to_10": 7.0,
+            "risk": "Need to ensure tensor-core or vectorized fp16 math; avoid scalar __half2float bottleneck."
+          },
+          "memory_bandwidth": {
+            "notes": "Dominant cost is reading input (1*16*720*1280*2=29.5MB) and writing pooled output (14.7MB). Without fusion, intermediate conv output (1*32*720*1280*2=59MB) doubles traffic. Full fusion is the biggest win.",
+            "rating_0_to_10": 8.0,
+            "risk": "If we don't fuse pool with conv, BW wasted on 59MB intermediate."
+          },
+          "register_pressure": {
+            "notes": "Weights are tiny (9KB); easily fits in shared memory. Per-thread accumulators for Cout=32 outputs over 2x2 pool window manageable.",
+            "rating_0_to_10": 6.0,
+            "risk": "If a thread computes all 32 output channels for a 2x2 tile, ~128 fp32 accumulators \u2014 borderline but viable."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS:\n1) Classification: stencil (3x3 conv) + elementwise (ReLU) + reduction-like (2x2 avgpool). Dense, fixed small channel dims (Cin=16, Cout=32), large spatial (720x1280), N=1, fp16.\n2) Math: out[co,oh,ow] = avg over 2x2 of ReLU(bias[co] + sum_{ci,kh,kw} in[ci,2oh+kh-1+dh,2ow+kw-1+dw] * w[co,ci,kh,kw]). Reductions over Cin,kh,kw and 2x2 pool. All output elements independent.\n3) Layout: NCHW contiguous fp16. Input read with 3x3 overlap (high reuse along H,W). Weights tiny (9KB), read-once-per-block. Output written once.\n4) Regimes: (a) memory-bound streaming of input/output (current main cost), (b) compute-bound if we tile aggressively with tensor cores, (c) launch/latency-bound for tiny work \u2014 not this case (large spatial).\n5) Knobs: tile shape in HxW, channel parallelism (Cout per thread/block), shared-mem staging of input halo & weights, vectorized half2/uint4 loads, fp16 vs fp32 accumulators, fused vs split kernels, WMMA tensor cores.\n6) Skeleton: one fused kernel \u2014 each block produces a tile of pooled outputs (e.g., 8x16 pooled = 16x32 conv) for all 32 output channels; load input halo (Cin slices) + 2x2-strided neighborhood into shared memory; load weights into shared/constant memory; each thread accumulates partial sums across Cin/kh/kw using half2 FMA; apply ReLU; reduce 2x2 pool; write output. Single sync between halo load and compute.\n7) Families:\n  - F1 (TOP, full-fusion): single kernel, shared-mem tiled conv+relu+avgpool. Avoids 59MB intermediate. Working set fits easily.\n  - F2: tensor-core (WMMA/mma.sync) im2col-in-shared fused with pool. Higher compute throughput but conv is small and likely BW-bound; complexity high.\n  - F3: split fused (conv+relu) and (avgpool) custom kernels, vectorized half2. Easier but loses fusion benefit.\nForbidden tactic-named families avoided.\nInitial open actions below propose F1 variants and a quick win.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "init"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Write a single fused CUDA kernel that performs Conv3x3+bias+ReLU+AvgPool2x2 in one pass. Each block produces a tile of pooled outputs covering all 32 output channels. Stage the 3x3 input halo for the corresponding conv region in shared memory (one Cin channel at a time or all 16 at once \u2014 16*tile_h*tile_w*2B fits). Keep weights (9KB) in shared memory loaded once. Use fp32 accumulators per (co, pooled_h, pooled_w). After conv+bias+ReLU, reduce 2x2 within registers and write half output. Eliminates the 59MB intermediate tensor entirely.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 5.9,
+          "rationale": "Reference does separate conv (writes 59MB) + pool (re-reads 59MB). Fusion removes that round trip; with tiny weights and high reuse, a single tiled kernel should be strongly memory-bound on input only (~30MB read + 15MB write).",
+          "score_0_to_1": 0.9,
+          "title": "Fully fused Conv+ReLU+AvgPool single kernel (tiled, shared-mem)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 SMs ~170; tile 16x32 conv output per block \u2192 ~720*1280/4/(8*16) \u2248 1800 blocks \u2014 plenty of parallelism. Shared mem per block: 16*18*34*2 \u2248 19KB input halo + 9KB weights \u2248 28KB, fits.",
+            "notes": "Compute throughput 78.6%, math pipe throttle is top stall \u2014 FFMA bound on per-thread 16-output inner loop. Tensor cores unused.",
+            "rating_0_to_10": 8.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 28.8 GB/s, mem throughput only 5% \u2014 well below DRAM peak. Fusion eliminated intermediate. L2 hit 69% suggests good reuse.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "40 regs/thread, 19584 B smem, occupancy 62%. Room to push occupancy if regs drop.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_full_fusion",
+        "node_type": "decision",
+        "notes": "CURRENT: does=single fused kernel computing Conv3x3+bias+ReLU+AvgPool2x2 with weights in constant mem, input tile in smem, 16 pooled outputs per thread. bottleneck=compute (math pipe throttle 2.5%, compute_tp 78.6%, mem_tp 5%). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 5.91x speedup confirms fusion thesis; now compute-bound on FFMA, not memory. next bet: reduce FFMA cost via half2 SIMD or WMMA (m16n16k16 fits Cout=32,Cin=16 perfectly); or improve occupancy by lowering registers / increasing parallelism. PERF_GAP: expected 4.0x, observed 5.91x \u2014 better than predicted because L2 reuse across blocks higher than assumed.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.7041280269622803,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {
+              "achieved_bandwidth_gb_s": 28.81,
+              "compute_throughput_pct": 78.59,
+              "kernel_name": "fused_conv_relu_avgpool_kernel(const __half *, __half *, int, int, int, int)",
+              "l1_hit_rate_pct": 12.25,
+              "l2_hit_rate_pct": 69.01,
+              "memory_throughput_pct": 5.0,
+              "registers_per_thread": 40,
+              "shared_mem_per_block_bytes": 19584,
+              "sm_occupancy_pct": 62.14,
+              "tensor_core_utilization_pct": 0.0,
+              "top_stall_reasons": [
+                [
+                  "not_selected",
+                  3.84
+                ],
+                [
+                  "math_pipe_throttle",
+                  2.545
+                ],
+                [
+                  "wait",
+                  0.37
+                ]
+              ]
+            },
+            "reference_latency_ms": 4.158207893371582,
+            "speedup_factor": 5.905471354848278,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "2b7a957bdf892a01a344414afc22212614586a65"
+        }
+      },
+      {
+        "action": {
+          "description": "Keep the two-kernel structure but heavily optimize each: (1) Conv+ReLU: each thread computes multiple output channels for one spatial pixel using half2 vectorization across Cin (pairs); cache weights in shared/constant; use __ldg for inputs. (2) AvgPool: vectorize 2x2 with uint4 loads (8 halves at once) so each thread pools 4 output pixels. Easier to implement than full fusion, but keeps intermediate traffic.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "Quick baseline improvement; isolates which kernel dominates. Useful as a safety net if full fusion has bugs.",
+          "score_0_to_1": 0.15,
+          "title": "Vectorized split kernels (conv+relu, then avgpool)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "half2 FMA doubles fp16 throughput; constant memory for 9KB weights ideal.",
+            "notes": "Conv kernel reuses input only via L1/L2 not shared \u2014 leaves perf on table.",
+            "rating_0_to_10": 6.0,
+            "risk": "L2 reuse insufficient for 3x3 overlap; may still be BW-bound on intermediate."
+          },
+          "memory_bandwidth": {
+            "notes": "Still pays 59MB intermediate write+read. Better than reference but worse than fusion.",
+            "rating_0_to_10": 5.0,
+            "risk": "Bound by intermediate traffic."
+          },
+          "register_pressure": {
+            "notes": "Low; each thread holds few accumulators.",
+            "rating_0_to_10": 8.0,
+            "risk": "Minimal."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2_split_vectorized",
+        "node_type": "decision",
+        "notes": "DEPRIORITIZED: dominated by n1b 16.78x. Splitting reintroduces global intermediates and loses fusion locality.",
+        "overall_rating_0_to_10": 2.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement the conv inner loop using WMMA fragments (16x16x16 fp16) by treating each 2x2 pool tile as a small GEMM in shared memory (im2col-in-shared for a tile). After WMMA accumulate, apply bias+ReLU+2x2 reduction and write pooled output. Targets the Blackwell tensor cores for maximal compute throughput while still fusing the pool.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 7.0,
+          "rationale": "Tensor cores can crush the 8.5 GFLOP conv workload, leaving only input/output BW. Combined with fused pool gives best of both worlds \u2014 but high implementation risk.",
+          "score_0_to_1": 0.4,
+          "title": "Tensor-core (WMMA) fused conv+relu+avgpool"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "WMMA requires M,N,K multiples of 16. Cin=16, Cout=32 fit naturally. Im2col tile in shared memory needed.",
+            "notes": "Best compute density; problem may not need it since likely BW-bound.",
+            "rating_0_to_10": 9.0,
+            "risk": "Complexity, layout fiddling, correctness with halo padding."
+          },
+          "memory_bandwidth": {
+            "notes": "Same as full fusion path on BW; compute throughput far in excess of need.",
+            "rating_0_to_10": 9.0,
+            "risk": "BW likely still the limiter \u2014 diminishing returns vs n1."
+          },
+          "register_pressure": {
+            "notes": "WMMA fragments are register-heavy but tractable.",
+            "rating_0_to_10": 5.0,
+            "risk": "Spills if tile too large."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3_wmma_fused",
+        "node_type": "decision",
+        "notes": "Kept open as alternative top-level family using real tensor cores. Tiny GEMM (Cout=32,Cin=16) may not amortize WMMA overhead; revisit only if compute pipe becomes the proven ceiling.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Profile/sanity check: keep reference structure but only fuse the AvgPool2x2 into the conv kernel's tail (each thread that computes a conv pixel also contributes via atomic/shared reduction to its pooled output). This is a stepping stone toward n1 without full tiling.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.8,
+          "rationale": "Diagnostic \u2014 measures the value of eliminating the intermediate even without tiling. Lower ceiling than n1.",
+          "score_0_to_1": 0.15,
+          "title": "Fuse only AvgPool into conv tail (no spatial tiling)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Threads grouped by 2x2 pool quadrant; needs shfl/shared reduction.",
+            "notes": "Simpler than n1 but loses input reuse.",
+            "rating_0_to_10": 5.0,
+            "risk": "Atomic adds in shared can serialize."
+          },
+          "memory_bandwidth": {
+            "notes": "Saves intermediate write/read but conv still re-reads input 9x per output.",
+            "rating_0_to_10": 6.0,
+            "risk": "Input traffic dominates."
+          },
+          "register_pressure": {
+            "notes": "Low.",
+            "rating_0_to_10": 8.0,
+            "risk": "Minimal."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n4_pool_fuse_only",
+        "node_type": "decision",
+        "notes": "DEPRIORITIZED: dominated by n1b 16.78x; partial fusion strictly weaker.",
+        "overall_rating_0_to_10": 2.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 12.67,
+          "rationale": "",
+          "score_0_to_1": 0.95,
+          "title": "half2-vectorized inner loop (pack 2 conv outputs as half2, use __hfma2)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Compute throughput 95.6%; FFMA pipe saturated via __hfma2.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 57.39 GB/s; L1 hit 9.2% suggests room for reuse optimization.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "56 regs/thread, occupancy 62.1% \u2014 tolerable.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a_half2_simd",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Fully fused Conv3x3+ReLU+AvgPool2x2 with shared-mem input tile, packs 2 vertically-adjacent conv outputs per thread as half2 and uses __hfma2 across 16 input channels. bottleneck=compute throughput (95.6%) with low memory pressure (10%). FOLLOW_THROUGH: aligned_with_intent=yes; matches half2 SIMD intent. UPDATE_BELIEF: Observed 12.67x speedup (lat 0.346ms), far beyond 7.5x prediction; compute is now near-saturated, registers=56, occupancy 62%. Next bet: try tensor-core (WMMA/MMA) inner GEMM to break compute ceiling, or reduce shared-mem traffic via register reuse along W (slide 3x3 window) to cut redundant __halves2half2 packing. PERF_GAP: expected 7.5x vs observed 12.67x; reason=__hfma2 throughput + reduced index/control overhead beat estimate.",
+        "overall_rating_0_to_10": 9.2,
+        "parent_id": "n1_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.34563198685646057,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {
+              "achieved_bandwidth_gb_s": 57.39,
+              "compute_throughput_pct": 95.61,
+              "kernel_name": "fused_conv_relu_avgpool_kernel(const __half *, __half *, int, int, int, int)",
+              "l1_hit_rate_pct": 9.21,
+              "l2_hit_rate_pct": 63.33,
+              "memory_throughput_pct": 9.97,
+              "registers_per_thread": 56,
+              "shared_mem_per_block_bytes": 19584,
+              "sm_occupancy_pct": 62.1,
+              "tensor_core_utilization_pct": 0.0,
+              "top_stall_reasons": [
+                [
+                  "not_selected",
+                  2.23
+                ],
+                [
+                  "math_pipe_throttle",
+                  0.57
+                ],
+                [
+                  "long_scoreboard",
+                  0.39
+                ]
+              ]
+            },
+            "reference_latency_ms": 4.380671977996826,
+            "speedup_factor": 12.674382419981574,
+            "status": "passed"
+          },
+          "parent_solution_id": "2b7a957bdf892a01a344414afc22212614586a65",
+          "solution_id": "fa60b88f0413963a7761e59479d48cad18b567b6"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 16.78,
+          "rationale": "",
+          "score_0_to_1": 0.85,
+          "title": "WMMA m16n16k16 inner GEMM for conv (im2col in smem, 2 tile-cols for Cout=32)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "compute_throughput 95.61%; half2 HFMA2 path well-utilized; tensor cores still 0% (no real WMMA yet).",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "57.39 GB/s, 9.97% memory throughput; input tile in smem is small; bias/weight in const cache.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "56 regs/thread; 8 outputs/thread keeps regs in budget; occupancy 62%.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b_wmma_inner",
+        "node_type": "decision",
+        "notes": "CURRENT: half2-vectorized fused conv+ReLU+avgpool with weights rearranged into __half2 pairs across Cout, 4 conv outputs/thread feeding 2x2 avgpool. bottleneck=compute (95.6% pipe). FOLLOW_THROUGH: aligned_with_intent=no; intent was real WMMA m16n16k16 GEMM via im2col in smem; actual code uses scalar/half2 HFMA2 (no mma.sync, tensor_core_util=0%). UPDATE_BELIEF: Despite missing WMMA, the half2 HFMA2 path reached 16.78x, exceeding the 9x WMMA target; tensor cores remain untapped, so a true WMMA realization could still pay off for larger problems, but at Cin=16/Cout=32 the GEMM is tiny and overhead may dominate. next bet: push compute pipeline further (reduce __half2half2 broadcasts, hoist loads, try ldmatrix or one warp-level mma test) and increase occupancy by trimming registers. PERF_GAP: expected 9.0x vs observed 16.78x \u2014 likely because predicted speedup was conservative and half2 HFMA2 already saturates the math pipe.",
+        "overall_rating_0_to_10": 8.8,
+        "parent_id": "n1_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.25279998779296875,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 4.242976188659668,
+            "speedup_factor": 16.783925607363816,
+            "status": "passed"
+          },
+          "parent_solution_id": "2b7a957bdf892a01a344414afc22212614586a65",
+          "solution_id": "59a08fdaab245d582593b1bdd7534194ee3c88e0"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 6.5,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Reduce per-thread work / register pressure to raise occupancy (8 outs/thread, 512 threads)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c_occupancy",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n1, mutually exclusive with n1a/n1b (changes thread-tile mapping & block size, not compute primitive). Easy quick-win to address 62% occupancy and math-pipe throttle by exposing more warps.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "2b7a957bdf892a01a344414afc22212614586a65",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.9,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Compute throughput 95.6%; FFMA pipe saturated via __hfma2.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 57.39 GB/s; L1 hit 9.2% suggests room for reuse optimization.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "56 regs/thread, occupancy 62.1% \u2014 tolerable.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 10,
+        "node_id": "node_reference_r10_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 9.2,
+        "parent_id": "n1a_half2_simd",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "fa60b88f0413963a7761e59479d48cad18b567b6",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.85,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "compute_throughput 95.61%; half2 HFMA2 path well-utilized; tensor cores still 0% (no real WMMA yet).",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "57.39 GB/s, 9.97% memory throughput; input tile in smem is small; bias/weight in const cache.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "56 regs/thread; 8 outputs/thread keeps regs in budget; occupancy 62%.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 18,
+        "node_id": "node_reference_r18_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 8.8,
+        "parent_id": "n1b_wmma_inner",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "59a08fdaab245d582593b1bdd7534194ee3c88e0",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused Conv2d(3x3, pad=1, 16->32) + ReLU + AvgPool2d(2x2) on a single 1x16x720x1280 fp16 tensor on RTX5090. Total conv work is small (~8.5 GFLOPs) and weights are tiny (9KB), so the workload is fundamentally memory-bandwidth bound on the input (29.5MB) and output (14.7MB). The reference splits the pipeline into two kernels, materializing a 59MB intermediate \u2014 eliminating that round-trip via full single-kernel fusion is the dominant optimization. Constraints: fp16 NCHW contiguous, tolerance rtol=atol=0.01, must expose set_params, output shape 1x32x360x640.",
+  "open_questions": [
+    "Does the evaluator measure end-to-end (compile + first run) or steady-state? Affects whether autotuning is worthwhile.",
+    "Is N always 1, or can batch vary? Current grid sizing assumes N=1; need to confirm get_inputs is the only shape.",
+    "What's the reference kernel's measured latency on RTX5090 so we can target a concrete speedup?",
+    "Are fp16 accumulators acceptable within rtol=0.01, or do we need fp32 accumulation for the 16*9=144 sum?",
+    "Is bias always present (Conv2d default bias=True is set), so we can hardcode the bias path?",
+    "Is cuDNN available/used inside the reference's 'simple' kernel? The reference comment says cuDNN/ATen but the .cu shows a naive kernel \u2014 confirms reference is the naive kernel (good \u2014 easy to beat).",
+    "Does RTX5090 (sm_120) WMMA support fp16x fp16 -> fp32 at 16x16x16 as on sm_80+? Needed before committing to n3.",
+    "What's the optimal shared-memory tile size considering 228KB shared/SM on Blackwell vs occupancy targets?"
+  ]
+}

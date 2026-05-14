@@ -118,7 +118,7 @@ def run_ncu_profile(
     timeout: int = 120,
     kernel_name_filter: str | None = None,
     verbose: bool = False,
-) -> NcuMetrics | None:
+) -> list[NcuMetrics] | None:
     """Run ncu on the given command and parse metrics.
 
     Args:
@@ -128,7 +128,8 @@ def run_ncu_profile(
         verbose: If True, print diagnostic info on failure
 
     Returns:
-        NcuMetrics on success, None on any failure (ncu not found, timeout, parse error)
+        List of NcuMetrics (one per kernel, sorted heaviest first) on success,
+        None on any failure (ncu not found, timeout, parse error).
     """
     if not NCU_AVAILABLE:
         if verbose:
@@ -140,10 +141,15 @@ def run_ncu_profile(
         "--metrics", NCU_METRICS_STR,
         "--csv",
         "--target-processes", "all",
+        # Lock clocks for reproducible measurements
+        "--clock-control", "base",
+        # Only profile kernels between cudaProfilerStart/Stop markers
+        # (the profiled code calls these around the measured region)
+        "--profile-from-start", "off",
     ]
 
     if kernel_name_filter:
-        ncu_cmd.extend(["--kernel-name", kernel_name_filter])
+        ncu_cmd.extend(["--kernel-name-base", kernel_name_filter])
 
     ncu_cmd.append("--")
     ncu_cmd.extend(cmd)
@@ -190,13 +196,14 @@ def run_ncu_profile(
 # CSV parsing
 # ---------------------------------------------------------------------------
 
-def _parse_ncu_csv(csv_text: str) -> NcuMetrics | None:
-    """Parse ncu --csv output into NcuMetrics.
+def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
+    """Parse ncu --csv output into a list of NcuMetrics (one per kernel launch).
 
-    ncu CSV format has rows like:
+    ncu CSV format (long-format, one row per metric per kernel launch):
         "ID","Process ID","Process Name","Host Name","Kernel Name","...","Metric Name","Metric Unit","Metric Value"
-    Each row is one metric for one kernel invocation.
-    We aggregate across kernel invocations (take the first kernel launch or average).
+
+    Returns all profiled kernels sorted by compute throughput (heaviest first),
+    so the LLM can reason about every kernel in the forward pass.
     """
     try:
         # Find the header line (starts with "ID" typically)
@@ -207,92 +214,98 @@ def _parse_ncu_csv(csv_text: str) -> NcuMetrics | None:
                 header_idx = i
                 break
         if header_idx is None:
-            # Try treating entire text as CSV
             header_idx = 0
 
         csv_content = "\n".join(lines[header_idx:])
         reader = csv.DictReader(io.StringIO(csv_content))
 
-        # Collect all metric values by metric name (first kernel invocation)
-        metrics_by_name: dict[str, list[float]] = {}
-        kernel_name = ""
+        # Group metrics by kernel launch ID
+        kernels: dict[str, dict[str, float]] = {}  # id -> {metric_name: value}
+        kernel_names: dict[str, str] = {}  # id -> kernel name
 
         for row in reader:
+            launch_id = row.get("ID", "").strip()
             metric_name = row.get("Metric Name", "").strip()
             metric_value_str = row.get("Metric Value", "").strip()
-            if not metric_name or not metric_value_str:
+            if not launch_id or not metric_name or not metric_value_str:
                 continue
 
-            # Capture kernel name from first row
-            if not kernel_name:
-                kernel_name = row.get("Kernel Name", "").strip()
+            kernel_names.setdefault(launch_id, row.get("Kernel Name", "").strip())
 
-            # Parse numeric value (ncu may use commas as thousand separators)
             try:
                 clean_val = metric_value_str.replace(",", "")
                 val = float(clean_val)
             except (ValueError, TypeError):
                 continue
 
-            metrics_by_name.setdefault(metric_name, []).append(val)
+            kernels.setdefault(launch_id, {})[metric_name] = val
 
-        if not metrics_by_name:
+        if not kernels:
             return None
 
-        def _avg(name: str) -> float | None:
-            vals = metrics_by_name.get(name)
-            if not vals:
-                return None
-            return sum(vals) / len(vals)
+        # Build NcuMetrics for each kernel launch
+        throughput_metric = "sm__throughput.avg.pct_of_peak_sustained_elapsed"
+        result: list[NcuMetrics] = []
 
-        def _first_int(name: str) -> int | None:
-            vals = metrics_by_name.get(name)
-            if not vals:
-                return None
-            return int(vals[0])
+        for kid in kernels:
+            metrics_by_name = kernels[kid]
+            kernel_name = kernel_names.get(kid, "")
 
-        # Build metrics
-        m = NcuMetrics()
-        m.kernel_name = kernel_name
-        m.raw_csv = csv_text[:3000]  # bounded for debugging
+            def _get(name: str, _m=metrics_by_name) -> float | None:
+                val = _m.get(name)
+                return val if val is not None else None
 
-        m.sm_occupancy_pct = _avg("sm__warps_active.avg.pct_of_peak_sustained_active")
-        m.compute_throughput_pct = _avg("sm__throughput.avg.pct_of_peak_sustained_elapsed")
-        m.memory_throughput_pct = _avg("dram__throughput.avg.pct_of_peak_sustained_elapsed")
-        m.l1_hit_rate_pct = _avg("l1tex__t_sector_hit_rate.pct")
-        m.l2_hit_rate_pct = _avg("lts__t_sector_hit_rate.pct")
-        m.tensor_core_utilization_pct = _avg("sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed")
+            def _get_int(name: str, _m=metrics_by_name) -> int | None:
+                val = _m.get(name)
+                return int(val) if val is not None else None
 
-        # Bandwidth: bytes/sec → GB/s
-        bw = _avg("dram__bytes.sum.per_second")
-        if bw is not None:
-            m.achieved_bandwidth_gb_s = bw / 1e9
+            m = NcuMetrics()
+            m.kernel_name = kernel_name
 
-        m.registers_per_thread = _first_int("launch__registers_per_thread")
+            m.sm_occupancy_pct = _get("sm__warps_active.avg.pct_of_peak_sustained_active")
+            m.compute_throughput_pct = _get(throughput_metric)
+            m.memory_throughput_pct = _get("dram__throughput.avg.pct_of_peak_sustained_elapsed")
+            m.l1_hit_rate_pct = _get("l1tex__t_sector_hit_rate.pct")
+            m.l2_hit_rate_pct = _get("lts__t_sector_hit_rate.pct")
+            m.tensor_core_utilization_pct = _get("sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed")
 
-        # Shared memory: dynamic + static
-        dyn = _avg("launch__shared_mem_per_block_dynamic")
-        static = _avg("launch__shared_mem_per_block_static")
-        if dyn is not None or static is not None:
-            m.shared_mem_per_block_bytes = int((dyn or 0) + (static or 0))
+            bw = _get("dram__bytes.sum.per_second")
+            if bw is not None:
+                m.achieved_bandwidth_gb_s = bw / 1e9
 
-        # Stall reasons
-        stall_metrics = [
-            ("long_scoreboard", "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio"),
-            ("short_scoreboard", "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio"),
-            ("wait", "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio"),
-            ("not_selected", "smsp__average_warps_issue_stalled_not_selected_per_issue_active.ratio"),
-            ("math_pipe_throttle", "smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio"),
-        ]
-        stalls: list[tuple[str, float]] = []
-        for reason_name, metric_name in stall_metrics:
-            val = _avg(metric_name)
-            if val is not None and val > 0:
-                stalls.append((reason_name, val))
-        stalls.sort(key=lambda x: x[1], reverse=True)
-        m.top_stall_reasons = stalls[:3]
+            m.registers_per_thread = _get_int("launch__registers_per_thread")
 
-        return m
+            dyn = _get("launch__shared_mem_per_block_dynamic")
+            static = _get("launch__shared_mem_per_block_static")
+            if dyn is not None or static is not None:
+                m.shared_mem_per_block_bytes = int((dyn or 0) + (static or 0))
+
+            # Stall reasons
+            stall_metrics = [
+                ("long_scoreboard", "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio"),
+                ("short_scoreboard", "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio"),
+                ("wait", "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio"),
+                ("not_selected", "smsp__average_warps_issue_stalled_not_selected_per_issue_active.ratio"),
+                ("math_pipe_throttle", "smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio"),
+            ]
+            stalls: list[tuple[str, float]] = []
+            for reason_name, metric_name in stall_metrics:
+                val = _get(metric_name)
+                if val is not None and val > 0:
+                    stalls.append((reason_name, val))
+            stalls.sort(key=lambda x: x[1], reverse=True)
+            m.top_stall_reasons = stalls[:3]
+
+            result.append(m)
+
+        # Sort by compute throughput descending (heaviest kernel first)
+        result.sort(key=lambda m: m.compute_throughput_pct or 0.0, reverse=True)
+
+        # Store raw CSV only in first kernel (for debugging)
+        if result:
+            result[0].raw_csv = csv_text[:3000]
+
+        return result
 
     except Exception:
         return None
@@ -302,11 +315,41 @@ def _parse_ncu_csv(csv_text: str) -> NcuMetrics | None:
 # Rendering for prompts
 # ---------------------------------------------------------------------------
 
-def render_profiler_summary(metrics: NcuMetrics) -> str:
-    """Render NcuMetrics into a concise, prompt-friendly text block."""
+def render_profiler_summary(metrics: NcuMetrics | list[NcuMetrics]) -> str:
+    """Render NcuMetrics into a concise, prompt-friendly text block.
+
+    Accepts a single NcuMetrics or a list. When multiple kernels are provided,
+    each is labeled with its index and name so the LLM can reason about all of them.
+    """
+    if isinstance(metrics, NcuMetrics):
+        kernel_list = [metrics]
+    else:
+        kernel_list = metrics
+
+    all_lines: list[str] = []
+    multi = len(kernel_list) > 1
+
+    for idx, km in enumerate(kernel_list):
+        if multi:
+            label = km.kernel_name or f"kernel_{idx}"
+            # Truncate very long demangled names for readability
+            if len(label) > 80:
+                label = label[:77] + "..."
+            all_lines.append(f"[Kernel {idx}: {label}]")
+
+        lines = _render_single_kernel(km)
+        all_lines.extend(lines)
+
+        if multi and idx < len(kernel_list) - 1:
+            all_lines.append("")  # separator between kernels
+
+    return "\n".join(all_lines)
+
+
+def _render_single_kernel(metrics: NcuMetrics) -> list[str]:
+    """Render a single kernel's metrics."""
     lines: list[str] = []
 
-    # Determine if memory-bound or compute-bound
     mem_pct = metrics.memory_throughput_pct
     comp_pct = metrics.compute_throughput_pct
     bound_hint = ""
@@ -347,11 +390,26 @@ def render_profiler_summary(metrics: NcuMetrics) -> str:
         stalls_str = ", ".join(f"{name} ({val:.1%})" for name, val in metrics.top_stall_reasons)
         lines.append(f"- profiler_top_stalls: {stalls_str}")
 
-    return "\n".join(lines)
+    return lines
 
 
-def metrics_to_dict(metrics: NcuMetrics) -> dict[str, Any]:
-    """Convert NcuMetrics to a flat dict for EvalResult.profiler_metrics."""
+def metrics_to_dict(metrics: NcuMetrics | list[NcuMetrics]) -> dict[str, Any]:
+    """Convert NcuMetrics to a dict for EvalResult.profiler_metrics.
+
+    When multiple kernels are provided, the dict has:
+        {"kernels": [<per-kernel dict>, ...]}
+    When a single kernel is provided (backward compat), same format is used.
+    """
+    if isinstance(metrics, NcuMetrics):
+        kernel_list = [metrics]
+    else:
+        kernel_list = metrics
+
+    return {"kernels": [_single_metrics_to_dict(m) for m in kernel_list]}
+
+
+def _single_metrics_to_dict(metrics: NcuMetrics) -> dict[str, Any]:
+    """Convert a single NcuMetrics to a flat dict."""
     d: dict[str, Any] = {}
     if metrics.sm_occupancy_pct is not None:
         d["sm_occupancy_pct"] = round(metrics.sm_occupancy_pct, 2)
