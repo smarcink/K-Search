@@ -223,6 +223,16 @@ def diff(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
     return max_abs, mse, cos_sim
 
 
+def _try_set_params(module, ref_model: nn.Module) -> None:
+    """Pass reference model's conv weights/bias to a CUDA module via set_params()."""
+    for m in ref_model.modules():
+        if isinstance(m, nn.Conv2d):
+            w = m.weight.data
+            b = m.bias.data if m.bias is not None else torch.Tensor()
+            module.set_params(w, b)
+            return
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare optimized kernels against a reference model",
@@ -327,6 +337,9 @@ Examples:
                     kernel["kernel_h"], kernel["kernel_cu"], kernel["main_cpp"],
                     name=f"k{i}",
                 )
+                # If the module exposes set_params(), pass reference model weights
+                if hasattr(module, "set_params"):
+                    _try_set_params(module, model)
                 # Try run with just inputs first; if it fails, try with model params appended
                 try:
                     ms, out = benchmark_cuda_module(module, inputs, args.warmup, args.iters, device=device)
