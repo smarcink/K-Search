@@ -144,6 +144,8 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
                 solution_ref=name,
                 definition_name=self.name,
                 artifacts_dir=self._artifacts_dir,
+                target_hardware=self._cfg.gpu,
+                description=getattr(self, "_continue_from_description", None),
             )
             sol = solution_from_json_dict(d)
             if sol.definition != self.name:

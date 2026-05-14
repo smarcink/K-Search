@@ -340,14 +340,21 @@ def load_ksearch_solution_json(
     solution_ref: str,
     definition_name: str,
     artifacts_dir: str | None,
+    target_hardware: str | None = None,
+    description: str | None = None,
 ) -> dict[str, Any]:
     """
     Load a persisted k-search Solution JSON.
 
     `solution_ref` can be:
     - an absolute/relative path to a .json file, OR
+    - a directory containing kernel.h/kernel.cu/main.cpp (CUDA) or model_new.py (Triton), OR
     - a solution name, resolved under the k-search artifacts dir:
         <artifacts>/<task_name>/solutions/<definition_name>/<solution_name>.json
+
+    Extra kwargs (only used when solution_ref is a directory):
+      target_hardware: GPU target name (e.g. "H100", "RTX5090")
+      description: human-readable description of the initial kernel
     """
     ref = str(solution_ref or "").strip()
     if not ref:
@@ -357,6 +364,13 @@ def load_ksearch_solution_json(
     if p.suffix.lower() == ".json" and p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
 
+    # Directory with kernel source files → synthesize solution dict on the fly
+    if p.is_dir():
+        return _solution_dict_from_kernel_dir(
+            p, definition_name=definition_name,
+            target_hardware=target_hardware, description=description,
+        )
+
     from k_search.utils.paths import get_ksearch_artifacts_dir
 
     root = get_ksearch_artifacts_dir(base_dir=artifacts_dir, task_name=str(definition_name or "")).resolve()
@@ -364,6 +378,52 @@ def load_ksearch_solution_json(
     if not sol_path.exists():
         raise FileNotFoundError(f"Solution JSON not found: {sol_path}")
     return json.loads(sol_path.read_text(encoding="utf-8"))
+
+
+def _solution_dict_from_kernel_dir(
+    kernel_dir: Path,
+    definition_name: str,
+    target_hardware: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Build a Solution JSON dict from a directory with CUDA or Triton source files."""
+    kernel_dir = kernel_dir.resolve()
+    sources: list[dict[str, str]] = []
+    language = "triton"
+
+    # CUDA: kernel.h + kernel.cu + main.cpp
+    if (kernel_dir / "kernel.cu").exists() and (kernel_dir / "main.cpp").exists():
+        language = "cuda"
+        for fname in ("kernel.h", "kernel.cu", "main.cpp"):
+            fpath = kernel_dir / fname
+            if fpath.exists():
+                sources.append({"path": fname, "content": fpath.read_text()})
+    # Triton: model_new.py
+    elif (kernel_dir / "model_new.py").exists():
+        language = "triton"
+        sources.append({"path": "model_new.py", "content": (kernel_dir / "model_new.py").read_text()})
+    else:
+        raise FileNotFoundError(
+            f"Kernel directory '{kernel_dir}' must contain either "
+            f"(kernel.cu + main.cpp) for CUDA or (model_new.py) for Triton"
+        )
+
+    hw_list = [target_hardware] if target_hardware else []
+    sol_name = kernel_dir.name
+    desc = description or f"Initial kernel loaded from {kernel_dir}"
+
+    return {
+        "name": sol_name,
+        "definition": definition_name,
+        "author": "manual",
+        "description": desc,
+        "spec": {
+            "language": language,
+            "target_hardware": hw_list,
+            "entry_point": "main.cpp::run" if language == "cuda" else "model_new.py::ModelNew",
+        },
+        "sources": sources,
+    }
 
 
 def solution_from_json_dict(d: dict[str, Any]) -> Solution:

@@ -293,7 +293,10 @@ def main():
     parser.add_argument("--baseline-solution", default=None, help="Optional baseline solution name to compare against; if absent, 'vs_base' is omitted")
     parser.add_argument("--num-eval-workload", type=int, default=None, help="If set, evaluate only this many workloads per definition; default uses all workloads")
     # Continue optimization options
-    parser.add_argument("--continue-from-solution", default=None, help="Resume optimization from an existing solution name in the dataset")
+    parser.add_argument("--continue-from-solution", default=None,
+                        help="Resume optimization from an existing solution (name, .json path, or directory with kernel sources)")
+    parser.add_argument("--continue-from-description", default=None,
+                        help="Description for the initial kernel when --continue-from-solution is a directory")
     parser.add_argument(
         "--continue-from-world-model",
         default=None,
@@ -467,6 +470,10 @@ def main():
         )
     else:
         raise ValueError(f"Unsupported task_source: {task_source}")
+
+    # Attach optional continue-from description for directory-based solution loading
+    if hasattr(args, 'continue_from_description') and args.continue_from_description:
+        task._continue_from_description = args.continue_from_description
 
     generate_and_evaluate(
         task=task,
