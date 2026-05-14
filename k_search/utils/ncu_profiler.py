@@ -139,7 +139,6 @@ def run_ncu_profile(
         NCU_PATH,
         "--metrics", NCU_METRICS_STR,
         "--csv",
-        "--page", "raw",
         "--target-processes", "all",
     ]
 
