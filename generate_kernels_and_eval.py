@@ -317,6 +317,11 @@ def main():
         choices=["fp32", "fp16", "bf16"],
         help="dtype for cuda_kernel eval",
     )
+    parser.add_argument(
+        "--enable-ncu-profiling",
+        action="store_true",
+        help="Run NVIDIA Nsight Compute (ncu) profiling on passed kernels to collect hardware metrics for the LLM.",
+    )
 
     # Device Bench options (unified for CUDA / XPU / any accelerator)
     parser.add_argument("--device-bench-device", default=None,
@@ -352,6 +357,7 @@ def main():
             rtol=args.rtol,
             atol=args.atol,
             artifacts_dir=args.artifacts_dir,
+            enable_ncu_profiling=args.enable_ncu_profiling,
         )
     elif task_source == "device_bench":
         from k_search.tasks.device_bench_task import DeviceBenchTask

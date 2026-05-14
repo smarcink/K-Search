@@ -223,6 +223,25 @@ def _try_pass_params(module, model):
                 return
 
 
+def _run_profile_only(args):
+    """Profile-only mode: compile kernel, load ref model, run kernel once for ncu profiling."""
+    model, get_inputs_fn, dtype = load_reference(args.ref_path, args.precision)
+    module = compile_cuda_kernel(args.kernel_dir)
+    _try_pass_params(module, model)
+
+    # Generate inputs
+    inputs = get_inputs_fn()
+    inputs = [x.to(dtype=dtype, device="cuda") if isinstance(x, torch.Tensor) else x for x in inputs]
+
+    # Warmup (minimal — ncu will instrument the run call below)
+    module.run(*inputs)
+    torch.cuda.synchronize()
+
+    # Profiled run: ncu captures this kernel launch
+    module.run(*inputs)
+    torch.cuda.synchronize()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ref-path", required=True)
@@ -232,7 +251,16 @@ def main():
     parser.add_argument("--precision", default="fp16")
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--atol", type=float, default=1e-2)
+    parser.add_argument(
+        "--profile-only", action="store_true",
+        help="Compile and run kernel once for ncu profiling. No correctness/timing."
+    )
     args = parser.parse_args()
+
+    # --profile-only mode: compile, load, run once, exit
+    if args.profile_only:
+        _run_profile_only(args)
+        return
 
     result = {"compiled": False, "correct": False, "latency_ms": None, "ref_latency_ms": None, "error": ""}
 

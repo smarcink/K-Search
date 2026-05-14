@@ -30,6 +30,10 @@ class EvalResult:
     # Task-defined optional metrics. Generators should prefer methods below over raw fields.
     metrics: dict[str, Any] = field(default_factory=dict)
 
+    # Profiler metrics (populated when ncu profiling is enabled and kernel passes).
+    # Keys match NcuMetrics field names; empty dict when no profiling was performed.
+    profiler_metrics: dict[str, Any] = field(default_factory=dict)
+
     def to_dict(
         self,
         *,
@@ -160,7 +164,37 @@ class EvalResult:
                 lines.append(f"- {pre}score: {float(sc):.4f}")
         except Exception:
             pass
+        # Append profiler summary if available
+        profiler_lines = self.profiler_summary_lines()
+        if profiler_lines:
+            lines.extend(profiler_lines)
         return lines
+
+    def profiler_summary_lines(self) -> list[str]:
+        """Return rendered profiler summary lines, or empty list if no profiling data."""
+        if not self.profiler_metrics:
+            return []
+        try:
+            from k_search.utils.ncu_profiler import NcuMetrics, render_profiler_summary
+
+            # Reconstruct NcuMetrics from the flat dict
+            m = NcuMetrics(
+                sm_occupancy_pct=self.profiler_metrics.get("sm_occupancy_pct"),
+                compute_throughput_pct=self.profiler_metrics.get("compute_throughput_pct"),
+                memory_throughput_pct=self.profiler_metrics.get("memory_throughput_pct"),
+                l1_hit_rate_pct=self.profiler_metrics.get("l1_hit_rate_pct"),
+                l2_hit_rate_pct=self.profiler_metrics.get("l2_hit_rate_pct"),
+                achieved_bandwidth_gb_s=self.profiler_metrics.get("achieved_bandwidth_gb_s"),
+                tensor_core_utilization_pct=self.profiler_metrics.get("tensor_core_utilization_pct"),
+                registers_per_thread=self.profiler_metrics.get("registers_per_thread"),
+                shared_mem_per_block_bytes=self.profiler_metrics.get("shared_mem_per_block_bytes"),
+                top_stall_reasons=self.profiler_metrics.get("top_stall_reasons", []),
+                kernel_name=self.profiler_metrics.get("kernel_name", ""),
+            )
+            rendered = render_profiler_summary(m)
+            return rendered.splitlines() if rendered else []
+        except Exception:
+            return []
 
 
 class SupportedLanguages(str, Enum):

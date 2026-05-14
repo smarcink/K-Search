@@ -74,6 +74,7 @@ class CudaKernelTask:
         atol: float = 1e-2,
         artifacts_dir: str | None = None,
         name: str | None = None,
+        enable_ncu_profiling: bool = False,
     ) -> None:
         self._ref_path = str(Path(ref_path).resolve())
         if not Path(self._ref_path).exists():
@@ -90,6 +91,7 @@ class CudaKernelTask:
         )
         self._name = str(name or Path(self._ref_path).stem)
         self._artifacts_dir = str(artifacts_dir) if artifacts_dir else None
+        self._enable_ncu_profiling = bool(enable_ncu_profiling)
         self._solutions: dict[str, Solution] = {}
 
         # Feedback state for world-model prompts
@@ -274,7 +276,13 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
                 return EvalResult(status="failed", log_excerpt=excerpt)
 
             # Parse evaluator JSON output
-            return self._parse_eval_output(stdout)
+            eval_result = self._parse_eval_output(stdout)
+
+            # Run ncu profiling if enabled and kernel passed
+            if self._enable_ncu_profiling and eval_result.is_passed():
+                eval_result = self._run_ncu_profiling(eval_result, tmp_dir, env)
+
+            return eval_result
 
         except subprocess.TimeoutExpired:
             msg = f"Evaluation timed out after {self._cfg.timeout}s"
@@ -292,6 +300,35 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
             if tmp_dir:
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _run_ncu_profiling(self, eval_result: EvalResult, tmp_dir: str, env: dict) -> EvalResult:
+        """Run ncu profiling on a passed kernel and attach metrics to the EvalResult."""
+        try:
+            from k_search.utils.ncu_profiler import (
+                NCU_AVAILABLE,
+                metrics_to_dict,
+                run_ncu_profile,
+            )
+
+            if not NCU_AVAILABLE:
+                return eval_result
+
+            evaluator_path = Path(__file__).parent / "cuda_kernel_eval.py"
+            profile_cmd = [
+                sys.executable, str(evaluator_path),
+                "--ref-path", self._ref_path,
+                "--kernel-dir", tmp_dir,
+                "--precision", self._cfg.precision,
+                "--profile-only",
+            ]
+
+            ncu_metrics = run_ncu_profile(profile_cmd, timeout=120)
+            if ncu_metrics is not None:
+                eval_result.profiler_metrics = metrics_to_dict(ncu_metrics)
+        except Exception:
+            # Profiling is best-effort; never fail the eval
+            pass
+        return eval_result
 
     def _parse_eval_output(self, stdout: str) -> EvalResult:
         """Parse JSON output from cuda_kernel_eval.py."""

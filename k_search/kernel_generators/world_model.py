@@ -1493,6 +1493,11 @@ def merge_computed_signals(
                 t["speedup_factor"] = float(eval_result.speedup_factor)
             except Exception:
                 pass
+        if eval_result.profiler_metrics:
+            try:
+                t["profiler"] = dict(eval_result.profiler_metrics)
+            except Exception:
+                pass
 
     try:
         return json.dumps(base_obj, indent=2, sort_keys=True)
