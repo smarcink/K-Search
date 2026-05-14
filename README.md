@@ -24,10 +24,9 @@
 
 ## Features
 
-- ⚡ **Multi-Backend Task System** — Pluggable task backends for different kernel benchmarking ecosystems:
-  - [**FlashInfer-Bench**](https://bench.flashinfer.ai/) — MLA decode, GQA decode, MLA prefill, MoE kernels with full workload suites
-  - [**GPUMode**](https://www.gpumode.com/home) — Competition tasks (e.g., TriMul) with leaderboard evaluation
-  - [**KernelBench**](https://github.com/ScalingIntelligence/KernelBench) — PyTorch kernel optimization with 4 difficulty levels and 200+ problems
+- ⚡ **Task Backends** — Two focused backends for kernel optimization:
+  - **cuda_kernel** — Multi-file CUDA kernel optimization (kernel.h / kernel.cu / main.cpp)
+  - **device_bench** — Triton kernel optimization on NVIDIA CUDA and Intel XPU
 
 - 📊 **W&B Integration** — Full Weights & Biases logging with per-round score tracking, generated code artifacts, and world model snapshots.
 
@@ -51,16 +50,13 @@ k_search/
 │   └── world_model_prompts.py          # World-model-injected prompt templates
 ├── tasks/
 │   ├── task_base.py                    # Task protocol, Solution, EvalResult types
-│   ├── flashinfer_bench_task.py        # FlashInfer-Bench task adapter
-│   ├── gpu_mode_task.py                # GPUMode TriMul task adapter
-│   ├── kernelbench_task.py             # KernelBench task adapter
-│   ├── flashinfer_bench/               # FlashInfer-specific prompts
-│   ├── gpu_mode/                       # GPUMode evaluator, spec, utilities
-│   │   ├── evaluator.py
-│   │   ├── trimul/                     # Vendored TriMul problem (spec, eval, reference)
-│   │   └── libkernelbot/              # Kernel evaluation harness
-│   └── kernelbench/                    # KernelBench evaluation harness
-│       └── run_and_check.py            # KernelBench evaluator (local/modal)
+│   ├── prompts.py                      # Shared prompt blocks (CUDA XML format, etc.)
+│   ├── cuda_kernel_task.py             # Multi-file CUDA kernel task
+│   ├── cuda_kernel_eval.py             # CUDA kernel evaluator subprocess
+│   ├── device_bench_task.py            # Unified device bench (CUDA/XPU Triton)
+│   ├── device_bench/                   # Device bench evaluator
+│   ├── cuda_bench/                     # CUDA bench evaluator
+│   └── xpu_bench/                      # XPU bench evaluator
 └── utils/
     ├── paths.py                        # Artifact directory management
     └── solution_db.py                  # Solution database (JSONL persistence)
@@ -82,109 +78,59 @@ cd K-Search
 
 # Install dependencies
 uv pip install openai wandb
-uv pip install git+https://github.com/caoshiyi/flashinfer-bench-ksearch.git
 ```
 
-We provide ready-to-use launch scripts under `scripts/` for both tasks. Before running, open the script and set the following variables at the top:
+### CUDA Kernel Optimization
 
-- `KSEARCH_ROOT` — Path to this repo
-- `API_KEY` — Your OpenAI-compatible API key
-- `WANDB_API_KEY` — Your Weights & Biases API key
-
-### GPUMode TriMul
-
-Edit `scripts/gpumode_trimul_wm.sh` to set the required variables, then run:
+Optimize a PyTorch reference model with multi-file CUDA kernels:
 
 ```bash
-bash scripts/gpumode_trimul_wm.sh
+python generate_kernels_and_eval.py \
+  --task-source cuda_kernel \
+  --task-path path/to/reference.py \
+  --model-name gpt-5.2 \
+  --language cuda \
+  --target-gpu H100 \
+  --max-opt-rounds 20 \
+  --world-model \
+  --save-solutions
 ```
 
-Key variables you can customize (see the script header for the full list):
+### Device Bench (Triton on NVIDIA / Intel XPU)
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `KSEARCH_ROOT` | Path to K-Search repo | — |
-| `API_KEY` | OpenAI-compatible API key | — |
-| `WANDB_API_KEY` | W&B API key | — |
-| `MODEL_NAME` | LLM model identifier | `gpt-5.2` |
-| `BASE_URL` | OpenAI-compatible API base URL | `https://us.api.openai.com/v1` |
-| `LANGUAGE` | Target language (`triton`, `cuda`) | `triton` |
-| `MAX_OPT_ROUNDS` | Maximum optimization rounds | `300` |
-
-### FlashInfer-Bench
-
-First, download the [FlashInfer Trace](https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace) dataset:
+Optimize a PyTorch reference model with Triton kernels on any accelerator:
 
 ```bash
-# Requires git-lfs
-git lfs install
-git clone https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace
+# NVIDIA CUDA
+python generate_kernels_and_eval.py \
+  --task-source device_bench \
+  --task-path path/to/reference.py \
+  --device-bench-device cuda:0 \
+  --model-name gpt-5.2 \
+  --language triton \
+  --target-gpu H100 \
+  --max-opt-rounds 20 \
+  --world-model \
+  --save-solutions
+
+# Intel XPU
+python generate_kernels_and_eval.py \
+  --task-source device_bench \
+  --task-path path/to/reference.py \
+  --device-bench-device xpu:0 \
+  --model-name gpt-5.2 \
+  --language triton \
+  --max-opt-rounds 20 \
+  --world-model \
+  --save-solutions
 ```
-
-Then edit `scripts/mla_decode_wm.sh` to set the required variables (including `DATASET_ROOT` pointing to the downloaded dataset), and run:
-
-```bash
-bash scripts/mla_decode_wm.sh
-```
-
-Key variables you can customize (see the script header for the full list):
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `KSEARCH_ROOT` | Path to K-Search repo | — |
-| `DATASET_ROOT` | Path to downloaded `flashinfer-trace` dataset | — |
-| `API_KEY` | OpenAI-compatible API key | — |
-| `WANDB_API_KEY` | W&B API key | — |
-| `MODEL_NAME` | LLM model identifier | `gemini-3-pro-preview` |
-| `BASE_URL` | OpenAI-compatible API base URL | Gemini endpoint |
-| `DEFINITION` | Target kernel definition | `mla_paged_decode_h16_ckv512_kpe64_ps1` |
-| `LANGUAGE` | Target language (`triton`, `cuda`) | `cuda` |
-| `MAX_OPT_ROUNDS` | Maximum optimization rounds | `20` |
-
-### KernelBench
-
-First, install the KernelBench library with GPU support:
-
-```bash
-uv pip install "kernelbench[gpu] @ git+https://github.com/ScalingIntelligence/KernelBench.git"
-```
-
-Edit `scripts/kernelbench_wm.sh` to set the required variables, then run:
-
-```bash
-bash scripts/kernelbench_wm.sh
-```
-
-This script can be used with any of the kernels in the [KernelBench dataset](https://huggingface.co/datasets/ScalingIntelligence/KernelBench). Key variables you can customize (see the script header for the full list):
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `KSEARCH_ROOT` | Path to K-Search repo | `.` |
-| `API_KEY` | OpenAI-compatible API key | — |
-| `WANDB_API_KEY` | W&B API key | — |
-| `MODEL_NAME` | LLM model identifier | `gpt-5.2` |
-| `BASE_URL` | OpenAI-compatible API base URL | `https://api.openai.com/v1` |
-| `LEVEL` | KernelBench difficulty level (1-4) | `1` |
-| `PROBLEM_ID` | Problem ID within the level | `1` |
-| `EVAL_MODE` | Evaluation mode (`local` or `modal`) | `local` |
-| `TARGET_GPU` | Target GPU (e.g., `H100`, `A100-80GB`) | `H100` |
-| `LANGUAGE` | Target language (`cuda` or `triton`) | `triton` |
-| `MAX_OPT_ROUNDS` | Maximum optimization rounds | `50` |
-| `ARTIFACTS_DIR` | Base output directory | `.ksearch-output-kernelbench` |
-| `NUM_CORRECT_TRIALS` | Number of correctness validation trials | `5` |
-| `NUM_PERF_TRIALS` | Number of performance measurement trials | `100` |
-
-**Evaluation Modes:**
-
-- **Local**: Runs evaluation on your local GPU (requires CUDA-capable GPU)
-- **Modal**: Runs evaluation on cloud GPUs via [Modal](https://modal.com/) (requires Modal account)
 
 ## CLI Reference
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--task-source` | Task backend (`flashinfer`, `gpumode`, or `kernelbench`) | `flashinfer` |
-| `--definition` | Target kernel definition name | — |
+| `--task-source` | Task backend (`cuda_kernel`, `device_bench`, `xpu_bench`, `cuda_bench`) | `cuda_kernel` |
+| `--task-path` | Path to reference .py file with Model class | *required* |
 | `--model-name` | LLM model identifier | *required* |
 | `--base-url` | OpenAI-compatible API base URL | OpenAI default |
 | `--language` | Target language (`triton`, `cuda`) | `triton` |
@@ -198,24 +144,13 @@ This script can be used with any of the kernels in the [KernelBench dataset](htt
 | `--save-solutions` | Persist generated solutions to disk | off |
 | `--artifacts-dir` | Base directory for all K-Search artifacts | `.ksearch` |
 | `--wandb` | Enable Weights & Biases logging | off |
-| `--wandb-project` | W&B project name | `flashinfer-bench` |
-| `--run-name` | W&B run name | auto-generated |
-| `--kernelbench-level` | KernelBench difficulty level (1-4) | `1` |
-| `--kernelbench-problem-id` | KernelBench problem ID | `1` |
-| `--kernelbench-eval-mode` | KernelBench evaluation mode (`local` or `modal`) | `local` |
-| `--kernelbench-num-correct-trials` | Number of correctness trials | `5` |
-| `--kernelbench-num-perf-trials` | Number of performance trials | `100` |
-
-## Baselines
-
-K-Search includes adapter configurations for comparison with existing evolutionary kernel optimization systems:
-
-| System | Directory | Description |
-|--------|-----------|-------------|
-| **OpenEvolve** | `baselines/openevolve/` | Google's evolutionary code optimization framework |
-| **ShinkaEvolve** | `baselines/shinkaevolve/` | Evolutionary search with FlashInfer evaluator integration |
-
-Both baselines are configured for the same kernel targets (MLA decode, GQA decode, MLA prefill, MoE) to enable direct comparison.
+| `--cuda-kernel-num-correct-trials` | Number of correctness trials (cuda_kernel) | `5` |
+| `--cuda-kernel-num-perf-trials` | Number of performance trials (cuda_kernel) | `100` |
+| `--cuda-kernel-precision` | dtype for cuda_kernel eval | `fp16` |
+| `--device-bench-device` | Device string (e.g. `cuda:0`, `xpu:0`) | auto |
+| `--device-bench-precision` | dtype for device_bench eval | `fp16` |
+| `--device-bench-num-correct-trials` | Number of correctness trials (device_bench) | `5` |
+| `--device-bench-num-perf-trials` | Number of performance trials (device_bench) | `100` |
 
 ## Results
 

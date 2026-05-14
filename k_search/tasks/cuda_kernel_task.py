@@ -132,7 +132,7 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
 """
 
     def get_code_format_text(self, *, language: str, target_gpu: str) -> str:
-        from k_search.tasks.flashinfer_bench.prompts import _cuda_xml_and_guidelines_block
+        from k_search.tasks.prompts import _cuda_xml_and_guidelines_block
         return _cuda_xml_and_guidelines_block(target_gpu=str(target_gpu or self._cfg.gpu)).strip()
 
     def get_solution(self, solution_name: str) -> Solution | None:

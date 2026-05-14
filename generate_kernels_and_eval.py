@@ -240,18 +240,16 @@ def generate_and_evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate kernels with GPT/Gemini (OpenAI-compatible) and evaluate via task backends.")
-    parser.add_argument("--local", required=False, default=None, help="Path to flashinfer-trace dataset root (flashinfer only)")
     parser.add_argument(
         "--task-source",
-        choices=["flashinfer", "gpumode", "kernelbench", "cuda_kernel", "device_bench", "xpu_bench", "cuda_bench"],
-        default="flashinfer",
-        help="Task backend to use. 'xpu_bench' and 'cuda_bench' are aliases for 'device_bench'.",
+        choices=["cuda_kernel", "device_bench"],
+        default="cuda_kernel",
+        help="Task backend to use. 'cuda_kernel' for multi-file CUDA kernels, 'device_bench' for Triton on CUDA/XPU.",
     )
     parser.add_argument(
         "--task-path",
         default=None,
-        help="Task source path/identifier. For --task-source=flashinfer, this is the dataset root path. "
-             "For --task-source=kernelbench, this is a local .py file with Model class to optimize (bypasses HuggingFace dataset).",
+        help="Path to reference .py file with Model class to optimize.",
     )
     parser.add_argument("--definition", default=None, help="Single definition name to target (required)")
     parser.add_argument("--model-name", required=True, help="LLM model name (e.g., gpt-4.1, gpt-5, gemini-2.5-pro via OpenAI-compatible endpoint, or claude-opus-4-6/claude-4-6-opus via Anthropic-compatible endpoint)")
@@ -262,23 +260,8 @@ def main():
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
 
     # Benchmark configuration
-    parser.add_argument("--warmup-runs", type=int, default=10)
-    parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--num-trials", type=int, default=1)
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--atol", type=float, default=1e-2)
-    parser.add_argument("--use-isolated-runner", action="store_true")
-    parser.add_argument(
-        "--parallel-workloads",
-        action="store_true",
-        help="Enable workload-parallel scheduling in Benchmark (useful when evaluating only a small number of solutions).",
-    )
-    parser.add_argument(
-        "--max-parallel-workloads",
-        type=int,
-        default=0,
-        help="Max concurrent workloads when --parallel-workloads is enabled (0 = auto based on visible CUDA devices).",
-    )
     parser.add_argument("--no-save-results", action="store_true", help="Do not write traces to dataset")
     parser.add_argument(
         "--save-solutions",
@@ -290,7 +273,6 @@ def main():
         default=".ksearch",
         help="Base directory for k-search artifacts (solutions, world model snapshots, eval reports).",
     )
-    parser.add_argument("--baseline-solution", default=None, help="Optional baseline solution name to compare against; if absent, 'vs_base' is omitted")
     parser.add_argument("--num-eval-workload", type=int, default=None, help="If set, evaluate only this many workloads per definition; default uses all workloads")
     # Continue optimization options
     parser.add_argument("--continue-from-solution", default=None,
@@ -305,9 +287,7 @@ def main():
             "Use 'auto' to load <artifacts>/<task>/world_model/world_model.json if present."
         ),
     )
-    parser.add_argument("--feedback-workloads", nargs="+", default=None, help="Explicit workload UUIDs to use for optimization feedback rounds")
-    # Nsight Compute
-    parser.add_argument("--feedback-trace-policy", default="first", choices=["first", "random"], help="Policy for selecting feedback traces")
+
     parser.add_argument(
         "--world-model",
         action="store_true",
@@ -330,22 +310,14 @@ def main():
     parser.add_argument("--wandb-project", default=os.getenv("WANDB_PROJECT"), help="W&B project")
     parser.add_argument("--run-name", default=os.getenv("RUN_NAME"), help="W&B run name")
 
-    # GPUMode options
-    parser.add_argument("--gpumode-mode", default="benchmark", help="GPUMode eval mode (e.g., benchmark/test/leaderboard/profile)")
-    parser.add_argument("--gpumode-keep-tmp", action="store_true", help="Keep GPUMode temp working dir for debugging")
-    parser.add_argument("--gpumode-task-dir", default=None, help="Override GPUMode task dir (defaults to vendored trimul task)")
-
-    # KernelBench options
-    parser.add_argument("--kernelbench-level", type=int, default=1, help="KernelBench level (1, 2, or 3)")
-    parser.add_argument("--kernelbench-problem-id", type=int, default=1, help="Problem ID within the level")
-    parser.add_argument("--kernelbench-eval-mode", default="local", choices=["local", "modal"], help="Evaluation mode")
-    parser.add_argument("--kernelbench-num-correct-trials", type=int, default=5, help="Number of correctness trials")
-    parser.add_argument("--kernelbench-num-perf-trials", type=int, default=1000, help="Number of performance trials")
+    # CUDA Kernel options
+    parser.add_argument("--cuda-kernel-num-correct-trials", type=int, default=5, help="Number of correctness trials (cuda_kernel task)")
+    parser.add_argument("--cuda-kernel-num-perf-trials", type=int, default=100, help="Number of performance trials (cuda_kernel task)")
     parser.add_argument(
-        "--kernelbench-precision",
-        default="fp32",
+        "--cuda-kernel-precision",
+        default="fp16",
         choices=["fp32", "fp16", "bf16"],
-        help="dtype for KernelBench eval (model+inputs are cast to this; allclose tolerance is 1e-4 for fp32, 1e-2 for fp16/bf16)",
+        help="dtype for cuda_kernel eval",
     )
 
     # Device Bench options (unified for CUDA / XPU / any accelerator)
@@ -359,15 +331,6 @@ def main():
     )
     parser.add_argument("--device-bench-num-correct-trials", type=int, default=5, help="Number of correctness trials")
     parser.add_argument("--device-bench-num-perf-trials", type=int, default=100, help="Number of performance trials")
-    # Legacy aliases (mapped to --device-bench-* internally)
-    parser.add_argument("--xpu-bench-device", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--xpu-bench-precision", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--xpu-bench-num-correct-trials", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--xpu-bench-num-perf-trials", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--cuda-bench-device", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--cuda-bench-precision", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--cuda-bench-num-correct-trials", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--cuda-bench-num-perf-trials", type=int, default=None, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -375,59 +338,9 @@ def main():
     if not api_key:
         raise ValueError("API key is required (pass --api-key or set LLM_API_KEY)")
 
-    task_source = str(args.task_source or "flashinfer")
-    task_path = str(args.task_path or (args.local or ""))
-    if task_source == "flashinfer":
-        from k_search.tasks.flashinfer_bench_task import FlashInferBenchTask
-
-        if not task_path:
-            raise ValueError("--local or --task-path is required for --task-source=flashinfer")
-        if not args.definition:
-            raise ValueError("--definition is required")
-        def_name = str(args.definition)
-
-        task = FlashInferBenchTask.from_cli_args(
-            task_path=task_path,
-            definition_name=str(def_name),
-            warmup_runs=args.warmup_runs,
-            iterations=args.iterations,
-            num_trials=args.num_trials,
-            rtol=args.rtol,
-            atol=args.atol,
-            use_isolated_runner=args.use_isolated_runner,
-            parallel_workloads=args.parallel_workloads,
-            max_parallel_workloads=args.max_parallel_workloads,
-            baseline_solution=args.baseline_solution,
-            feedback_workloads=args.feedback_workloads,
-            feedback_trace_policy=args.feedback_trace_policy,
-            num_feedback_workloads=5,
-            artifacts_dir=args.artifacts_dir,
-        )
-    elif task_source == "gpumode":
-        from k_search.tasks.gpu_mode_task import GpuModeTriMulTask
-
-        task = GpuModeTriMulTask(
-            mode=str(args.gpumode_mode or "benchmark"),
-            keep_tmp=bool(args.gpumode_keep_tmp),
-            task_dir=(str(args.gpumode_task_dir) if args.gpumode_task_dir else None),
-            artifacts_dir=args.artifacts_dir,
-        )
-    elif task_source == "kernelbench":
-        from k_search.tasks.kernelbench_task import KernelBenchTask
-
-        task = KernelBenchTask(
-            level=args.kernelbench_level,
-            problem_id=args.kernelbench_problem_id,
-            eval_mode=args.kernelbench_eval_mode,
-            gpu=args.target_gpu,
-            num_correct_trials=args.kernelbench_num_correct_trials,
-            num_perf_trials=args.kernelbench_num_perf_trials,
-            artifacts_dir=args.artifacts_dir,
-            backend=args.language,  # Pass language as KernelBench evaluation backend
-            precision=args.kernelbench_precision,
-            local_ref_path=args.task_path,
-        )
-    elif task_source == "cuda_kernel":
+    task_source = str(args.task_source or "cuda_kernel")
+    task_path = str(args.task_path or "")
+    if task_source == "cuda_kernel":
         from k_search.tasks.cuda_kernel_task import CudaKernelTask
 
         if not task_path:
@@ -435,37 +348,25 @@ def main():
         task = CudaKernelTask(
             ref_path=task_path,
             gpu=args.target_gpu,
-            num_correct_trials=args.kernelbench_num_correct_trials,
-            num_perf_trials=args.kernelbench_num_perf_trials,
-            precision=args.kernelbench_precision,
+            num_correct_trials=args.cuda_kernel_num_correct_trials,
+            num_perf_trials=args.cuda_kernel_num_perf_trials,
+            precision=args.cuda_kernel_precision,
             rtol=args.rtol,
             atol=args.atol,
             artifacts_dir=args.artifacts_dir,
         )
-    elif task_source in ("device_bench", "xpu_bench", "cuda_bench"):
+    elif task_source == "device_bench":
         from k_search.tasks.device_bench_task import DeviceBenchTask
 
         if not task_path:
-            raise ValueError(f"--task-path is required for --task-source={task_source} (path to reference .py file with Model class)")
-
-        # Resolve device: explicit --device-bench-device > legacy --xpu/cuda-bench-device > alias default
-        _alias_defaults = {"xpu_bench": "xpu:0", "cuda_bench": "cuda:0", "device_bench": "cuda:0"}
-        _device = (
-            args.device_bench_device
-            or args.xpu_bench_device
-            or args.cuda_bench_device
-            or _alias_defaults[task_source]
-        )
-        _precision = args.device_bench_precision or args.xpu_bench_precision or args.cuda_bench_precision or "fp16"
-        _correct = args.device_bench_num_correct_trials or args.xpu_bench_num_correct_trials or args.cuda_bench_num_correct_trials or 5
-        _perf = args.device_bench_num_perf_trials or args.xpu_bench_num_perf_trials or args.cuda_bench_num_perf_trials or 100
+            raise ValueError("--task-path is required for --task-source=device_bench (path to reference .py file with Model class)")
 
         task = DeviceBenchTask(
             ref_path=task_path,
-            device=_device,
-            precision=_precision,
-            num_correct_trials=_correct,
-            num_perf_trials=_perf,
+            device=args.device_bench_device or "cuda:0",
+            precision=args.device_bench_precision,
+            num_correct_trials=args.device_bench_num_correct_trials,
+            num_perf_trials=args.device_bench_num_perf_trials,
             artifacts_dir=args.artifacts_dir,
         )
     else:
