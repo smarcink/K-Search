@@ -1,0 +1,348 @@
+{
+  "computed_signals": {
+    "round_index": 26,
+    "trace": {
+      "latency_ms": 0.6732800006866455,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 4.499199867248535,
+      "speedup_factor": 6.682509301716998,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n_full_fusion",
+    "nodes": [
+      {
+        "action": {
+          "description": "Root analysis node",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "Initial world model",
+          "score_0_to_1": 0.0,
+          "title": "root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.4,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): high BW HBM-class GDDR7, large L2, abundant SMs, fp16 tensor cores available but problem is small fp16 conv with C_in=16, C_out=32, so MMA is overkill; plain CUDA cores with vectorized fp16 likely sufficient.",
+            "notes": "Conv 3x3 with 16->32 channels: 16*32*9 = 4608 MACs per output element times 32*720*1280 outputs (before pool) ~= 1.36e10 MACs. After pool, output is 32x360x640. AvgPool reduces 4 spatial inputs per output. Arithmetic intensity moderate; mostly memory-bound for activations.",
+            "rating_0_to_10": 6.0,
+            "risk": "fp16 accumulation precision; need fp32 accumulate"
+          },
+          "memory_bandwidth": {
+            "notes": "Input: 1*16*720*1280*2B = ~29.5 MB. Weights: 32*16*9*2B = 9 KB (fits in shared/registers easily). Output: 32*360*640*2B = ~14.7 MB. Fusing conv+relu+avgpool avoids writing intermediate ~58 MB conv output to global mem -- major win.",
+            "rating_0_to_10": 9.0,
+            "risk": "Halo / boundary handling for 3x3 conv with padding=1; multiple reads of input rows."
+          },
+          "register_pressure": {
+            "notes": "If each thread computes a 2x2 output block (one pooled output = 2x2 conv outputs), it needs 32 fp32 accumulators across out channels per pooled point -> too many. Better: each block/warp produces tile of pooled outputs for subset of out channels.",
+            "rating_0_to_10": 6.0,
+            "risk": "Splitting C_out across blocks reduces fusion benefit only marginally because input is reread per group."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: dense stencil (3x3 conv) + elementwise (ReLU) + pooling reduction (2x2 avg). All fusable. 2) Math: y[oc,oh,ow] = avg_{i,j in 2x2}( relu( sum_{ic,kh,kw} x[ic, 2oh+i+kh-1, 2ow+j+kw-1]*W[oc,ic,kh,kw] + b[oc] ) ). Output shape: 1x32x360x640 fp16. 3) Layout: NCHW fp16 contiguous; input 1x16x720x1280, weights 32x16x3x3 small, fits in shared/constant. 4) Regimes: (a) memory-bound activation streaming - dominant; (b) compute-bound if poor reuse; (c) latency-bound if too few blocks. 5) Knobs: tile size (output tile in pooled space), C_out blocking, vectorization (half2/float4), shared mem for input halo tile, register accumulators, fp32 accumulate. 6) Skeleton: each block handles tile of pooled outputs (e.g., 16x16 pooled = 32x32 conv outputs needing 34x34 halo) for ALL 32 out channels; load input halo per ic into shared, accumulate into 32 fp32 register accums per thread-output; ReLU; 2x2 average; write fp16 out. 7) Families: (F1) FULL FUSION single kernel: shared-mem tile + register accumulators over all 32 oc \u2014 TOP CHOICE since weights (9KB) fit. (F2) Two-stage conv-fused-relu then pool \u2014 wastes BW. (F3) im2col+GEMM \u2014 overkill for 16->32. SELF_CHECK: F1 chosen. Working set fits: weights 4608 fp16=9KB constant; halo tile e.g., 16ic*34*34*2B = ~37KB shared (feasible per SM).",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "init"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single fused CUDA kernel: each block produces a tile of pooled outputs (e.g., 16x16 pooled = 32x32 conv outputs) for all 32 output channels. Load input halo tile (16 in-channels, 34x34) into shared memory in stages; each thread holds per-oc fp32 accumulators for its 2x2 conv-output sub-tile, applies ReLU, averages over 2x2 to produce one pooled fp16 output per oc. Weights stored in constant or shared memory. Uses fp32 accumulation, fp16 I/O.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 6.68,
+          "rationale": "Avoids writing the 58MB conv intermediate to global memory; reuses halo via shared memory across 3x3 stencil; weights tiny and reused fully.",
+          "score_0_to_1": 0.9,
+          "title": "Full-fusion tiled kernel (conv+ReLU+avgpool) with shared-mem halo"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 ample shared memory per SM (>100KB); fp16 vector loads (half2) align well with C_in=16.",
+            "notes": "Reuses 4x4 patch for 4 pooled outputs; weights in constant memory; good FMA density.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Conv intermediate kept in registers; only input read and pooled output written.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "32 OC * 4 floats per thread = 128 regs/thread of accumulators; launch_bounds(128,4) constrains occupancy.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion",
+        "node_type": "decision",
+        "notes": "CURRENT: does= single fused kernel computes 2x2 pooled tile over all 32 OC by reading 16 IC halo tiles into smem (double-buffered) and accumulating 4 conv outputs per thread in registers, then bias+ReLU+avgpool. bottleneck= compute/register pressure (high reg usage limits occupancy; fp32 math on fp16 data). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 6.68x speedup confirms the fusion + smem-halo approach is excellent; next bet= push toward tensor-core mma (HMMA) or warp-level cooperative reduction to exploit fp16 compute, and/or reduce register pressure by blocking OC.",
+        "overall_rating_0_to_10": 9.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.6732800006866455,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "reference_latency_ms": 4.499199867248535,
+            "speedup_factor": 6.682509301716998,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "d3fafdef8d0ee592644b1da622a0e4e4f727017e"
+        }
+      },
+      {
+        "action": {
+          "description": "Each block produces a pooled output tile for a SUBSET of output channels (e.g., 8 or 16 oc per block). Reduces register pressure and allows higher thread occupancy. Input halo is loaded once per block and reused across the oc subset.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.8,
+          "rationale": "Trades a small amount of input re-read (halo loaded for multiple oc-groups) for much better register pressure and occupancy.",
+          "score_0_to_1": 0.35,
+          "title": "Fused kernel with output-channel blocking"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Better occupancy on Blackwell SMs; weights subset fits in shared trivially.",
+            "notes": "Slightly more BW than full-oc fusion but typically faster due to occupancy.",
+            "rating_0_to_10": 8.0,
+            "risk": "Need to pick oc-block size carefully (8,16,32)."
+          },
+          "memory_bandwidth": {
+            "notes": "Input read ~ceil(32/oc_block) times instead of once; for oc_block=16, only 2x; for 32, 1x.",
+            "rating_0_to_10": 7.0,
+            "risk": "Extra input traffic if oc_block too small."
+          },
+          "register_pressure": {
+            "notes": "Lower per-thread accum count -> better occupancy.",
+            "rating_0_to_10": 8.0,
+            "risk": "Minor."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_oc_block",
+        "node_type": "decision",
+        "notes": "Downscored: redundant with new child n_full_fusion_oc_block which composes OC-blocking onto the already-winning fused kernel. Prefer the child.",
+        "overall_rating_0_to_10": 4.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Fused kernel where each thread directly produces ONE pooled output (one (oh_p, ow_p, oc) point) by reading the 4x4 conv-input footprint (2x2 pooled stride x 3x3 kernel with overlap = effective 4x4 input window) without using shared memory \u2014 relying instead on L1/L2 cache for halo reuse across neighboring threads. Weights placed in constant memory.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.4,
+          "rationale": "Simplest implementation; small C_in=16 means each thread does 16*9*4=576 FMAs (or 16*16 with shared 2x2 conv outputs reuse). Useful as a baseline and possibly competitive due to good L1/L2 cache behavior on RTX5090.",
+          "score_0_to_1": 0.25,
+          "title": "Cache-only fused kernel (no shared mem) per-pooled-output threads"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 has large L1/L2; small footprint per thread maps well.",
+            "notes": "Simple; no shared mem coordination.",
+            "rating_0_to_10": 6.0,
+            "risk": "May redundantly load input across threads."
+          },
+          "memory_bandwidth": {
+            "notes": "Relies on L2 to amortize halo reuse; expected input BW ~2-3x optimal.",
+            "rating_0_to_10": 6.0,
+            "risk": "If L2 thrashing occurs, regress."
+          },
+          "register_pressure": {
+            "notes": "Very low: one accumulator per thread.",
+            "rating_0_to_10": 9.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_no_smem",
+        "node_type": "decision",
+        "notes": "Downscored: smem-halo fusion already at 6.68x; removing smem likely regresses due to repeated halo reads.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 10.0,
+          "rationale": "",
+          "score_0_to_1": 0.75,
+          "title": "Use WMMA/MMA tensor cores for fp16 conv accumulation in fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.45,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "RTX5090 tensor cores can dramatically accelerate fp16 GEMM; needs careful im2col layout in smem.",
+            "rating_0_to_10": 9.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Same I/O footprint as parent.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Fragments replace per-thread accumulators.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion_mma",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n_full_fusion (not a sibling alternative). Replaces scalar fp32 FMA inner loop with wmma m16n16k16 on fp16 to use tensor cores; im2col-like staging in smem still uses the existing halo strategy. Mutually exclusive with n_full_fusion_oc_block since both restructure the same inner accumulation differently.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "d3fafdef8d0ee592644b1da622a0e4e4f727017e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 8.0,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "OC-block the fused kernel to reduce register pressure and raise occupancy"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Better latency hiding via higher occupancy.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "May re-read input per OC chunk unless smem persists across chunks.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "4x reduction in accumulator regs improves occupancy.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion_oc_block",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n_full_fusion; mutually exclusive with n_full_fusion_mma because both alter inner accumulation layout. Process OC in chunks of 8 or 16 instead of all 32, lowering per-thread regs (32->8 accumulators of 4 floats) and enabling more blocks/SM. Reload halo per OC chunk OR sweep IC inner / OC outer with smem persistence.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "d3fafdef8d0ee592644b1da622a0e4e4f727017e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 7.5,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Vectorize smem loads/stores with __half2/float4 and unroll IC pipeline"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Deeper IC pipeline hides smem latency.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Wider loads improve effective bandwidth.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Minor change.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion_vec_io",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n_full_fusion; orthogonal to mma/oc_block in intent but listed as alternative low-risk refinement. Use half2 vector ldg into smem (SMEM_W likely even), prefetch 2 IC ahead, and convert patch to half2 to halve smem reads. Cheap, low-risk incremental improvement.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "d3fafdef8d0ee592644b1da622a0e4e4f727017e",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fuse Conv2d(3x3, pad=1, stride=1) + ReLU + AvgPool2d(2x2) on fp16 NCHW input 1x16x720x1280 producing fp16 1x32x360x640. Weights are tiny (32x16x3x3 = 9KB fp16) and fully cacheable in constant/shared memory. The reference's main waste is the 58MB intermediate conv output written to global memory; full fusion into one kernel removes that traffic, making the problem activation-bandwidth bound. Key constraints: fp16 input/output with fp32 accumulation for accuracy (rtol=atol=0.01), padding=1 boundary handling, halo overlap of 3x3 stencil with 2x2 pooling (each pooled output depends on a 4x4 input window per in-channel after combining stride-1 conv + stride-2 pool). RTX5090 (Blackwell) offers plentiful shared memory, large L2, and high BW which favors a tiled fused kernel.",
+  "open_questions": [
+    "What is the reference kernel's actual measured latency, and is it already fused or does it write intermediates?",
+    "Is fp16 input dtype actually fp16 or fp32? get_inputs() shows fp16 but model.half() confirms \u2014 output dtype expected fp16.",
+    "Optimal output tile size in pooled space (8x8 vs 16x16 vs 32x8) for halo reuse vs occupancy trade-off on RTX5090?",
+    "Should weights live in __constant__ memory, shared memory, or be broadcast via __ldg from global?",
+    "Does Blackwell benefit from cp.async for halo loading at this small per-block working-set size?",
+    "Can we use half2 vectorized loads for C_in=16 (=8 half2) to halve load instructions?",
+    "Is per-thread oc-blocking better (each thread holds K oc accumulators) or per-block oc-blocking (each block handles oc subset)?",
+    "Boundary tiles (right/bottom edges of 1280x720): does branch divergence on padding meaningfully hurt, or should boundary tiles use a separate kernel?"
+  ]
+}

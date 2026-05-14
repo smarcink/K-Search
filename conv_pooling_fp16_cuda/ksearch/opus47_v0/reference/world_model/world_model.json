@@ -1,0 +1,354 @@
+{
+  "computed_signals": {
+    "round_index": 4,
+    "trace": {
+      "latency_ms": 0.6707199811935425,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 4.291296005249023,
+      "speedup_factor": 6.398044080351813,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1a",
+    "nodes": [
+      {
+        "action": {
+          "description": "Root dummy node",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": "root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): high SM count, large L2, fp16 tensor cores available; this workload is fp16 in/out but small enough to be bandwidth-bound. AvgPool 2x2 stride 2 halves spatial dims.",
+            "notes": "Conv 3x3 with C_in=16, C_out=32 is a small GEMM-like op per pixel (288 MACs); intensity is modest, memory traffic likely dominates.",
+            "rating_0_to_10": 7.0,
+            "risk": "If we use fp16 with fp32 accumulate poorly, may lose accuracy; tensor cores need NHWC + multiples of 8."
+          },
+          "memory_bandwidth": {
+            "notes": "Input ~28MB fp16 (1*16*720*1280*2), output ~14MB (1*32*360*640*2). Weights ~9KB. Spatial reuse from 3x3 stencil; AvgPool reduces output writes 4x. Bandwidth bound regime.",
+            "rating_0_to_10": 8.0,
+            "risk": "Naive multi-kernel pipeline (conv->relu->pool) triples global traffic. Fusion is critical."
+          },
+          "register_pressure": {
+            "notes": "Per-output-tile of 2x2 (pool window) over 32 out channels = manageable; weight reuse via shared memory.",
+            "rating_0_to_10": 6.0,
+            "risk": "Spilling if we try to keep all 32 channels in registers per thread."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: fused stencil + pointwise + reduction (Conv3x3 NCHW + ReLU + AvgPool2x2). Inputs fp16; weights/bias fp16; output fp16, shape [1,32,360,640]. 2) Math: y[n,oc,oh,ow]=avg_{i,j in 2x2}(relu(sum_{ic,ky,kx} W[oc,ic,ky,kx]*x[n,ic,2*oh+i+ky-1,2*ow+j+kx-1]+b[oc])). Per output pixel reduces over (ic=16,ky=3,kx=3)=144 macs plus 4-pixel pool avg => 576 macs/output. 3) Layout: NCHW fp16 contiguous. Weights tiny (32*16*9*2=9216 B) -> fit in shared/const. For one output pool pixel need a 4x4 region of conv outputs => 5x5 input footprint per (n,ic). Heavy spatial reuse. 4) Regimes: (a) memory-bound full image -> fusion + vectorized loads dominate; (b) small batch=1 -> need enough blocks to fill SMs across spatial tiles; (c) channel-parallel reductions across ic=16 (small) fit in one warp. 5) Knobs: fusion granularity (single fused kernel vs split), tile size (OH_tile x OW_tile per block), keep weights in shared/const, NCHW vs NHWC, fp16 math vs fp32 accumulate, vectorized half2/float4 loads, AvgPool merged via direct 4x4-input->1-output computation. 6) Skeleton: grid over (oc_tile, oh_tile, ow_tile, n). Each block loads weights to smem once, loads input tile (with halo) to smem, each thread computes one output pool pixel by summing 4 conv outputs each requiring 3x3*ic mac, with ReLU then /4. 7) Families: F1 Single fused kernel NCHW with shared-memory input tile + weights in smem (top candidate, full fusion fits: weights 9KB + input tile <16KB). F2 Implicit-GEMM style via tensor cores after NHWC layout transform (higher peak but layout overhead, batch=1 small). F3 Two-kernel: fused conv+relu writing to scratch then pool (baseline-ish, extra global traffic; rejected unless F1 fails). Pick F1.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused CUDA kernel performing Conv3x3(pad=1) + bias + ReLU + AvgPool2x2 in one pass. Grid maps blocks to (oc_block, oh_tile, ow_tile). Each block loads weights for its oc_block into shared memory once, cooperatively loads the corresponding input halo tile per ic across all ic into shared/registers, computes 2x2 conv outputs per output pool pixel, applies ReLU, averages, writes a single fp16 output. Use fp32 accumulators, fp16 loads via __half2.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 6.4,
+          "rationale": "Eliminates intermediate global traffic between conv/relu/pool; weights tiny so easily cached; spatial reuse via shared memory. Best fit for bandwidth-bound regime on RTX5090.",
+          "score_0_to_1": 0.85,
+          "title": "Fused NCHW Conv3x3+ReLU+AvgPool kernel with shared-mem weights+input tile"
+        },
+        "choice": "F1-fused-NCHW",
+        "confidence_0_to_1": 0.85,
+        "decision": "family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "NCHW fp16, fp32 accumulators. No tensor cores but compute is light (~576 MACs/output) and easily handled by FFMA.",
+            "notes": "Good FMA reuse via 3x3 sliding window across 2x2 pool outputs.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Single global read of input per tile, single write of output; weights in constant cache.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "OC_CHUNK=8 with 4 outputs/thread and 16 p[][] floats may spill; __launch_bounds__(128,8) only achievable if regs<=32.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: Single fused NCHW kernel does Conv3x3+bias+ReLU+AvgPool2x2 in one pass; loads all 16 input channels of a 18x34 halo tile into shared mem, weights/bias in constant mem, each thread accumulates 4 conv outputs over 8-oc chunks then ReLU+avg. bottleneck: likely shared-memory bandwidth / register pressure (each thread holds OC_CHUNK*4=32 floats acc + 16 p[4][4] regs). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 6.40x speedup at 0.671ms vs 4.291ms ref confirms fusion + shmem tile is strong on RTX5090. Next bet: push further via vectorized __half2 IO + smaller per-thread output footprint to free regs and raise occupancy; or warp-level OC parallelism.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.6707199811935425,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "reference_latency_ms": 4.291296005249023,
+            "speedup_factor": 6.398044080351813,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "e2045bb1d99b4de620153e6e74f45b49203afcc2"
+        }
+      },
+      {
+        "action": {
+          "description": "Transform input to NHWC, use WMMA/tensor cores to compute conv (im2col-implicit) at fp16, fuse ReLU and AvgPool in epilogue. Requires layout conversion of input/output around the kernel or a preface kernel.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.6,
+          "rationale": "Tensor cores give huge fp16 throughput, but problem is bandwidth-bound and tiny GEMM K=16*9=144 leaves tensor cores underutilized; layout conversion adds traffic.",
+          "score_0_to_1": 0.4,
+          "title": "NHWC tensor-core implicit-GEMM conv with fused ReLU+pool epilogue"
+        },
+        "choice": "F2-NHWC-WMMA",
+        "confidence_0_to_1": 0.3,
+        "decision": "family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "WMMA requires multiples of 16/8 along M,N,K. K=144 ok, but C_in=16 small; M (out pixels) huge fine.",
+            "notes": "Compute peak is overkill; little benefit.",
+            "rating_0_to_10": 6.0,
+            "risk": "Layout conversion + epilogue complexity."
+          },
+          "memory_bandwidth": {
+            "notes": "Layout swap adds reads/writes; may hurt vs F1.",
+            "rating_0_to_10": 5.0,
+            "risk": "Net regression if conversion isn't fused."
+          },
+          "register_pressure": {
+            "notes": "Fragment registers heavy.",
+            "rating_0_to_10": 4.0,
+            "risk": "Occupancy loss."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: mutually exclusive with n1/n3 (different layout+primitive). De-prioritized: n1 already 6.4x; WMMA on tiny C_in=16 with 3x3 conv has poor m/n/k alignment and large rewrite cost. Keep open as exploratory.",
+        "overall_rating_0_to_10": 4.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Two-kernel pipeline: kernel A fuses Conv3x3+bias+ReLU writing fp16 to a scratch buffer of size [1,32,720,1280]; kernel B reads it to do AvgPool2x2 to final [1,32,360,640]. Simpler but extra ~28MB round-trip.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "Easy fallback that still fuses conv+relu; useful baseline for correctness and bandwidth comparison.",
+          "score_0_to_1": 0.15,
+          "title": "Two-kernel split: fused Conv+ReLU then AvgPool"
+        },
+        "choice": "F3-split",
+        "confidence_0_to_1": 0.4,
+        "decision": "family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Standard NCHW conv kernel; no special HW use.",
+            "notes": "OK fit but suboptimal.",
+            "rating_0_to_10": 6.0,
+            "risk": "Lower speedup ceiling."
+          },
+          "memory_bandwidth": {
+            "notes": "Adds intermediate read/write of full pre-pool tensor.",
+            "rating_0_to_10": 4.0,
+            "risk": "Memory-bound regression vs full fusion."
+          },
+          "register_pressure": {
+            "notes": "Low; simple kernels.",
+            "rating_0_to_10": 8.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: exclusive with n1 (split kernels vs fused). Dominated by n1's 6.4x \u2014 splitting reintroduces intermediate global traffic. Strongly de-prioritized.",
+        "overall_rating_0_to_10": 2.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Under F1 fused kernel, choose tile size of OH_tile=8, OW_tile=16 output pool pixels per block (i.e., 16x32 conv-output pixels, plus halo 18x34 input pixels per ic). Block has 128 threads, each producing 1 pool-output across all 32 oc looped, or split oc into two halves (16+16). Weights staged to shared memory once per block.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 7.5,
+          "rationale": "Balances smem (~ 18*34*16*2 = ~19.5KB input tile + 9KB weights) and occupancy. Pool fusion saves halo redundancy.",
+          "score_0_to_1": 0.7,
+          "title": "Tune F1 occupancy: reduce OC_CHUNK & vectorize __half2 IO"
+        },
+        "choice": "tune-occupancy-vec-io",
+        "confidence_0_to_1": 0.6,
+        "decision": "tactic",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Smem ~29KB fits comfortably (RTX5090 has >100KB/SM available).",
+            "notes": "Reasonable occupancy possible (2 blocks/SM).",
+            "rating_0_to_10": 7.0,
+            "risk": "Need to verify register count <=64 for 2 blocks/SM."
+          },
+          "memory_bandwidth": {
+            "notes": "Larger tiles amortize halo overhead.",
+            "rating_0_to_10": 8.0,
+            "risk": "Too large reduces block count -> SM underuse on small image (only 360*640/(8*16)=1800 blocks * oc_tiles, plenty)."
+          },
+          "register_pressure": {
+            "notes": "32 oc accumulators per thread risky; may need oc loop or oc_tile=8/16.",
+            "rating_0_to_10": 5.0,
+            "risk": "Spilling."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "CURRENT parent: 6.4x fused kernel. Try OC_CHUNK=4 (halve register live set) and load/store __half via __half2 vectorized accesses to halve memory transactions; expect higher occupancy and lower L2 pressure. SELF_CHECK: child refinement of n1, not an alternative family.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 7.0,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Warp-parallel OC: assign OC dim to warp lanes, cooperative reduction"
+        },
+        "choice": "warp-oc-parallel",
+        "confidence_0_to_1": 0.45,
+        "decision": "tactic",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Need to redesign block shape; constant-mem weight loads broadcast per lane.",
+            "rating_0_to_10": 8.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Same shmem reuse pattern.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Only 4 acc per thread instead of 32.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b",
+        "node_type": "decision",
+        "notes": "Map 32 OCs across 32 lanes of a warp; each lane owns 1 OC for a tile of 2x2 outputs, eliminating OC loop and slashing per-thread accumulator regs. SELF_CHECK: alternative tactic to n1a (different parallelization axis); mutually exclusive with n1a as the chosen path forward but both are valid children of n1.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "e2045bb1d99b4de620153e6e74f45b49203afcc2",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 7.2,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Use __half2 FMA math + fp16 weights in shmem (skip fp32 constant)"
+        },
+        "choice": "fp16-accum-h2-math",
+        "confidence_0_to_1": 0.4,
+        "decision": "tactic",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c",
+        "node_type": "decision",
+        "notes": "Keep weights as __half in constant/shmem and use __hfma2 across 2 outputs; halves memory and doubles math throughput. Risk: accuracy tolerance. SELF_CHECK: alternative refinement of n1, mutually exclusive with n1a/n1b as the next chosen step.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "e2045bb1d99b4de620153e6e74f45b49203afcc2",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused Conv2d(3x3, pad=1, C_in=16, C_out=32) + bias + ReLU + AvgPool2x2(stride 2) on fp16 NCHW input of shape [1,16,720,1280] producing [1,32,360,640]. Workload is small per output (~576 MACs) and memory-bound on RTX5090; weights tiny (~9KB) and easily kept in shared/constant memory. Best strategy is a single fused kernel that loads an input halo tile + weights to shared memory, computes conv with fp32 accumulators, applies ReLU, averages a 2x2 block, and writes one fp16 output\u2014eliminating the intermediate full-resolution pre-pool tensor traffic. Key constraints: fp16 I/O with fp32 accumulate for accuracy (rtol/atol 0.01), NCHW layout fixed by reference, weights/bias provided via set_params, output shape and dtype must match reference exactly.",
+  "open_questions": [
+    "Are the weights/bias stored as fp16 after .half() conversion, and what is the exact memory layout passed to set_params?",
+    "Does the reference cast to fp32 internally for accumulation, and what numerical tolerance margin does that give us?",
+    "Is AvgPool2x2 using count_include_pad=True/False semantics (border effects at H=720,W=1280 which are even, so no border issue here)?",
+    "What's the achievable DRAM bandwidth on RTX5090 in practice (HBM/GDDR7 ~1.8TB/s) \u2014 sets the floor on attainable latency (~24ms-input + 14MB-output / BW)?",
+    "Best block/tile shape balancing smem (input halo tile per block) vs occupancy and oc-loop unrolling?",
+    "Should we use __half2 vectorized loads along W to halve global load instructions for the input tile?",
+    "Is it worth a one-time layout transform to NHWC to enable tensor cores given the tiny K=144 GEMM?",
+    "Can constant memory or __ldg cache hold the 9KB weight tensor more efficiently than shared memory?"
+  ]
+}
