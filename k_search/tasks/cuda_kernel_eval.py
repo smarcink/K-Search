@@ -187,7 +187,8 @@ def _try_pass_params(module, model):
     """Try to pass reference model weights to the compiled kernel module.
 
     Strategies (tried in order):
-    1. If module has set_params(), pass ALL model.parameters() in declaration order.
+    1. If module has set_params(), pass ALL model state_dict tensors in order.
+       This includes both parameters AND buffers (e.g. position encodings).
     2. Store model on __main__ so try_autoload_from_python() in C++ code can find it.
     """
     import __main__ as _main_mod
@@ -197,17 +198,21 @@ def _try_pass_params(module, model):
     if not hasattr(_main_mod, "model"):
         _main_mod.model = model
 
-    # Strategy 1: Pass all model parameters in declaration order
+    # Strategy 1: Pass all state_dict tensors (parameters + buffers) in order
     if hasattr(module, "set_params"):
-        params = [p.data for p in model.parameters()]
-        if params:
+        all_tensors = list(model.state_dict().values())
+        if all_tensors:
             try:
-                module.set_params(*params)
+                module.set_params(*all_tensors)
                 return
             except TypeError:
-                # Arity mismatch — maybe kernel expects named/grouped params differently.
-                # Fall through to let try_autoload_from_python handle it.
-                pass
+                # Arity mismatch — try with just parameters (no buffers)
+                params = [p.data for p in model.parameters()]
+                try:
+                    module.set_params(*params)
+                    return
+                except TypeError:
+                    pass
             except Exception as e:
                 print(f"[cuda_kernel_eval] set_params failed: {e}", file=sys.stderr)
                 pass

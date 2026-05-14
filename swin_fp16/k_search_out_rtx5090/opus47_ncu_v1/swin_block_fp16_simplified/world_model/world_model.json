@@ -1,0 +1,213 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "root",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (SM_120, Blackwell): large L2, plenty of SMs, fp16 tensor cores available. Window N=16 is tiny; tensor cores underutilized. MLP K=32->128 is small; can be done with vector MAD or small WMMA.",
+            "notes": "Most ops are bandwidth-bound elementwise/LayerNorm/small-GEMMs over 230400 windows. Attention is N=16 single-head, trivially fits in registers.",
+            "rating_0_to_10": 6.0,
+            "risk": "Tensor cores not strictly required; small N may hurt WMMA utilization."
+          },
+          "memory_bandwidth": {
+            "notes": "Activation tensor (1,720,1280,32) fp16 = ~58MB. Multiple full passes in reference => bandwidth limited. Goal: minimize global memory round-trips by fusing block.",
+            "rating_0_to_10": 7.0,
+            "risk": "If not fused, BW dominates."
+          },
+          "register_pressure": {
+            "notes": "Per-window: 16 tokens x 32 ch fp16 = 1KB activations; QKV weights 32*96 fp16 = 6KB; proj 32*32=2KB; fc1 32*128=8KB; fc2 128*32=8KB; LN params tiny. Total weights ~24KB constant per block, fits in shared memory broadcast across all windows.",
+            "rating_0_to_10": 6.0,
+            "risk": "Loading all weights to SMEM per block is fine; per-thread register working set manageable with token-parallel mapping."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: Simplified Swin block fp16 on (1,720,1280,32). Window=4x4 (N=16), C=32, heads=1, hidden=128, no shift. CANONICAL: y1 = x + Proj(Softmax(Q*K^T/sqrt(C)+RPE)*V) over each 4x4 window after LN1; y2 = y1 + FC2(GELU(FC1(LN2(y1)))). LAYOUT: x is (B,H,W,C)=(1,720,1280,32) contiguous; window partition is a pure reshape since H,W multiples of 4 \u2014 windows are (B*nH*nW=57600) groups of 16 tokens of C=32. WEIGHTS small (~24KB total), constant \u2014 keep in SMEM/const. REGIMES: (a) full-block-fused per-window kernel (one CTA per window, 16 threads each handling 1 token; LN+QKV+attn+proj+residual+LN+MLP+residual all in registers/SMEM, single read of x, single write of y) \u2014 BW-optimal. (b) Split into 2-3 fused kernels (attn-fused, mlp-fused) \u2014 easier but extra global trips. (c) Use cuBLAS/cublasLt for GEMMs + custom LN/softmax \u2014 leaves perf on table due to many small GEMMs (57600 tiny matmuls). KNOBS: CTA layout (1 window/CTA vs K windows/CTA to amortize weight loads via SMEM), thread mapping (16 threads per window with C=32 split, or 32 threads token-parallel with channel reduction across warp), use of __shfl for reductions, fp16x2 vectorized math, WMMA for fc1/fc2 (m16n16k16 possible since 128=8*16). RPE bias is constant 1x1x16x16 fp16 = 512B, replicate in SMEM. ATTN softmax: per-row max+exp+sum, 16 elements, trivial via warp shuffles. FUSION FEASIBILITY: total per-window working memory: 16*32*fp16=1KB for x, plus 16*32*3=3KB for qkv, plus 16*16=512B for attn scores, plus 16*128=4KB for mlp hidden. Weights (24KB) loaded once per CTA into SMEM and reused across many windows packed per CTA. FULL FUSION IS FEASIBLE and recommended as top candidate. CANDIDATES: F1) one mega-kernel fused block (multi-windows-per-CTA with SMEM-resident weights); F2) two-kernel split (attn-fused + mlp-fused) as safer baseline; F3) cuBLAS-heavy. Prioritize F1.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused CUDA kernel that processes one Swin block end-to-end. Each CTA processes a group of windows (e.g., 4-8 windows of 16 tokens each). All weights (LN1/LN2 gamma/beta, QKV, proj, FC1, FC2, RPE) are staged into shared memory once per CTA. Each window's computation (LN1 -> QKV -> scaled-dot-product attention with RPE -> softmax -> proj -> residual -> LN2 -> FC1 -> GELU -> FC2 -> residual) is done entirely in registers/SMEM. Input is read once, output written once.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.25,
+          "rationale": "Single global read/write of activation tensor (~58MB each way) instead of many passes; weights tiny and shared; eliminates kernel launch and intermediate alloc overhead. Bandwidth-optimal.",
+          "score_0_to_1": 0.8,
+          "title": "Fused single-kernel full-block (multi-windows per CTA)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 large SMEM/CTA. N=16 too small for WMMA on attention; FC1/FC2 (K=32, N=128 or K=128, N=32) over 16 rows could use WMMA m16n16k16 in 2 K-tiles.",
+            "notes": "Mostly small dense GEMV/GEMM-like ops per window done by 16-32 threads with shuffle reductions.",
+            "rating_0_to_10": 8.0,
+            "risk": "Implementation complexity; correctness of softmax/LN in fp16."
+          },
+          "memory_bandwidth": {
+            "notes": "Reads x once (~58MB), writes y once (~58MB). Weights loaded once per CTA (~24KB) negligible.",
+            "rating_0_to_10": 10.0,
+            "risk": "If occupancy too low due to SMEM, BW utilization may suffer."
+          },
+          "register_pressure": {
+            "notes": "Per thread (16 threads per window in CTA): holds C=32 fp16 channels for one token plus 128 hidden during MLP. Hidden=128 fp16 = 256B/thread = 64 regs of fp16x2 \u2014 borderline. Could split MLP across 2 threads per token.",
+            "rating_0_to_10": 6.0,
+            "risk": "Hidden-dim 128 per-token register footprint; may need to materialize to SMEM."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is the maximally-fused approach; cannot coexist with sibling that splits the block \u2014 they are alternative top-level strategies. Top candidate per FULL_FUSION_PRIORITY.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Two kernels: (K1) fused LN1+QKV+attn+softmax+proj+residual per window; (K2) fused LN2+FC1+GELU+FC2+residual per token. Each CTA handles many windows (K1) or many tokens (K2). Activation tensor still re-read once between kernels but intermediates stay in registers within each.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.35,
+          "rationale": "Simpler than full fusion; lower register pressure since MLP hidden=128 stays in one kernel. Cost: one extra full read/write of activation tensor (~58MB).",
+          "score_0_to_1": 0.65,
+          "title": "Two-kernel split: attention-fused + MLP-fused"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "MLP kernel can use WMMA more easily on contiguous tokens; attention kernel uses per-window 16-thread reductions.",
+            "notes": "Each kernel highly fused; uses small custom GEMM/GEMV.",
+            "rating_0_to_10": 7.0,
+            "risk": "WMMA gains modest at C=32."
+          },
+          "memory_bandwidth": {
+            "notes": "2x reads + 2x writes of activation tensor vs 1x for full fusion.",
+            "rating_0_to_10": 7.0,
+            "risk": "Extra ~120MB traffic costs ~0.1ms on RTX5090."
+          },
+          "register_pressure": {
+            "notes": "Lower; MLP hidden lives in one kernel only.",
+            "rating_0_to_10": 8.0,
+            "risk": "Manageable."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Mutually exclusive with full fusion (n1) and cuBLAS path (n3) \u2014 picks a different granularity. Safer fallback if full fusion has register/SMEM issues.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use cuBLAS/cublasLt for the three big batched-GEMMs (QKV, proj as a single big GEMM over all windows*tokens; FC1, FC2 as standard GEMMs), and write custom fused kernels for LayerNorm, attention (Q*K^T per window + softmax + *V), GELU, and the residual adds. Avoid the window-partition/reverse permute by treating x as (B*H*W, C) for QKV/proj/FC1/FC2 (since the permute is identity-equivalent \u2014 window reshape is contiguous for these per-token linears).",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.5,
+          "rationale": "Fastest to implement; relies on highly tuned GEMM library. But many global round-trips through activation tensor.",
+          "score_0_to_1": 0.5,
+          "title": "cuBLAS GEMMs + custom fused LN/attn/GELU"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.75,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "cuBLAS GEMMs at M=921600,K=32,N={96,32,128}/M=921600,K=128,N=32 \u2014 skinny-K GEMMs, library may not hit peak.",
+            "notes": "Library calls are robust but GEMM shapes are tiny in K.",
+            "rating_0_to_10": 6.0,
+            "risk": "Skinny GEMM perf on cuBLAS at K=32 may be subpar."
+          },
+          "memory_bandwidth": {
+            "notes": "Many intermediate tensors hit HBM: post-LN1, qkv (3x), attn-out, post-proj, post-LN2, hidden (4x size), final. Heavy BW.",
+            "rating_0_to_10": 4.0,
+            "risk": "Likely BW-bound, leaves perf on table."
+          },
+          "register_pressure": {
+            "notes": "No issue; each kernel small.",
+            "rating_0_to_10": 9.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Alternative to fusion strategies \u2014 uses library for compute, custom for the rest. Cannot be combined with full-fusion since it explicitly materializes intermediates.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin transformer block in fp16 on a (1,720,1280,32) tensor with non-overlapping 4x4 windows, single attention head, C=32, MLP hidden=128, no shift. The block is LN1 -> QKV -> scaled-dot-product attention (N=16) with constant RPE bias -> softmax -> proj -> residual -> LN2 -> FC1 -> GELU -> FC2 -> residual. Window count is 57600 independent windows of 16 tokens each; each window is computationally tiny and the entire set of weights (~24KB fp16) is small and constant. Primary bottleneck is global memory bandwidth across multiple full-tensor passes (activation ~58MB). Best strategy: fuse the entire block into a single CUDA kernel where each CTA processes several windows with weights resident in shared memory, reading input once and writing output once. Key constraints: fp16 numerics (LN/softmax must accumulate in fp32 for stability), small N=16 makes WMMA marginal, MLP hidden=128 dictates per-thread register budget, and correctness must match within rtol/atol=0.01.",
+  "open_questions": [
+    "Does fitting MLP hidden=128 per token in registers (with 16 threads/window) cause register spills on SM_120? Should we use 32 threads per window with channel-parallel reduction instead?",
+    "Is it more bandwidth-optimal to have one CTA process K consecutive windows (sharing weight SMEM) for K=4,8,16? What K maximizes occupancy on RTX5090?",
+    "Are FC1 (32x128) and FC2 (128x32) better done with WMMA m16n16k16 over 16-token tiles, or with plain fp16x2 FMAs given the small problem size?",
+    "How exactly does PyTorch's fp16 LayerNorm compute mean/var (fp32 accumulation) \u2014 do we need bessel-corrected variance? (No: torch uses biased variance.)",
+    "What is the layout/contiguity of the input tensor at the kernel boundary (B,H,W,C contiguous) and can we treat window partition as a pure reshape with strided gather, since H%Wh==0 and W%Ww==0?",
+    "Should RPE bias be loaded into SMEM, constant memory, or just per-thread registers (it's only 256 fp16 values)?",
+    "Are GELU approximations (tanh-based) acceptable within tol=0.01, or must we use the exact erf-based formulation that nn.GELU uses by default?",
+    "How will the evaluator pass parameter ordering \u2014 confirm declaration order: norm1.w, norm1.b, qkv.w, qkv.b, proj.w, proj.b, norm2.w, norm2.b, fc1.w, fc1.b, fc2.w, fc2.b, plus rpe_bias buffer."
+  ]
+}

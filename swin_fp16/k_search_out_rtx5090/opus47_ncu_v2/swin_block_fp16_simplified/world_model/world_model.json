@@ -1,0 +1,213 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "root",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (sm_120, Blackwell): high HBM BW, large L2, abundant SMs, supports fp16 tensor cores (wmma/mma) with bf16/fp16 inputs; vector loads via __half2/float4; ample shared memory per SM.",
+            "notes": "Workload mixes small-matmul attention (16x16 tiles per window) with tall-skinny linears (HW=720*1280=921600 tokens, C=32, hidden=128). The linears are essentially memory-bound GEMMs with tiny K=32 or K=128. Attention is per-window 16-token softmax and is compute-light. Whole block is bandwidth-bound; fusion is the main lever.",
+            "rating_0_to_10": 7.0,
+            "risk": "Small inner dims (C=32) limit tensor-core efficiency; must use shared-mem GEMM or warp-level reduction instead."
+          },
+          "memory_bandwidth": {
+            "notes": "B*H*W*C = 1*720*1280*32 = ~29.5M fp16 elements (~59MB) per activation tensor. Reference has many round-trips (norm1 out, qkv out, attn out, proj out, residual, norm2 out, fc1 out, fc2 out). Fusing dramatically reduces global traffic. Weights small (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32, ~36KB total fp16) -> easily cached/stashed in shared/constant.",
+            "rating_0_to_10": 9.0,
+            "risk": "Naive multi-kernel approach is BW-bound; need fused single-pass per window."
+          },
+          "register_pressure": {
+            "notes": "Per window (16 tokens x 32 dims = 512 fp16 = 1KB) trivially fits in shared memory; hidden MLP buffer 16x128 = 4KB fp16. All weights fit in shared memory of the SM (qkv+proj+fc1+fc2 weights+biases ~ 36KB). A single block per window is feasible.",
+            "rating_0_to_10": 7.0,
+            "risk": "Storing hidden 16x128 fp16 + weights in shared may pressure SMEM but well within 100KB/SM budget."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS: (1) Classification: fused transformer block = LayerNorm + tiny QKV linear + window self-attention (single head, N=16) + proj + residual + LayerNorm + MLP(GELU) + residual. Mixed elementwise + small GEMM + softmax reduction. All dims fixed at runtime (B=1,H=720,W=1280,C=32,Wh=Ww=4,N=16,hidden=128, heads=1). nH=180, nW=320, total windows = 57600. (2) Canonical: For each window of N=16 tokens: y0=LN(x); q,k,v=y0@Wqkv+b; attn=softmax(q@k^T/sqrt(C)+rpe); o=attn@v; o=o@Wproj+bp; r1=x+o; y1=LN(r1); h=GELU(y1@W1+b1); out=r1+h@W2+b2. Independence: each of the 57600 windows is fully independent. (3) Layout: input contiguous [1,720,1280,32] fp16; window partition is a strided read (stride C across W=1280, stride W*C across H), output write similarly strided. Weights all small fp16; rpe_bias 1x1x16x16 fp16/fp32. (4) Regimes: full-shape default -> BW-bound across many sub-kernels; fused per-window -> compute/SMEM-bound with weight reuse; tensor-core path -> limited by tiny K. (5) Knobs: one block per window vs multiple windows per block; weights in shared vs constant vs registers; warp-level vs block-level reductions; vectorized __half2 IO; fp32 accumulators for LN/softmax/matmul; rpe baked into shared. (6) Skeleton: grid=(nH*nW), block=128-256 threads; load x window (16*32=512 halves) coalesced via permuted indexing; LN1 (mean/var across 32, fp32 accum); QKV matmul (16x32 @ 32x96 -> 16x96) using all threads cooperatively; compute attn 16x16 with rpe + softmax (row-wise reduce); matmul attn @ V (16x16 @ 16x32 -> 16x32); proj (16x32@32x32); add residual; LN2; FC1 (16x32@32x128) + GELU; FC2 (16x128@128x32) + add residual; write back. Weights cached in shared (loaded once per block; persistent across windows if multiple windows/block). (7) Families pruned: (A) FULL FUSION single kernel per-window \u2014 TOP CHOICE, total smem per window ~ x(1KB)+hidden(4KB)+weights(36KB) \u2248 41KB fits; (B) Tensor-core MMA for the GEMMs \u2014 limited gain at C=32; (C) Split kernels with cuBLAS+custom LN/softmax \u2014 easy but BW-bound. SELF: A dominates because all weights and per-window state fit in registers+SMEM, eliminating multi-kernel global traffic. NEXT ACTIONS: implement fused per-window kernel; consider grouping several windows per block to amortize weight loading; consider FP32 accumulation paths.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_started"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused CUDA kernel where each thread block processes one 4x4 window. Threads cooperatively load the 16x32 window tile, run LN1, the QKV linear, scaled dot-product attention with the 16x16 RPE bias and softmax, attn@V, proj, residual, LN2, FC1+GELU, FC2, and the second residual, then write the 16x32 result back to the correct output positions. All weights/biases/rpe loaded into shared memory once per block (or held in constant memory). Use fp32 accumulators inside LN/softmax/GEMMs; fp16 storage. Use __half2 vectorized IO where possible.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.2,
+          "rationale": "Eliminates ~8 global memory round-trips of the activation tensor (~59MB each) and reuses weights from SMEM. Per-window working set fits easily; this is the dominant lever on a BW-rich GPU like RTX5090.",
+          "score_0_to_1": 0.85,
+          "title": "Fused per-window single-kernel Swin block"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Grid = 180*320 = 57600 blocks \u2014 plenty of parallelism for RTX5090. Block size 64-128 threads (2-4 warps) sufficient; small matmuls done via cooperative threads.",
+            "notes": "Tiny GEMMs (16x32x96, 16x16x32, 16x32x32, 16x32x128, 16x128x32) \u2014 best done with manual warp-cooperative reductions rather than wmma. Compute very low intensity overall but fusion turns the problem into a streaming pass.",
+            "rating_0_to_10": 7.0,
+            "risk": "Underutilization of tensor cores; correctness pitfalls in softmax/LN numerics."
+          },
+          "memory_bandwidth": {
+            "notes": "Reads ~59MB input + ~36KB weights (cached) and writes ~59MB output. Single pass approaches the BW lower bound.",
+            "rating_0_to_10": 10.0,
+            "risk": "Non-coalesced patterns from window permutation; mitigated by careful index computation."
+          },
+          "register_pressure": {
+            "notes": "Per-block SMEM ~ 41KB (weights+hidden+window); plenty of headroom. Register usage moderate.",
+            "rating_0_to_10": 7.0,
+            "risk": "Occupancy might drop if SMEM/regs grow; can group multiple windows per block to amortize."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_full_fusion",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Mutually exclusive with split-kernel cuBLAS-style approach (n2) because they choose different top-level strategies. Top candidate per full-fusion priority.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Process multiple windows per thread block (e.g., 4-16 windows per block) so that weight loads from global -> shared are amortized across windows, and more threads participate per block to better utilize warps. Each warp or warp-group handles one window's 16x32 tile; weights and rpe are shared across warps in the block.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.15,
+          "rationale": "57600 blocks with one window each is fine for occupancy, but loading the 36KB of weights once per block is wasteful. Grouping windows amortizes weight load and improves SM occupancy/ILP. Builds on top of n1.",
+          "score_0_to_1": 0.7,
+          "title": "Multi-window-per-block grouping"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Better warp utilization; 4-8 warps per block working independently on different windows.",
+            "notes": "Same compute, more reuse of weights from SMEM.",
+            "rating_0_to_10": 8.0,
+            "risk": "Synchronization granularity may increase if windows share intermediate buffers."
+          },
+          "memory_bandwidth": {
+            "notes": "Weight loads amortized; activation BW unchanged (still must read/write each element once).",
+            "rating_0_to_10": 9.0,
+            "risk": "Minimal; activation BW already minimal in fused path."
+          },
+          "register_pressure": {
+            "notes": "Per-warp working set (16x32 + 16x128) stays per-warp in SMEM; weights shared once.",
+            "rating_0_to_10": 7.0,
+            "risk": "Total SMEM grows with windows-per-block; monitor occupancy."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2_multi_window_block",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Alternative to n1's 'one window per block' tiling choice. Cannot be combined as both define the block-to-window mapping differently.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Cache the small weights (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32, plus biases and 16x16 rpe; total ~36KB fp16) in __constant__ memory rather than shared. Each kernel reads weights via constant cache (broadcast-friendly when all threads access the same element), eliminating the explicit shared-memory staging code path.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.5,
+          "rationale": "Constant memory is 64KB per kernel and is broadcast-optimized; could simplify code while remaining fast for the broadcast-style access patterns of matmuls where threads share K-rows.",
+          "score_0_to_1": 0.55,
+          "title": "Use __constant__ memory for all weights/biases/rpe"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Constant cache broadcast works best when warp threads access the same address. Some matmul patterns are not broadcast; those would suffer L1 reload.",
+            "notes": "Possibly slightly slower than well-managed SMEM but simpler code.",
+            "rating_0_to_10": 6.0,
+            "risk": "Non-uniform accesses serialize on constant cache."
+          },
+          "memory_bandwidth": {
+            "notes": "Removes one SMEM load step but constant cache may serialize on divergent indices.",
+            "rating_0_to_10": 7.0,
+            "risk": "Performance regression vs SMEM if access pattern is not broadcast-friendly."
+          },
+          "register_pressure": {
+            "notes": "Frees up SMEM for activations/hidden buffer.",
+            "rating_0_to_10": 8.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3_constant_weights",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is an alternative storage-class decision for weights; mutually exclusive with explicit SMEM staging used in n1/n2 baselines. Could also be tried orthogonally for some weights only.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin transformer block in fp16 on a fixed-shape input (1,720,1280,32) with 4x4 windows, single attention head (N=16), and 4x MLP ratio (hidden=128). The block is LN -> QKV linear -> scaled dot-product self-attention with a 16x16 relative-position bias -> output proj -> residual -> LN -> FC1 -> GELU -> FC2 -> residual. With 57,600 independent windows and tiny per-window state (16x32 activations, 16x128 hidden) plus small weights (~36KB total), the workload is overwhelmingly memory-bandwidth bound in the reference (many activation round-trips). The decisive optimization is a single fused per-window CUDA kernel that streams each input window through the entire block in registers/shared memory, reading and writing the global activation tensor only once. Constraints: fp16 storage with fp32 accumulators for LN mean/var, softmax max/sum, and GEMMs; rtol/atol = 0.01; window partitioning is a strided permutation; weights and rpe must be settable via set_params; RTX5090 (Blackwell, sm_120) is BW-rich with abundant SMEM.",
+  "open_questions": [
+    "What numeric precision (fp16 vs fp32 accumulators) is required at each stage to meet rtol/atol=0.01, especially in softmax and the two LayerNorms?",
+    "Does the reference store rpe_bias in fp16 (after .half()) or fp32 inside the model? The state_dict bias is registered before .half() \u2014 confirm dtype passed to set_params.",
+    "Best block-to-window mapping: 1 window/block (simplest) vs multiple windows/block (amortizes weight load) \u2014 what gives best occupancy on sm_120?",
+    "Should weights live in shared memory, constant memory, or registers/__ldg? Which provides best behavior for the broadcast-style small GEMMs?",
+    "Is it worth using wmma/MMA tensor cores given K=32/128 and M=N=16, or are warp-cooperative manual GEMMs faster at these tiny sizes?",
+    "Can the strided window read/write be made fully coalesced via per-thread mapping (each thread handles one (token,channel) pair with __half2 across channels)?",
+    "Does the Linear bias get applied in fp32 then cast, matching torch's nn.Linear fp16 semantics closely enough for tolerance?",
+    "How does PyTorch's LayerNorm handle epsilon (default 1e-5) and is its mean/var computed with Welford or two-pass \u2014 does our implementation need to match for tolerance?"
+  ]
+}
