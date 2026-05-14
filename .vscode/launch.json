@@ -24,6 +24,7 @@
             "args": [
                 "swin_fp16/swin_block_fp16_simplified.py",
                 "swin_fp16/opus47_v2_compile",
+                "swin_fp16/opus47_nvu_v2",
                 "--precision", "fp16",
                 "--warmup", "100",
                 "--iters", "1000", 

@@ -1,0 +1,41 @@
+{
+  "claude-opus-4-7_swin_block_fp16_simplified_cuda_optimized_r35_20260514_145212_ebbd56dc": {
+    "status": "passed",
+    "latency_ms": 1.4187840223312378,
+    "reference_latency_ms": 8.418304443359375,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 5.933464368683162,
+    "log_excerpt": "PASSED: latency=1.419ms ref=8.418ms speedup=5.93x",
+    "metrics": {},
+    "profiler_metrics": {
+      "kernels": [
+        {
+          "sm_occupancy_pct": 16.41,
+          "compute_throughput_pct": 23.47,
+          "memory_throughput_pct": 5.14,
+          "l1_hit_rate_pct": 91.71,
+          "l2_hit_rate_pct": 63.73,
+          "achieved_bandwidth_gb_s": 29.59,
+          "tensor_core_utilization_pct": 9.57,
+          "registers_per_thread": 96,
+          "shared_mem_per_block_bytes": 47104,
+          "top_stall_reasons": [
+            [
+              "short_scoreboard",
+              2.98
+            ],
+            [
+              "long_scoreboard",
+              1.71
+            ],
+            [
+              "wait",
+              1.46
+            ]
+          ],
+          "kernel_name": "swin_block_kernel_v2(const __half *, __half *, const __half *, const __half *, const __half *, const __half *, int, int, int, int, int, int)"
+        }
+      ]
+    }
+  }
+}

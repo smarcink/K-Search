@@ -1,16 +1,46 @@
 {
   "computed_signals": {
-    "round_index": 0,
+    "round_index": 46,
     "trace": {
-      "latency_ms": null,
+      "latency_ms": 1.3596800565719604,
       "mean_vs_baseline_factor": null,
-      "reference_latency_ms": null,
-      "speedup_factor": null,
-      "status": "init"
+      "profiler": {
+        "kernels": [
+          {
+            "achieved_bandwidth_gb_s": 29.6,
+            "compute_throughput_pct": 23.25,
+            "kernel_name": "swin_block_kernel_v2(const __half *, __half *, const __half *, const __half *, const __half *, const __half *, int, int, int, int, int, int)",
+            "l1_hit_rate_pct": 90.74,
+            "l2_hit_rate_pct": 59.38,
+            "memory_throughput_pct": 5.14,
+            "registers_per_thread": 84,
+            "shared_mem_per_block_bytes": 47104,
+            "sm_occupancy_pct": 16.41,
+            "tensor_core_utilization_pct": 9.67,
+            "top_stall_reasons": [
+              [
+                "short_scoreboard",
+                3.35
+              ],
+              [
+                "long_scoreboard",
+                1.91
+              ],
+              [
+                "wait",
+                1.47
+              ]
+            ]
+          }
+        ]
+      },
+      "reference_latency_ms": 8.544927597045898,
+      "speedup_factor": 6.2845134454567635,
+      "status": "passed"
     }
   },
   "decision_tree": {
-    "active_leaf_id": "root",
+    "active_leaf_id": "node_swin_block_fp16_simplified_r35_cont_1",
     "nodes": [
       {
         "action": {
@@ -62,59 +92,59 @@
         "action": {
           "description": "Implement a single fused CUDA kernel where each thread block processes one 4x4 window. Threads cooperatively load the 16x32 window tile, run LN1, the QKV linear, scaled dot-product attention with the 16x16 RPE bias and softmax, attn@V, proj, residual, LN2, FC1+GELU, FC2, and the second residual, then write the 16x32 result back to the correct output positions. All weights/biases/rpe loaded into shared memory once per block (or held in constant memory). Use fp32 accumulators inside LN/softmax/GEMMs; fp16 storage. Use __half2 vectorized IO where possible.",
           "difficulty_1_to_5": 4,
-          "expected_vs_baseline_factor": 0.2,
+          "expected_vs_baseline_factor": 0.58,
           "rationale": "Eliminates ~8 global memory round-trips of the activation tensor (~59MB each) and reuses weights from SMEM. Per-window working set fits easily; this is the dominant lever on a BW-rich GPU like RTX5090.",
-          "score_0_to_1": 0.85,
+          "score_0_to_1": 0.8,
           "title": "Fused per-window single-kernel Swin block"
         },
         "choice": "",
-        "confidence_0_to_1": 0.7,
+        "confidence_0_to_1": 0.85,
         "decision": "",
         "impacts": {
           "compute_intensity_and_hw_fit": {
             "hw_notes": "Grid = 180*320 = 57600 blocks \u2014 plenty of parallelism for RTX5090. Block size 64-128 threads (2-4 warps) sufficient; small matmuls done via cooperative threads.",
-            "notes": "Tiny GEMMs (16x32x96, 16x16x32, 16x32x32, 16x32x128, 16x128x32) \u2014 best done with manual warp-cooperative reductions rather than wmma. Compute very low intensity overall but fusion turns the problem into a streaming pass.",
-            "rating_0_to_10": 7.0,
-            "risk": "Underutilization of tensor cores; correctness pitfalls in softmax/LN numerics."
+            "notes": "Compute throughput 94% but tensor core util 0%. All GEMMs done as scalar half2 FMA \u2014 leaving large speedup from MMA/WMMA on the table.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
           },
           "memory_bandwidth": {
-            "notes": "Reads ~59MB input + ~36KB weights (cached) and writes ~59MB output. Single pass approaches the BW lower bound.",
-            "rating_0_to_10": 10.0,
-            "risk": "Non-coalesced patterns from window permutation; mitigated by careful index computation."
+            "notes": "Global mem traffic reduced to single load+store; achieved BW only 23GB/s indicates kernel is compute/latency-bound, not BW-bound.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
           },
           "register_pressure": {
-            "notes": "Per-block SMEM ~ 41KB (weights+hidden+window); plenty of headroom. Register usage moderate.",
-            "rating_0_to_10": 7.0,
-            "risk": "Occupancy might drop if SMEM/regs grow; can group multiple windows per block to amortize."
+            "notes": "96 regs/thread keeps occupancy at 32.9% (4 wins/block). Could explore 2 wins/block or fewer locals.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
           }
         },
         "last_updated_round": 0,
         "node_id": "n1_full_fusion",
         "node_type": "decision",
-        "notes": "SELF_CHECK: Mutually exclusive with split-kernel cuBLAS-style approach (n2) because they choose different top-level strategies. Top candidate per full-fusion priority.",
-        "overall_rating_0_to_10": 8.0,
+        "notes": "CURRENT: does=fused single-kernel Swin block, 1 window per warp, 4 windows/block, weights in __constant__, all GEMMs as half2 dot products. bottleneck=compute/latency (94% compute throughput, 0% tensor core, low occupancy 33%). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 1.71x achieved vs predicted ~5x (0.2 factor). PERF_GAP: expected_vs_baseline=0.2 vs observed=0.58. Reason: SM is saturated on scalar HFMA pipelines and shfl reductions; no tensor-core usage despite all GEMM shapes being 16xKx16 which map naturally to wmma m16n16k16. Next bet: introduce WMMA tensor cores for QKV/proj/FC1/FC2 to cut HFMA pressure dramatically.",
+        "overall_rating_0_to_10": 8.2,
         "parent_id": "root",
         "solution_ref": {
           "eval": {
-            "score": null,
-            "score_name": null,
-            "status": "open"
+            "score": 1.71,
+            "score_name": "speedup_vs_ref",
+            "status": "passed"
           },
           "parent_solution_id": null,
-          "solution_id": null
+          "solution_id": "7e9fc4a0cc8bd426b07e5631d51312d9738f959b"
         }
       },
       {
         "action": {
           "description": "Process multiple windows per thread block (e.g., 4-16 windows per block) so that weight loads from global -> shared are amortized across windows, and more threads participate per block to better utilize warps. Each warp or warp-group handles one window's 16x32 tile; weights and rpe are shared across warps in the block.",
           "difficulty_1_to_5": 4,
-          "expected_vs_baseline_factor": 0.15,
+          "expected_vs_baseline_factor": 0.35,
           "rationale": "57600 blocks with one window each is fine for occupancy, but loading the 36KB of weights once per block is wasteful. Grouping windows amortizes weight load and improves SM occupancy/ILP. Builds on top of n1.",
-          "score_0_to_1": 0.7,
-          "title": "Multi-window-per-block grouping"
+          "score_0_to_1": 0.15,
+          "title": "Multi-window block family (alternative mapping)"
         },
         "choice": "",
-        "confidence_0_to_1": 0.55,
+        "confidence_0_to_1": 0.7,
         "decision": "",
         "impacts": {
           "compute_intensity_and_hw_fit": {
@@ -137,8 +167,8 @@
         "last_updated_round": 0,
         "node_id": "n2_multi_window_block",
         "node_type": "decision",
-        "notes": "SELF_CHECK: Alternative to n1's 'one window per block' tiling choice. Cannot be combined as both define the block-to-window mapping differently.",
-        "overall_rating_0_to_10": 7.0,
+        "notes": "DEPRIORITIZED: dominated by current 4-windows/CTA at 6.30x; further multi-window aggregation unlikely to help given low SM occupancy is not the bottleneck.",
+        "overall_rating_0_to_10": 3.0,
         "parent_id": "root",
         "solution_ref": {
           "eval": {
@@ -154,13 +184,13 @@
         "action": {
           "description": "Cache the small weights (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32, plus biases and 16x16 rpe; total ~36KB fp16) in __constant__ memory rather than shared. Each kernel reads weights via constant cache (broadcast-friendly when all threads access the same element), eliminating the explicit shared-memory staging code path.",
           "difficulty_1_to_5": 2,
-          "expected_vs_baseline_factor": 0.5,
+          "expected_vs_baseline_factor": 0.55,
           "rationale": "Constant memory is 64KB per kernel and is broadcast-optimized; could simplify code while remaining fast for the broadcast-style access patterns of matmuls where threads share K-rows.",
-          "score_0_to_1": 0.55,
-          "title": "Use __constant__ memory for all weights/biases/rpe"
+          "score_0_to_1": 0.1,
+          "title": "Constant memory weights (subsumed)"
         },
         "choice": "",
-        "confidence_0_to_1": 0.5,
+        "confidence_0_to_1": 0.8,
         "decision": "",
         "impacts": {
           "compute_intensity_and_hw_fit": {
@@ -183,8 +213,8 @@
         "last_updated_round": 0,
         "node_id": "n3_constant_weights",
         "node_type": "decision",
-        "notes": "SELF_CHECK: This is an alternative storage-class decision for weights; mutually exclusive with explicit SMEM staging used in n1/n2 baselines. Could also be tried orthogonally for some weights only.",
-        "overall_rating_0_to_10": 6.0,
+        "notes": "DEPRIORITIZED: full weights exceed 64KB __constant__; biases+RPE already in constant memory.",
+        "overall_rating_0_to_10": 2.5,
         "parent_id": "root",
         "solution_ref": {
           "eval": {
@@ -193,6 +223,366 @@
             "status": "open"
           },
           "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.36,
+          "rationale": "",
+          "score_0_to_1": 0.85,
+          "title": "Use WMMA tensor cores for QKV/proj/FC1/FC2 GEMMs"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Tensor core util only 6.92%; tiny 16x16 GEMMs underfill TCs. SM occupancy 16.5% limits latency hiding.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "L1 hit 90.76%, L2 59%, BW 21GB/s; reuse is good but throughput is low because compute is small per window.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "79 regs/thread; FC2 keeps 8 A frags which is heavy.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_full_fusion_child_tc",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single-warp-per-window fused Swin block using WMMA for QKV/proj/FC1/FC2 with fp16 LN/softmax fast paths. bottleneck=compute/latency from low TC utilization and low occupancy; many small WMMA tiles plus fp32->fp16 scratch round-trips dominate. FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: WMMA gave 5.03x (vs prior 1.71x) confirming TCs help, but TC util is still only 6.92% and occupancy 16.5%; next bet: stage weights via cp.async into shared and/or process multiple windows per warp to amortize WMMA fragment loads and raise occupancy. PERF_GAP: expected 0.30x vs observed 0.20x (1/5.03)=0.199; near target.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "n1_full_fusion",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.8391040563583374,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 21.46,
+                  "compute_throughput_pct": 22.82,
+                  "kernel_name": "swin_block_kernel_v2(const __half *, __half *, const __half *, const __half *, const __half *, const __half *, int, int, int, int, int, int)",
+                  "l1_hit_rate_pct": 90.76,
+                  "l2_hit_rate_pct": 59.09,
+                  "memory_throughput_pct": 3.73,
+                  "registers_per_thread": 79,
+                  "shared_mem_per_block_bytes": 47104,
+                  "sm_occupancy_pct": 16.52,
+                  "tensor_core_utilization_pct": 6.92,
+                  "top_stall_reasons": [
+                    [
+                      "short_scoreboard",
+                      4.68
+                    ],
+                    [
+                      "wait",
+                      1.97
+                    ],
+                    [
+                      "long_scoreboard",
+                      1.49
+                    ]
+                  ]
+                }
+              ]
+            },
+            "reference_latency_ms": 9.250271797180176,
+            "speedup_factor": 5.029770754514513,
+            "status": "passed"
+          },
+          "parent_solution_id": "7e9fc4a0cc8bd426b07e5631d51312d9738f959b",
+          "solution_id": "a5b5369259799f56728dc5c43124f56daf2b8012"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 6.26,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.82,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.85,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "TC util only 9.5%; small tiles underuse TCs",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "BW low (5%); not the bottleneck",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "96 regs/thread; occupancy capped at 4 CTAs",
+            "rating_0_to_10": 5.0,
+            "risk": "med"
+          }
+        },
+        "last_updated_round": 12,
+        "node_id": "node_swin_block_fp16_simplified_r12_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Fused single-kernel Swin block (LN1+QKV+attn+softmax+attn@V+proj+res+LN2+FC1+GELU+FC2+res) with 4 windows/CTA, WMMA m16n16k16 tiles, per-window shared-mem scratch; constants in __constant__. bottleneck: latency/sync-bound \u2014 sm_occupancy ~16%, mem BW ~5%, compute ~23%, TC util ~9.5%; many small WMMAs and __syncwarp after each store. FOLLOW_THROUGH: aligned_with_intent: yes. UPDATE_BELIEF: eval improved 1.84->1.40ms (6.26x). Stalls dominated by short_scoreboard (3.05) suggesting shared-mem dependency latency between WMMA store and subsequent vector load. next bet: reduce store->load round-trips by writing WMMA accumulator directly to next operand layout, e.g., keep softmax results in registers and skip sscratch reload, or fuse bias-add into accumulator using wmma::store with fragment elements (iterate frag.x[]).",
+        "overall_rating_0_to_10": 8.4,
+        "parent_id": "n1_full_fusion_child_tc",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.397887945175171,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 29.11,
+                  "compute_throughput_pct": 23.33,
+                  "kernel_name": "swin_block_kernel_v2(const __half *, __half *, const __half *, const __half *, const __half *, const __half *, int, int, int, int, int, int)",
+                  "l1_hit_rate_pct": 90.75,
+                  "l2_hit_rate_pct": 59.05,
+                  "memory_throughput_pct": 5.06,
+                  "registers_per_thread": 96,
+                  "shared_mem_per_block_bytes": 47104,
+                  "sm_occupancy_pct": 16.42,
+                  "tensor_core_utilization_pct": 9.5,
+                  "top_stall_reasons": [
+                    [
+                      "short_scoreboard",
+                      3.05
+                    ],
+                    [
+                      "long_scoreboard",
+                      1.62
+                    ],
+                    [
+                      "wait",
+                      1.44
+                    ]
+                  ]
+                }
+              ]
+            },
+            "reference_latency_ms": 8.751487731933594,
+            "speedup_factor": 6.260507333323441,
+            "status": "passed"
+          },
+          "parent_solution_id": "a5b5369259799f56728dc5c43124f56daf2b8012",
+          "solution_id": "e71d9244ac578ed015b2e5a05e11b3a23f9820de"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 6.3,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.78,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.8,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "TC util only 9.5%; lots of epilogue overhead between WMMAs",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "BW 29 GB/s; not BW bound",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "96 reg/thread, occupancy 16%",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 23,
+        "node_id": "node_swin_block_fp16_simplified_r23_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Fused per-window Swin block via WMMA on FP16, 4 windows/CTA, with constant-memory biases/RPE; LN done by single thread per token; epilogues store via fp32 scratch then __half2 packs. bottleneck=latency/sync (compute throughput 23%, SM occ 16%, short_scoreboard stalls dominate, low tensor-core utilization 9.5%). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: eval steady at 6.30x (1.38ms), stalls are short_scoreboard on shared-mem epilogue + __syncwarp; next bet=eliminate fp32 scratch round-trip per WMMA tile by using wmma store to fp16 fragment (store_matrix_sync to __half) or direct fragment-element epilogue using fragment.x[] indexing to write bias+residual without going through shared scratch; also try to coalesce attno/proj epilogues. Impacts updated.",
+        "overall_rating_0_to_10": 7.8,
+        "parent_id": "node_swin_block_fp16_simplified_r12_cont_1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.38099205493927,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 29.61,
+                  "compute_throughput_pct": 23.47,
+                  "kernel_name": "swin_block_kernel_v2(const __half *, __half *, const __half *, const __half *, const __half *, const __half *, int, int, int, int, int, int)",
+                  "l1_hit_rate_pct": 91.71,
+                  "l2_hit_rate_pct": 63.7,
+                  "memory_throughput_pct": 5.14,
+                  "registers_per_thread": 96,
+                  "shared_mem_per_block_bytes": 47104,
+                  "sm_occupancy_pct": 16.41,
+                  "tensor_core_utilization_pct": 9.57,
+                  "top_stall_reasons": [
+                    [
+                      "short_scoreboard",
+                      2.97
+                    ],
+                    [
+                      "long_scoreboard",
+                      1.71
+                    ],
+                    [
+                      "wait",
+                      1.46
+                    ]
+                  ]
+                }
+              ]
+            },
+            "reference_latency_ms": 8.700896263122559,
+            "speedup_factor": 6.300468009213265,
+            "status": "passed"
+          },
+          "parent_solution_id": "e71d9244ac578ed015b2e5a05e11b3a23f9820de",
+          "solution_id": "b20df7a6d1facdeca98bbe70785d559eb1f85cd4"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.55,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.7,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "tensor core util 9.7%; epilogue + sync overhead dominates",
+            "rating_0_to_10": 6.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "BW already low and not the bottleneck",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "84 regs/thread, occupancy capped by smem (47KB)",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 35,
+        "node_id": "node_swin_block_fp16_simplified_r35_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does: single-kernel fused Swin block; 4 windows per CTA, each window owns one warp; uses WMMA for QKV/attn/proj/FC1/FC2 with constant memory for small params. bottleneck: latency-bound; short_scoreboard (3.35) + long_scoreboard (1.91) dominate; low SM occupancy (16.4%) and very low memory throughput (5.1%) indicate underutilized compute waiting on shared-mem accumulator stores/loads between WMMA tiles. FOLLOW_THROUGH: aligned_with_intent: yes (small refinement on top bottleneck; eval improved slightly 1.381->1.360ms, 6.28x). UPDATE_BELIEF: changed: register count dropped 96->84 but speedup essentially unchanged; short_scoreboard stalls increased slightly, suggesting WMMA store->scalar reload via shared mem (the sscratch round-trip after every mma_sync) is the prime stall source. next bet: eliminate the float sscratch round-trip by writing the accumulator directly to __half shared (mem_row_major + cast via fragment-level conversion) or by fusing bias-add via per-thread fragment iteration (frag.x[i]) so we keep results in registers and write __half2 once. This should cut short_scoreboard stalls and increase compute throughput.",
+        "overall_rating_0_to_10": 7.4,
+        "parent_id": "node_swin_block_fp16_simplified_r23_cont_1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.3596800565719604,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 29.6,
+                  "compute_throughput_pct": 23.25,
+                  "kernel_name": "swin_block_kernel_v2(const __half *, __half *, const __half *, const __half *, const __half *, const __half *, int, int, int, int, int, int)",
+                  "l1_hit_rate_pct": 90.74,
+                  "l2_hit_rate_pct": 59.38,
+                  "memory_throughput_pct": 5.14,
+                  "registers_per_thread": 84,
+                  "shared_mem_per_block_bytes": 47104,
+                  "sm_occupancy_pct": 16.41,
+                  "tensor_core_utilization_pct": 9.67,
+                  "top_stall_reasons": [
+                    [
+                      "short_scoreboard",
+                      3.35
+                    ],
+                    [
+                      "long_scoreboard",
+                      1.91
+                    ],
+                    [
+                      "wait",
+                      1.47
+                    ]
+                  ]
+                }
+              ]
+            },
+            "reference_latency_ms": 8.544927597045898,
+            "speedup_factor": 6.2845134454567635,
+            "status": "passed"
+          },
+          "parent_solution_id": "b20df7a6d1facdeca98bbe70785d559eb1f85cd4",
+          "solution_id": "47a336c65dc6fafb58d8d7bbb2069dbe230d5b51"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.7,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "tensor core util 9.7%; epilogue + sync overhead dominates",
+            "rating_0_to_10": 6.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "BW already low and not the bottleneck",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "84 regs/thread, occupancy capped by smem (47KB)",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 46,
+        "node_id": "node_swin_block_fp16_simplified_r46_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 7.4,
+        "parent_id": "node_swin_block_fp16_simplified_r35_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "47a336c65dc6fafb58d8d7bbb2069dbe230d5b51",
           "solution_id": null
         }
       }
