@@ -1,0 +1,12 @@
+{
+  "claude-opus-4-7_swin_block_fp16_simplified_cuda_optimized_r41_20260514_162630_b1ba4e3f": {
+    "status": "passed",
+    "latency_ms": 1.4556479454040527,
+    "reference_latency_ms": 9.223296165466309,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 6.336213501751719,
+    "log_excerpt": "PASSED: latency=1.456ms ref=9.223ms speedup=6.34x",
+    "metrics": {},
+    "profiler_metrics": {}
+  }
+}

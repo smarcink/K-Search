@@ -1,0 +1,629 @@
+{
+  "computed_signals": {
+    "round_index": 50,
+    "trace": {
+      "latency_ms": 1.7536640167236328,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 9.318143844604492,
+      "speedup_factor": 5.313528564048182,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "node_swin_block_fp16_simplified_r41_cont_1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (sm_120, Blackwell). Native fp16 tensor cores, large shared mem, 128 SMs. Problem is small per-window (16x32) so attention is bandwidth bound; MLP (32->128->32) is GEMV-like over many tokens.",
+            "notes": "Per-window attention working set is tiny: q,k,v ~ 16x32 fp16 = 1KB each. Easily fits in registers/shared. Whole block can be fused per window. MLP is the dominant FLOP portion (1x720x1280x32x128x2 = ~7.5 GFLOPs forward).",
+            "rating_0_to_10": 7.0,
+            "risk": "Achieving good utilization on tiny GEMMs requires careful warp-level mapping."
+          },
+          "memory_bandwidth": {
+            "notes": "Input/output tensor: 1*720*1280*32 fp16 = ~59 MB. Weights tiny (qkv 32*96 + proj 32*32 + fc1 32*128 + fc2 128*32 ~ 25 KB). Activations dominate BW; full fusion avoids repeated trips.",
+            "rating_0_to_10": 8.0,
+            "risk": "Multiple passes (norm1, attn, residual, norm2, mlp, residual) cause repeated HBM I/O if not fused."
+          },
+          "register_pressure": {
+            "notes": "Per token C=32 floats fits in 32 regs. Per window 16 tokens * 32 = 512 floats which is large but tractable across a warp/block. MLP hidden=128 per token is heavier.",
+            "rating_0_to_10": 6.0,
+            "risk": "Holding hidden=128 per token in regs may cause spills if not split across threads."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: Simplified Swin block on (1,720,1280,32) fp16. window=4x4 (N=16), heads=1, dim=32, mlp_ratio=4 (hidden=128), no shift. ANALYSIS: (1) Classification: fused transformer block = LayerNorm + small attention (window-MSA) + residual + LayerNorm + MLP(GELU) + residual. Mixed elementwise + small matmul + softmax reductions. (2) Math/Deps: x1 = x + Proj(Softmax(scale*Q*K^T + RPE) * V) where (Q,K,V)=qkv(LN1(x)); x2 = x1 + fc2(GELU(fc1(LN2(x1)))). Attention is per-window independent (BW = 1*180*320 = 57600 windows). MLP/LN are per-token independent. (3) Layout: x is (B,H,W,C)=NHWC contiguous. Windows are 4x4 spatial tiles. Weights small. Reuse: each token used by qkv proj and by mlp; window tokens reused in attention. (4) Regimes: (a) attention-dominant if MLP cheap - here MLP is ~4x ops of attn; (b) memory-bound if naive multi-kernel; (c) compute-bound on MLP if fully fused. RTX5090 BW ~1.7TB/s, compute peak >100 TF fp16. With ~59MB activation, BW lower bound ~70us; reference likely 1-3ms. (5) Knobs: parallel unit (per-window vs per-token), tiling (one window per CTA, 16 threads or 1 warp), shared mem for window tile, precompute RPE constant, use tensor cores vs scalar (small matrices favor scalar/warp shuffle). (6) Skeleton: kernel grid = num_windows; each CTA loads 16x32 tile, applies LN1, computes qkv via tiny matmul, attention with softmax in registers/smem, proj, residual; then LN2, fc1 (32->128), GELU, fc2 (128->32), residual, write back. (7) FAMILIES: F1 single fused mega-kernel per window (full fusion - top candidate, working set ~16*32+16*128 fp16 = 9KB easily in smem); F2 split into two fused kernels (attention-fused, mlp-fused) sharing intermediate via global; F3 cuBLAS+custom-elementwise hybrid. Full fusion is clearly best given tiny working set.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single CUDA kernel that processes one 4x4 window per CTA. Each CTA loads 16 tokens (16x32 fp16) into shared memory, performs LN1, qkv projection (small GEMM via warp), Q*K^T (16x16) + RPE, softmax, attn*V, proj, add residual, LN2, fc1 (32->128), GELU, fc2 (128->32), add residual, write back. Use one warp (32 threads) per window: each thread handles one channel for the 16-token tile in attention path; for MLP use 32 threads to compute 128 hidden via 4-wide loop or split. Keep all intermediates in registers/shared. Avoid any global memory round-trip between sub-ops.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.91,
+          "rationale": "Working set per window fits trivially in shared+registers. Eliminates ~5-6 global memory passes of the 59MB activation, which dominates reference runtime. Small matmuls are easy on a warp-per-window basis.",
+          "score_0_to_1": 0.8,
+          "title": "Full per-window fused mega-kernel (one warp per window)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "57600 windows / 128 SMs = 450 windows per SM. With 1 warp/window and 4-8 warps/SM occupancy that's plenty. dim=32 matches warp size exactly - natural mapping (1 thread per channel).",
+            "notes": "Compute intensity raised by full fusion; small GEMMs done with warp shuffles or smem-resident accumulators.",
+            "rating_0_to_10": 9.0,
+            "risk": "Need correct warp-level reductions for softmax and LN; tensor cores likely unused (matrices too small), so peak fp16 not reached - but kernel becomes BW-bound minimum which is the goal."
+          },
+          "memory_bandwidth": {
+            "notes": "Reads input once, writes output once. ~2x59MB = 118MB total. At ~1.5TB/s achievable, ~80us lower bound.",
+            "rating_0_to_10": 10.0,
+            "risk": "Coalescing of NHWC window reads needs care; 16 tokens of 32 fp16 = 1KB per window, stride=W*C in memory, not contiguous across tokens."
+          },
+          "register_pressure": {
+            "notes": "Per thread: ~16 values (one per token) for attention; in MLP, hidden=128 split across 32 threads = 4 values/thread. Tractable.",
+            "rating_0_to_10": 6.0,
+            "risk": "Storing 16x16 attention matrix + 16x128 MLP hidden in smem ~ 4.5KB/CTA - fine."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single CTA (1 warp=32 threads) per 4x4 window performs LN1, QKV, attn+RPE, softmax, projection+resid, LN2, FC1+GELU, FC2+resid all in shared mem/registers. bottleneck=compute/latency-bound: each thread does scalar FMAs over C_DIM=32 or HIDDEN=128 sequentially; weight loads from gmem repeated per window; only 32 threads/CTA limits occupancy/ILP. FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: Got 1.91x vs 5x expected \u2014 fused design correct but underutilizes the warp (one thread per output channel of C=32, no tensor cores, sequential GEMM). Next bet: use a full block (128-256 threads) per window with cooperative tiled GEMMs and/or MMA (m16n8k16 fp16 tensor core) for QKV/proj/FC1/FC2; also cache weights once in shared across all windows of a batch by using a persistent CTA. PERF_GAP: expected=5.0x observed=1.91x; reason=under-parallelized warp-only execution and repeated gmem weight loads, no tensor cores.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 4.94979190826416,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 9.43727970123291,
+            "speedup_factor": 1.906601302870218,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "9fc380da7d4d884f85d84d377f1f1941fe782d13"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 5.36,
+          "rationale": "",
+          "score_0_to_1": 0.9,
+          "title": "Tensor-core MMA fused mega-kernel (block-per-window, wmma/mma.m16n8k16)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.92,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Tensor cores well utilized for QKV/proj/FC1/FC2.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Weights re-read per window from gmem; could cache in smem across CTAs.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "wmma fragments + per-thread softmax buffer; manageable at 2 warps/CTA.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "Best leaf so far at 5.36x. Children should refine, not regress: focus on epilogue fusion / async copies / PTX mma.",
+        "overall_rating_0_to_10": 9.2,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.71779203414917,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 9.206048011779785,
+            "speedup_factor": 5.359233148580516,
+            "status": "passed"
+          },
+          "parent_solution_id": "9fc380da7d4d884f85d84d377f1f1941fe782d13",
+          "solution_id": "04109be269bbb13ac5bb036f115d0d5c14c1af4e"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 3.4,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Cache hot weights (qkv_w/proj_w/fc1_w/fc2_w) in shared memory; reuse across windows in CTA"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Lower occupancy from smem caching offsets reuse gains.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Weights reused across 2 windows per CTA, reducing DRAM reads, but only marginal benefit vs L2 hit rate.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Unchanged from n1a.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Mega-kernel with all 4 weight matrices (qkv,proj,fc1,fc2) staged into shared memory once per CTA, then reused across WINS_PER_CTA=2 windows; per-warp computes one window via wmma. bottleneck=smem capacity / occupancy \u2014 staging ~14KB of weights + per-warp scratch limits WINS_PER_CTA, and the high static smem reduces achievable CTAs/SM vs n1a's lean version.\nFOLLOW_THROUGH: aligned_with_intent=yes. Implemented qkv/proj/fc1/fc2 staged into smem with cooperative load before window loop.\nUPDATE_BELIEF: Observed 3.40x vs new ref (1.72ms->2.45ms wallclock, regression from parent n1a's 5.36x/1.72ms). Caching hurt because (a) extra 14KB static smem reduced occupancy, (b) WINS_PER_CTA had to stay at 2 (4 overflowed 48KB), and (c) the original gmem weight reads were already L2/L1-cached cheaply across the grid. PERF_GAP: expected 6.5x, observed 3.4x \u2014 smem pressure dominates the saved gmem traffic. Next bet: revert weight caching for fc1/fc2 (largest), keep only qkv_w in smem if anything; or push smem reuse via dynamic smem + opt-in carveout (>48KB) to enable WINS_PER_CTA=4 with cached weights.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "score": 3.4,
+            "score_name": "speedup",
+            "status": "passed"
+          },
+          "parent_solution_id": "04109be269bbb13ac5bb036f115d0d5c14c1af4e",
+          "solution_id": "fcec33542c5c3ae1940fa97fb050c3bdaa4505fc"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 6.27,
+          "rationale": "",
+          "score_0_to_1": 0.92,
+          "title": "Fragment-level bias+activation: avoid tmp_c smem round-trip after each MMA"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.95,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Keeps wmma; reduces __syncwarp churn.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Eliminates store-then-reload of accumulator through smem.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Direct fragment iteration; needs careful mapping of bias indices per lane.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a2",
+        "node_type": "decision",
+        "notes": "CURRENT: Mega-kernel with wmma 16x16x16, one warp per window, 2 windows/CTA. Bias/GELU/residual applied directly on fragment elements via frag_row/frag_col mapping, avoiding smem round-trip after MMAs. BOTTLENECK: likely smem traffic + small-K MMAs (K=32) and remaining LN/softmax serial steps. FOLLOW_THROUGH: yes - current_code matches fragment-level epilogue intent. UPDATE_BELIEF: achieved 6.27x (above 6.0 target). Next bet: reduce smem usage by keeping QKV/attn output in registers across stages, and/or use mma.m16n8k16 PTX to halve fragment count and enable better K-staging.",
+        "overall_rating_0_to_10": 9.4,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.4107840061187744,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 8.851008415222168,
+            "speedup_factor": 6.273822482275149,
+            "status": "passed"
+          },
+          "parent_solution_id": "04109be269bbb13ac5bb036f115d0d5c14c1af4e",
+          "solution_id": "8c17a05296853cb18332a1e346f020dc3e925e45"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 7.0,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Switch to PTX mma.m16n8k16 with cp.async double-buffered weight tiles"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.45,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Best peak TC throughput on Ada/Blackwell with finer tile shape.",
+            "rating_0_to_10": 9.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "cp.async overlaps weight loads with compute.",
+            "rating_0_to_10": 9.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Hand-rolled PTX increases reg use; careful staging needed.",
+            "rating_0_to_10": 5.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Child of n1a; mutually exclusive with n1a1/n1a2 only in implementation effort priority, but architecturally composable. Kept distinct because PTX-level rewrite is a deeper, riskier path.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "04109be269bbb13ac5bb036f115d0d5c14c1af4e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 6.27,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "cp.async double-buffered weight/activation pipeline (overlap gmem loads with MMA)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_swin_block_fp16_simplified_r30_1",
+        "node_type": "decision",
+        "notes": "CURRENT: Block-per-CTA Swin window fused mega-kernel with WMMA for QKV/proj/FC1/FC2, two windows per CTA, fp16 throughout. Bottleneck: compute + shared-memory traffic with redundant weight reloads across windows.\nFOLLOW_THROUGH: aligned_with_intent: no. Intent was cp.async double-buffered overlap of gmem loads with MMA; implementation just kept WMMA reloads from gmem each tile without cp.async pipelining.\nUPDATE_BELIEF: Despite misalignment, run achieved 6.27x speedup (1.41ms vs 8.85ms ref) - currently best. Next bet: share FC1/FC2 weights across windows within a CTA via shared-memory staging (n1a4) to amortize gmem traffic; then layer cp.async pipelining on top.\nimpacts: memory_bandwidth rating ~6 (weights reloaded per window), compute_intensity ~8 (WMMA utilized), sync ~7 (many __syncwarp).",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.7536640167236328,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 9.318143844604492,
+            "speedup_factor": 5.313528564048182,
+            "status": "passed"
+          },
+          "parent_solution_id": "04109be269bbb13ac5bb036f115d0d5c14c1af4e",
+          "solution_id": "778f7d383e94a03a44d3d5d564cdbd467b0e5728"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 7.2,
+          "rationale": "",
+          "score_0_to_1": 0.78,
+          "title": "Share FC1/FC2 (and proj/qkv) weights across WINS_PER_CTA windows via SMEM staging"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a4",
+        "node_type": "decision",
+        "notes": "Promoted: with n1a2 at 1.41ms, MLP weight bandwidth dominates and can be amortized across warps in CTA. SELF_CHECK: child of n1a; composable with n1a3 but independent from n1a1/n1a2 implementation specifics. Excludes siblings by focusing on weight reuse, not activation/scheduling.",
+        "overall_rating_0_to_10": 8.2,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "04109be269bbb13ac5bb036f115d0d5c14c1af4e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Lower occupancy from smem caching offsets reuse gains.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Weights reused across 2 windows per CTA, reducing DRAM reads, but only marginal benefit vs L2 hit rate.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Unchanged from n1a.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 30,
+        "node_id": "node_swin_block_fp16_simplified_r30_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1a1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "fcec33542c5c3ae1940fa97fb050c3bdaa4505fc",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 6.5,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.55,
+          "title": "cp.async double-buffered weight/activation pipeline (overlap gmem loads with MMA)"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Keeps wmma; reduces __syncwarp churn.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Eliminates store-then-reload of accumulator through smem.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Direct fragment iteration; needs careful mapping of bias indices per lane.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 41,
+        "node_id": "node_swin_block_fp16_simplified_r41_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: Fused per-warp mega-kernel with wmma MMA across LN1->QKV->Attn->Proj->LN2->FC1->FC2 and residual; WINS_PER_CTA=2 warps share SMEM staging. Bottleneck: mix of weight gmem bandwidth and per-warp MMA serialization. FOLLOW_THROUGH: no - intent was cp.async double-buffered pipeline overlap but current code still uses synchronous wmma::load_matrix_sync from gmem with no cp.async or ping-pong buffers. UPDATE_BELIEF: eval got 5.31x (1.75ms) which is worse than best n1a2 (6.27x/1.41ms), so this path/code is a regression vs best. Next bet: pursue n1a4 (share FC1/FC2 weights across WINS_PER_CTA windows via SMEM staging) since weights dominate gmem traffic and are reused across windows.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1a2",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "8c17a05296853cb18332a1e346f020dc3e925e45",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 7.2,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Stage fc1_w/fc2_w into shared memory once per CTA and reuse across both windows"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_swin_block_fp16_simplified_r41_cont_1_a",
+        "node_type": "decision",
+        "notes": "Next-step chain refinement on top of r30_1 (best 1.41ms). Load fc1_w (128x32) and fc2_w (32x128) into shared memory cooperatively across both warps once at CTA start; both windows reuse. Reduces global weight traffic ~2x for MLP (dominant compute). SELF_CHECK: only child of cont node; no siblings to exclude.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "node_swin_block_fp16_simplified_r41_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 7.0,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Revert to n1a2 base and add cp.async ping-pong for fc1_w/fc2_w tiles only"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.55,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_swin_block_fp16_simplified_r41_cont_1_child1",
+        "node_type": "decision",
+        "notes": "Next step: restart from best solution (n1a2, 1.41ms) and add cp.async double-buffered staging strictly on the FC1/FC2 weight tiles (highest gmem volume). Avoid touching attention path. SELF_CHECK: single child under solved node; chain refinement, not sibling alternative.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "node_swin_block_fp16_simplified_r41_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.7,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 50,
+        "node_id": "node_swin_block_fp16_simplified_r50_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "node_swin_block_fp16_simplified_r30_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "778f7d383e94a03a44d3d5d564cdbd467b0e5728",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fuse a simplified Swin transformer block (LN1 + window-MSA(qkv,proj) + residual + LN2 + MLP(fc1,GELU,fc2) + residual) on a (1,720,1280,32) fp16 NHWC tensor with 4x4 windows (N=16), single head, hidden=128, no shift. The block is dominated by repeated activation-tensor memory traffic (~59MB) across 6+ sub-ops; weights are tiny (~25KB) and per-window working set fits easily in shared memory + registers. The natural parallel unit is one 4x4 window per CTA/warp (57600 windows total on 128 SMs of RTX5090), with dim=32 perfectly matching warp size. Key constraints: numeric tolerance rtol=atol=0.01 (fp16, slack for fused softmax/LN), correctness of softmax reduction and LN mean/var in fp32, and exposing set_params to receive state_dict in declared order including rpe_bias.",
+  "open_questions": [
+    "Exact state_dict ordering after self.half() and rpe_bias buffer registration \u2014 what is the precise positional order for set_params?",
+    "Is LayerNorm's eps the default 1e-5 (in fp16 LN, accumulation should be in fp32)?",
+    "Are tensor cores worth invoking at K=32 (warp-level wmma 16x16x16 fits only one tile) or are warp-shuffle FMA loops faster for these tiny GEMMs?",
+    "Best memory layout for the 16-token window load \u2014 gather via 16 strided loads of 32 fp16 each, or transpose to per-window contiguous in a tiny pre-pass?",
+    "Do we need to support arbitrary H,W or hard-code the 720x1280 case (nH=180, nW=320, both divisible by 4)?",
+    "Will fc1 weights (32x128 = 4KB fp16) and fc2 (128x32 = 4KB fp16) fit comfortably as __constant__ memory or be cached in L1 across all CTAs?",
+    "Acceptable approximation for GELU (tanh-approx vs exact erf) under the 0.01 tolerance?",
+    "Is the residual path's add-into-output stable in fp16, or do we need fp32 accumulation to stay within tolerance?"
+  ]
+}
