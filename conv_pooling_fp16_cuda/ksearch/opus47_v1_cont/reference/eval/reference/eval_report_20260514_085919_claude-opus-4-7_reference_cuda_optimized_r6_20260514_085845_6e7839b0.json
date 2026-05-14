@@ -1,0 +1,11 @@
+{
+  "claude-opus-4-7_reference_cuda_optimized_r6_20260514_085845_6e7839b0": {
+    "status": "passed",
+    "latency_ms": 0.5323519706726074,
+    "reference_latency_ms": 4.799488067626953,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 9.01562938062007,
+    "log_excerpt": "PASSED: latency=0.532ms ref=4.799ms speedup=9.02x",
+    "metrics": {}
+  }
+}

@@ -1,0 +1,357 @@
+{
+  "computed_signals": {
+    "round_index": 6,
+    "trace": {
+      "latency_ms": 0.40595200657844543,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 4.404895782470703,
+      "speedup_factor": 10.8507796761426,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1",
+    "nodes": [
+      {
+        "action": {
+          "description": "Root analysis node",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "Deep analysis of Conv2d+ReLU+AvgPool2d fused pipeline",
+          "score_0_to_1": 0.0,
+          "title": "ROOT"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): high BW HBM/GDDR7, large L2, supports fp16 tensor cores via mma. fp16 input means 2B/element. Output spatial 360x640.",
+            "notes": "Conv 3x3 with C_in=16, C_out=32 is compute-light; likely memory-bound. Tensor cores can help if reformulated as implicit GEMM.",
+            "rating_0_to_10": 6.0,
+            "risk": "Small C_in=16 limits tensor core efficiency unless we pack along spatial."
+          },
+          "memory_bandwidth": {
+            "notes": "Input 1*16*720*1280*2B = ~29.5MB. Output post-pool 1*32*360*640*2B = ~14.7MB. Conv intermediate would be ~59MB if materialized. Fusing avoids that.",
+            "rating_0_to_10": 8.0,
+            "risk": "If not fused, intermediate write/read dominates."
+          },
+          "register_pressure": {
+            "notes": "Per 2x2 output pool tile, need conv outputs for 2x2 spatial = 4 conv outputs per out-channel. Weights: 32*16*3*3 = 4608 fp16 = 9KB fits in shared memory easily.",
+            "rating_0_to_10": 5.0,
+            "risk": "Holding all 32 output channels per thread may pressure registers; tile across channels."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) CLASSIFICATION: Fused stencil(3x3 conv) + elementwise(ReLU) + reduction(2x2 avgpool). Dense access, deterministic indices. Dims: N=1,C_in=16,H=720,W=1280,C_out=32,kernel=3 pad=1, pool=2 stride=2 -> out H=360,W=640. fp16. 2) MATH: out[co,oh,ow] = avg over (i,j) in 2x2 of ReLU(sum_{ci,kh,kw} x[ci,2*oh+i+kh-1,2*ow+j+kw-1]*w[co,ci,kh,kw] + b[co]). 3) LAYOUT: x NCHW fp16 contiguous; w 32x16x3x3 fp16 (9KB - fits SMEM/const); b 32 fp16. Pooling region needs 4x4 input footprint (2x2 outputs each needing 3x3, overlapping = 4x4). Reuse high across output tile. 4) REGIMES: (a) memory-bound conv input streaming - currently dominant; (b) weight reuse - small weights, broadcast easily; (c) compute-bound if we use tensor cores at large tile. 5) KNOBS: tile (oh,ow) per block, channel tiling (full 32 vs split), SMEM for input halo vs direct, weights in const/SMEM/registers, vectorized loads (half2/uint4), tensor core (wmma/mma m16n8k16) vs cuda cores, fusion depth (conv->relu->pool all in one). 6) SKELETON: each block computes a tile of output pooled pixels (e.g., 16x16 pooled = 32x32 conv outputs = 34x34 input halo per channel). Load 16 channels of input halo to SMEM, load weights to SMEM/registers, each thread computes 2x2 conv outputs, applies ReLU, averages, writes pooled output. 7) FAMILIES: (F1) Fully-fused single-kernel cuda-core implementation with SMEM halo tiling - working set fits (16ch*34*34*2B=37KB SMEM + 9KB weights). TOP candidate. (F2) Tensor-core implicit GEMM fused with pool - reshape conv as GEMM (M=H*W,N=C_out,K=C_in*9), but small C_in*9=144 K-dim ok. (F3) Two-pass: conv+relu fused, pool separate - WORSE, leaves global trip. Prefer F1.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.49404799938201904,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "reference_latency_ms": 4.063104152679443,
+            "speedup_factor": 8.224108098326044,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "4d0535b175d1074eee5837ab8003d3330bf72e7f"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused CUDA kernel that performs Conv2d(3x3,pad=1) -> ReLU -> AvgPool2d(2x2) in one pass. Each thread block computes a tile of pooled output pixels. Stage the input halo for the tile across all 16 input channels into shared memory; stage weights (32*16*3*3=4608 fp16) into shared memory or constant memory. Each thread computes the 2x2 conv outputs for one pooled pixel across some channel subset, applies ReLU, averages 2x2, writes one pooled output. Use vectorized fp16 loads (half2) where possible.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "Avoids materializing the conv intermediate (saves ~59MB of global traffic). Weights tiny, halo tile small. Strongest memory-bound win.",
+          "score_0_to_1": 0.9,
+          "title": "Fully-fused conv+relu+avgpool with SMEM halo tiling"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Per block tile e.g. 16x16 pooled -> 32x32 conv -> 34x34 halo. 16ch * 34*34*2B = 37KB SMEM (fits in 100KB+ SMEM on Blackwell). Weights 9KB.",
+            "notes": "FP32 FMA on RTX5090; could exploit half2/tensor cores.",
+            "rating_0_to_10": 7.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "Avoids intermediate; halo reuse strong.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "conv_acc[OUT_C][4] + patch[4][4] per thread is heavy; may limit occupancy.",
+            "rating_0_to_10": 5.0,
+            "risk": "med"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=single fused kernel staging 4x4 halo per channel in SMEM with double-buffered channel pipeline, computes 2x2 conv outputs per thread then ReLU+avgpool to 1 pooled pixel per thread; weights/bias in __constant__. bottleneck=likely compute/register pressure now (memory traffic minimized). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 10.85x speedup vs ref greatly exceeded 1.5x expectation \u2014 fusion + constant weights + halo SMEM dominated. next bet: push further via __half2 vectorized SMEM loads / HMMA-style FMA on packed half2, or tensor-core wmma on im2col tile; also try larger pooled tile to amortize halo loads.",
+        "overall_rating_0_to_10": 9.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.40595200657844543,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "reference_latency_ms": 4.404895782470703,
+            "speedup_factor": 10.8507796761426,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "86afda396e8871d8b8e4a2bc1ecc5f32c09607e1"
+        }
+      },
+      {
+        "action": {
+          "description": "Formulate the 3x3 conv as implicit GEMM with M=H_out*W_out/4 (per pool group), N=C_out=32, K=C_in*9=144. Use wmma/mma fp16 tensor cores (m16n16k16 or m16n8k16). Inside the same kernel, after producing 4 conv outputs per pooled pixel, apply ReLU and 2x2 average reduction before writeback. Weights pre-packed into a 32x144 matrix in SMEM.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.8,
+          "rationale": "Tensor cores could improve arithmetic throughput; however problem is memory bound, so gain limited. Adds complexity for im2col-like staging.",
+          "score_0_to_1": 0.5,
+          "title": "Tensor-core implicit GEMM fused with pool"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.45,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "C_out=32 fits one wmma N tile (16 or 32). K=144 small but workable. Need NHWC-like staging.",
+            "notes": "Tensor cores underutilized at small K but still faster than scalar fp16 FMA.",
+            "rating_0_to_10": 7.0,
+            "risk": "Overhead of im2col staging may eat gains; memory bound limits ceiling."
+          },
+          "memory_bandwidth": {
+            "notes": "Same input traffic as F1; same output. No advantage in BW.",
+            "rating_0_to_10": 8.0,
+            "risk": "If staging duplicates halo into SMEM in im2col layout, SMEM usage grows."
+          },
+          "register_pressure": {
+            "notes": "wmma fragments are fixed-size; manageable.",
+            "rating_0_to_10": 6.0,
+            "risk": "Multiple K-iterations accumulate fine."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Distinct threading/data model from F1 (warp-level wmma vs scalar threads). Cannot trivially combine\u2014the data staging layout differs (im2col vs direct halo).",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Within the fused-kernel approach, choose a NHWC reorganization on-chip: read NCHW input but transpose-into-SMEM as NHWC (channels innermost) so each thread can do vectorized half8 loads across channels (16 fp16 = 32B per pixel), enabling efficient inner-product over C_in via half2 dot products. Output written in NCHW as required.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "C_in=16 maps to one vector load per spatial pixel, dramatically improving channel-reduction inner loop.",
+          "score_0_to_1": 0.5,
+          "title": "On-chip NHWC channel-vectorized fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.45,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "16 fp16 channels = exactly one 32B aligned load (uint4). Perfect for vectorization.",
+            "notes": "Each thread does 9 inner iterations over kh,kw, each summing 16 channels via 8 half2 FMAs.",
+            "rating_0_to_10": 8.0,
+            "risk": "NCHW->NHWC stage in SMEM costs SMEM bandwidth but reusable across kernel taps."
+          },
+          "memory_bandwidth": {
+            "notes": "Coalesced reads in NCHW are per-channel rows; need careful global access pattern. Could read NCHW directly per-channel then build NHWC in SMEM.",
+            "rating_0_to_10": 8.0,
+            "risk": "Global access still NCHW; ensure each warp reads contiguous W."
+          },
+          "register_pressure": {
+            "notes": "Per thread accumulators for out-channel tile size affect spill.",
+            "rating_0_to_10": 6.0,
+            "risk": "Manageable with out-channel tile of 8 or 16."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: NHWC channel-vectorized layout \u2014 mutually exclusive with NCHW SMEM (n1) and im2col/wmma (n2). De-prioritized: n1 already 10.85x with NCHW; NHWC reshuffle unlikely to beat without tensor cores.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.2,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "half2-vectorized SMEM + FMA on packed half2 within fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: refinement (CHILD) of n1, not sibling. Replace per-pixel __half2float with __half22float2 / __hfma2 across 2 horizontal pixels, halving conversion overhead and register pressure. Mutually exclusive with n1b (larger tile).",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "86afda396e8871d8b8e4a2bc1ecc5f32c09607e1",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.15,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Enlarge pooled tile (e.g., 16x16 pooled => 32x32 conv) to amortize halo"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative refinement of n1 \u2014 changes tile geometry, mutually exclusive with n1a's half2 pipeline (would need separate impl). Reduces halo overhead ratio; risk: register pressure & occupancy with OUT_C accumulators.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "86afda396e8871d8b8e4a2bc1ecc5f32c09607e1",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Split OUT_C across threads / warp-cooperative output channels to cut regs"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: orthogonal refinement of n1 addressing register pressure (conv_acc[OUT_C][4]). Mutually exclusive with n1a/n1b because it changes thread-to-output mapping. Improves occupancy at cost of more syncs/SMEM reduction.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": "86afda396e8871d8b8e4a2bc1ecc5f32c09607e1",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused Conv2d(3x3, pad=1, C_in=16, C_out=32) + ReLU + AvgPool2d(2x2) on a 1x16x720x1280 fp16 NCHW input producing a 1x32x360x640 fp16 output on RTX5090. The pipeline is dominated by memory traffic: avoiding the ~59MB conv intermediate via single-kernel fusion is the primary lever. Weights are tiny (9KB) and fit easily in SMEM/constant memory. Each pooled output requires a 4x4 input footprint per channel across 16 channels, so a modest tile (e.g., 16x16 pooled outputs) needs ~37KB SMEM for input halo and ~9KB for weights \u2014 fits comfortably. Key constraints: fp16 precision (rtol/atol=0.01), NCHW input/output layout, alignment of half2/uint4 vector loads, and handling padding=1 boundaries.",
+  "open_questions": [
+    "What is the reference kernel's measured latency on RTX5090 (baseline to beat)?",
+    "Is the input always exactly 1x16x720x1280 fp16 or do we need to handle variable shapes?",
+    "Can we assume input pointer is 16B/32B aligned for vectorized loads (uint4)?",
+    "Does the reference use fp32 accumulation inside conv? (affects tolerance margin)",
+    "What's the best out-channel tiling factor to balance register pressure vs reuse on Blackwell SMs?",
+    "Are weights+bias guaranteed to be set before run() (set_params called)?",
+    "Will tensor cores actually outperform CUDA-core fp16 FMA given this is memory-bound and K=144 is small?",
+    "Should we use __constant__ memory for the 9KB weights instead of SMEM to free SMEM for larger tiles?"
+  ]
+}
