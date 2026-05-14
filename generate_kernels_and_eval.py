@@ -322,6 +322,11 @@ def main():
         action="store_true",
         help="Run NVIDIA Nsight Compute (ncu) profiling on passed kernels to collect hardware metrics for the LLM.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output: print kernel source and NCU profiler report after each evaluation.",
+    )
 
     # Device Bench options (unified for CUDA / XPU / any accelerator)
     parser.add_argument("--device-bench-device", default=None,
@@ -358,6 +363,7 @@ def main():
             atol=args.atol,
             artifacts_dir=args.artifacts_dir,
             enable_ncu_profiling=args.enable_ncu_profiling,
+            verbose=args.verbose,
         )
     elif task_source == "device_bench":
         from k_search.tasks.device_bench_task import DeviceBenchTask

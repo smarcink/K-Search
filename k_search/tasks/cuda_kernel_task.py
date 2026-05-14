@@ -75,6 +75,7 @@ class CudaKernelTask:
         artifacts_dir: str | None = None,
         name: str | None = None,
         enable_ncu_profiling: bool = False,
+        verbose: bool = False,
     ) -> None:
         self._ref_path = str(Path(ref_path).resolve())
         if not Path(self._ref_path).exists():
@@ -92,6 +93,7 @@ class CudaKernelTask:
         self._name = str(name or Path(self._ref_path).stem)
         self._artifacts_dir = str(artifacts_dir) if artifacts_dir else None
         self._enable_ncu_profiling = bool(enable_ncu_profiling)
+        self._verbose = bool(verbose)
         self._solutions: dict[str, Solution] = {}
 
         # Feedback state for world-model prompts
@@ -282,6 +284,10 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
             if self._enable_ncu_profiling and eval_result.is_passed():
                 eval_result = self._run_ncu_profiling(eval_result, tmp_dir, env)
 
+            # Verbose output
+            if self._verbose:
+                self._print_debug_report(eval_result, kernel_cu)
+
             return eval_result
 
         except subprocess.TimeoutExpired:
@@ -329,6 +335,30 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
             # Profiling is best-effort; never fail the eval
             pass
         return eval_result
+
+    def _print_debug_report(self, eval_result: EvalResult, kernel_cu: str) -> None:
+        """Print kernel source and profiler report when debug mode is enabled."""
+        sep = "=" * 60
+        print(f"\n{sep}")
+        print(f"[DEBUG] [{self._name}] Eval status: {eval_result.status}")
+        print(f"{sep}")
+
+        # Print kernel source
+        print(f"\n--- kernel.cu ---")
+        print(kernel_cu[:6000] if len(kernel_cu) > 6000 else kernel_cu)
+        if len(kernel_cu) > 6000:
+            print(f"... (truncated, {len(kernel_cu)} chars total)")
+
+        # Print profiler report
+        if eval_result.profiler_metrics:
+            print(f"\n--- NCU Profiler Report ---")
+            for line in eval_result.profiler_summary_lines():
+                print(f"  {line}")
+        elif self._enable_ncu_profiling and eval_result.is_passed():
+            print(f"\n--- NCU Profiler Report ---")
+            print("  (no profiler data collected)")
+
+        print(f"{sep}\n")
 
     def _parse_eval_output(self, stdout: str) -> EvalResult:
         """Parse JSON output from cuda_kernel_eval.py."""
