@@ -51,6 +51,25 @@
             ]
         },
         {
+            "name": "Compare Conv Polling fp16 CUDA implementations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/compare_kernels.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "justMyCode": true,
+            "args": [
+                "conv_pooling_fp16_cuda/reference.py",
+                "conv_pooling_fp16_cuda/opus47_v0",
+                "conv_pooling_fp16_cuda/opus47_v1",
+                "--precision", "fp16",
+                "--warmup", "100",
+                "--iters", "1000", 
+                "--atol", "1e-2",
+            ]
+        },
+        {
             "name": "Compare Elementwise ADD fp16 implementations",
             "type": "debugpy",
             "request": "launch",
