@@ -93,9 +93,9 @@ std::vector<torch::Tensor> run(torch::Tensor x) {
 
     auto stream = c10::cuda::getCurrentCUDAStream();
 
-    // --- Conv2d 3x3 (our custom kernel) ---
+    // --- Fused Conv2d 3x3 + ReLU (our custom kernel) ---
     auto conv_out = torch::empty({N, Cout, H, W}, x.options());
-    launch_conv2d_3x3(
+    launch_conv2d_3x3_relu(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(g_weight.data_ptr<at::Half>()),
         g_has_bias ? reinterpret_cast<const __half*>(g_bias.data_ptr<at::Half>()) : nullptr,
@@ -103,9 +103,9 @@ std::vector<torch::Tensor> run(torch::Tensor x) {
         N, Cin, Cout, H, W,
         stream.stream());
 
-    // --- Fused ReLU + AvgPool2x2 (our custom kernel) ---
+    // --- AvgPool2x2 (our custom kernel) ---
     auto out = torch::empty({N, Cout, H / 2, W / 2}, conv_out.options());
-    launch_relu_avgpool2x2(
+    launch_avgpool2x2(
         reinterpret_cast<const __half*>(conv_out.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
         N, Cout, H, W,
