@@ -277,8 +277,6 @@ def main():
     # Continue optimization options
     parser.add_argument("--continue-from-solution", default=None,
                         help="Resume optimization from an existing solution (name, .json path, or directory with kernel sources)")
-    parser.add_argument("--continue-from-description", default=None,
-                        help="Description for the initial kernel when --continue-from-solution is a directory")
     parser.add_argument(
         "--continue-from-world-model",
         default=None,
@@ -371,10 +369,6 @@ def main():
         )
     else:
         raise ValueError(f"Unsupported task_source: {task_source}")
-
-    # Attach optional continue-from description for directory-based solution loading
-    if hasattr(args, 'continue_from_description') and args.continue_from_description:
-        task._continue_from_description = args.continue_from_description
 
     generate_and_evaluate(
         task=task,
