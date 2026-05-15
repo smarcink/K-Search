@@ -1,14 +1,14 @@
-"""Unified Device Bench Task for K-Search.
+"""Triton Kernel Task for K-Search.
 
-Single task class that handles both NVIDIA CUDA and Intel XPU (and any
-future PyTorch accelerator backend).  Device-specific behaviour is driven
-by the ``--device`` argument:
+Single task class that handles Triton kernel optimization on both NVIDIA CUDA
+and Intel XPU (and any future PyTorch accelerator backend).  Device-specific
+behaviour is driven by the ``--device`` argument:
 
   - ``cuda:N``  → NVIDIA-specific prompts / optimization hints
   - ``xpu:N``   → Intel XPU-specific prompts / optimization hints
 
-Old ``xpu_bench`` and ``cuda_bench`` task names are kept as CLI aliases that
-simply resolve to this class.
+Backward-compat aliases (DeviceBenchTask, XpuBenchTask, CudaBenchTask) are
+kept for existing code.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ Then implement your optimized version.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class DeviceBenchTaskConfig:
+class TritonKernelTaskConfig:
     """Configuration for Device Bench task evaluation."""
     device: str = "cuda:0"
     precision: str = "fp16"
@@ -111,7 +111,7 @@ class DeviceBenchTaskConfig:
 # Task class
 # ---------------------------------------------------------------------------
 
-class DeviceBenchTask:
+class TritonKernelTask:
     """Unified task wrapper for optimizing PyTorch modules on any accelerator.
 
     Accepts any local .py file defining Model, get_inputs(), and optionally
@@ -136,7 +136,7 @@ class DeviceBenchTask:
         verbose: bool = False,
     ) -> None:
         self._ref_path = str(Path(ref_path).resolve())
-        self._cfg = DeviceBenchTaskConfig(
+        self._cfg = TritonKernelTaskConfig(
             device=str(device),
             precision=str(precision),
             num_correct_trials=int(num_correct_trials),
@@ -781,9 +781,3 @@ Your implementation will be evaluated for:
                 print(f"[{self._name}] Failure excerpt:\n{excerpt}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Backward-compat aliases
-# ---------------------------------------------------------------------------
-
-XpuBenchTask = DeviceBenchTask
-CudaBenchTask = DeviceBenchTask

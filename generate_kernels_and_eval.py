@@ -241,12 +241,6 @@ def generate_and_evaluate(
 def main():
     parser = argparse.ArgumentParser(description="Generate kernels with GPT/Gemini (OpenAI-compatible) and evaluate via task backends.")
     parser.add_argument(
-        "--task-source",
-        choices=["cuda_kernel", "device_bench"],
-        default="cuda_kernel",
-        help="Task backend to use. 'cuda_kernel' for multi-file CUDA kernels, 'device_bench' for Triton on CUDA/XPU.",
-    )
-    parser.add_argument(
         "--task-path",
         default=None,
         help="Path to reference .py file with Model class to optimize.",
@@ -255,7 +249,7 @@ def main():
     parser.add_argument("--model-name", required=True, help="LLM model name (e.g., gpt-4.1, gpt-5, gemini-2.5-pro via OpenAI-compatible endpoint, or claude-opus-4-6/claude-4-6-opus via Anthropic-compatible endpoint)")
     parser.add_argument("--base-url", default=None, help="Provider base URL. For Claude/Anthropic models a GNAI OpenAI URL is auto-rewritten to the /providers/anthropic path; or pass it directly (e.g. https://gnai.intel.com/api/providers/anthropic)")
     parser.add_argument("--api-key", default=None, help="API key; if omitted, uses LLM_API_KEY env var")
-    parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel")
+    parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel. 'cuda' uses the CUDA kernel task; 'triton'/'python' uses the Triton kernel task.")
     parser.add_argument("--target-gpu", default="H100", help="Target GPU architecture hint for prompts")
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
 
@@ -329,17 +323,17 @@ def main():
         help="Enable verbose output: print kernel source and profiler report after each evaluation.",
     )
 
-    # Device Bench options (unified for CUDA / XPU / any accelerator)
-    parser.add_argument("--device-bench-device", default=None,
-                        help="Device string (e.g. cuda:0, xpu:0). Auto-detected from task-source alias if omitted.")
+    # Triton Kernel options (unified for CUDA / XPU / any accelerator)
+    parser.add_argument("--triton-device", default=None,
+                        help="Device string for Triton kernel task (e.g. cuda:0, xpu:0). Defaults to cuda:0.")
     parser.add_argument(
-        "--device-bench-precision",
+        "--triton-precision",
         default="fp16",
         choices=["fp32", "fp16", "bf16"],
-        help="dtype for Device Bench eval",
+        help="dtype for Triton kernel eval",
     )
-    parser.add_argument("--device-bench-num-correct-trials", type=int, default=5, help="Number of correctness trials")
-    parser.add_argument("--device-bench-num-perf-trials", type=int, default=100, help="Number of performance trials")
+    parser.add_argument("--triton-num-correct-trials", type=int, default=5, help="Number of correctness trials (triton kernel task)")
+    parser.add_argument("--triton-num-perf-trials", type=int, default=100, help="Number of performance trials (triton kernel task)")
 
     args = parser.parse_args()
 
@@ -347,13 +341,14 @@ def main():
     if not api_key:
         raise ValueError("API key is required (pass --api-key or set LLM_API_KEY)")
 
-    task_source = str(args.task_source or "cuda_kernel")
     task_path = str(args.task_path or "")
-    if task_source == "cuda_kernel":
+    language = args.language
+
+    if language == "cuda":
         from k_search.tasks.cuda_kernel_task import CudaKernelTask
 
         if not task_path:
-            raise ValueError("--task-path is required for --task-source=cuda_kernel (path to reference .py file)")
+            raise ValueError("--task-path is required for --language=cuda (path to reference .py file)")
         task = CudaKernelTask(
             ref_path=task_path,
             gpu=args.target_gpu,
@@ -366,24 +361,24 @@ def main():
             enable_profiling=args.enable_profiling,
             verbose=args.verbose,
         )
-    elif task_source == "device_bench":
-        from k_search.tasks.device_bench_task import DeviceBenchTask
+    elif language in ("triton", "python"):
+        from k_search.tasks.triton_kernel_task import TritonKernelTask
 
         if not task_path:
-            raise ValueError("--task-path is required for --task-source=device_bench (path to reference .py file with Model class)")
+            raise ValueError("--task-path is required for --language=triton (path to reference .py file with Model class)")
 
-        task = DeviceBenchTask(
+        task = TritonKernelTask(
             ref_path=task_path,
-            device=args.device_bench_device or "cuda:0",
-            precision=args.device_bench_precision,
-            num_correct_trials=args.device_bench_num_correct_trials,
-            num_perf_trials=args.device_bench_num_perf_trials,
+            device=args.triton_device or "cuda:0",
+            precision=args.triton_precision,
+            num_correct_trials=args.triton_num_correct_trials,
+            num_perf_trials=args.triton_num_perf_trials,
             artifacts_dir=args.artifacts_dir,
             enable_profiling=args.enable_profiling,
             verbose=args.verbose,
         )
     else:
-        raise ValueError(f"Unsupported task_source: {task_source}")
+        raise ValueError(f"Unsupported language: {language}")
 
     generate_and_evaluate(
         task=task,
