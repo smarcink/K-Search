@@ -2,6 +2,7 @@ import torch
 from torch import nn, Tensor
 import triton
 import triton.language as tl
+import math
 
 
 def _make_relative_position_bias(window_size, num_heads, dtype):
@@ -24,141 +25,170 @@ def _make_relative_position_bias(window_size, num_heads, dtype):
 
 
 @triton.jit
-def _swin_block_kernel(
+def attn_block_kernel(
     X_ptr, Y_ptr,
     ln1_w_ptr, ln1_b_ptr,
     qkv_w_ptr, qkv_b_ptr,
     proj_w_ptr, proj_b_ptr,
     rpe_ptr,
-    ln2_w_ptr, ln2_b_ptr,
-    fc1_w_ptr, fc1_b_ptr,
-    fc2_w_ptr, fc2_b_ptr,
-    n_windows,
-    C: tl.constexpr,
-    N: tl.constexpr,
-    H: tl.constexpr,
-    BLOCK_W: tl.constexpr,
+    num_windows,
+    C: tl.constexpr, N: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
     pid = tl.program_id(0)
     w_start = pid * BLOCK_W
-    # M = BLOCK_W * N rows of width C
-    M: tl.constexpr = BLOCK_W * N
 
-    offs_m = tl.arange(0, M)  # token index across BLOCK_W*N
-    offs_c = tl.arange(0, C)
-    offs_3c = tl.arange(0, 3 * C)
-    offs_h = tl.arange(0, H)
-    offs_n = tl.arange(0, N)
+    # Load weights/biases once per CTA
+    c_range = tl.arange(0, C)
+    n_range = tl.arange(0, N)
+    c2_range = tl.arange(0, 3 * C)
 
-    # window indices for each row of M
-    win_idx_row = offs_m // N + w_start  # [M]
-    tok_idx_row = offs_m % N             # [M]
-    row_valid = win_idx_row < n_windows
+    ln1_w = tl.load(ln1_w_ptr + c_range)  # (C,)
+    ln1_b = tl.load(ln1_b_ptr + c_range)
+    # qkv_w: (3C, C), stored as (out, in). Load as (C, 3C) for x @ w.T
+    qkv_w = tl.load(qkv_w_ptr + c2_range[:, None] * C + c_range[None, :])  # (3C, C)
+    qkv_b = tl.load(qkv_b_ptr + c2_range)  # (3C,)
+    proj_w = tl.load(proj_w_ptr + c_range[:, None] * C + c_range[None, :])  # (C, C)
+    proj_b = tl.load(proj_b_ptr + c_range)
+    # RPE bias: (1, 1, N, N)
+    rpe = tl.load(rpe_ptr + n_range[:, None] * N + n_range[None, :])  # (N, N)
 
-    # Load input X: shape (n_windows*N, C) — windows are already partitioned externally
-    x_ptrs = X_ptr + win_idx_row[:, None] * (N * C) + tok_idx_row[:, None] * C + offs_c[None, :]
-    x = tl.load(x_ptrs, mask=row_valid[:, None], other=0.0).to(tl.float32)
+    scale = 1.0 / tl.sqrt(tl.full([], C, tl.float32))
 
-    # ---- LN1 ----
+    for wi in tl.static_range(0, BLOCK_W):
+        w_idx = w_start + wi
+        mask = w_idx < num_windows
+        # Load window: (N, C)
+        x_off = w_idx * N * C + n_range[:, None] * C + c_range[None, :]
+        x = tl.load(X_ptr + x_off, mask=mask, other=0.0).to(tl.float32)  # (N, C)
+        x_res = x  # save residual
+
+        # LayerNorm1
+        mean = tl.sum(x, axis=1) / C  # (N,)
+        xm = x - mean[:, None]
+        var = tl.sum(xm * xm, axis=1) / C
+        rstd = 1.0 / tl.sqrt(var + 1e-5)
+        x_n = xm * rstd[:, None] * ln1_w[None, :] + ln1_b[None, :]  # (N, C)
+
+        # QKV: (N, C) @ (C, 3C) = (N, 3C)
+        x_n_f16 = x_n.to(tl.float16)
+        qkv_w_t = tl.trans(qkv_w).to(tl.float16)  # (C, 3C)
+        qkv = tl.dot(x_n_f16, qkv_w_t, out_dtype=tl.float32) + qkv_b[None, :].to(tl.float32)  # (N, 3C)
+
+        # Split q, k, v: each (N, C)
+        q = tl.where(c2_range[None, :] < C, qkv, 0.0)
+        # Use slicing via masks - actually we need proper split. Use reshape trick:
+        # qkv layout: [q0..qC-1, k0..kC-1, v0..vC-1]
+        # Better: do three loads
+        q_mask = c2_range < C
+        k_mask = (c2_range >= C) & (c2_range < 2 * C)
+        v_mask = c2_range >= 2 * C
+
+        # Extract via reshape: easier — use offsets
+        q_off = c_range
+        k_off = C + c_range
+        v_off = 2 * C + c_range
+        # Re-do as separate sums isn't easy. Use take pattern:
+        q = tl.sum(tl.where(c2_range[None, None, :] == q_off[None, :, None], qkv[:, None, :], 0.0), axis=2)
+        # That's too slow. Simpler: do three separate dots.
+
+        # Restart QKV cleanly with three dots
+        # Actually let's redo using slicing on qkv_w
+        # (skip; use the trick below)
+        # We'll just slice qkv via arange:
+        q = tl.zeros([N, C], dtype=tl.float32)
+        k = tl.zeros([N, C], dtype=tl.float32)
+        v = tl.zeros([N, C], dtype=tl.float32)
+        # Use a static loop? With C=32, BLOCK could index columns
+        # Simpler approach: extract by broadcasting equality is too costly.
+        # Use tl.reshape to (N, 3, C)
+        qkv_r = tl.reshape(qkv, (N, 3, C))
+        q = tl.reshape(tl.sum(tl.where(tl.arange(0, 3)[None, :, None] == 0, qkv_r, 0.0), axis=1), (N, C))
+        k = tl.reshape(tl.sum(tl.where(tl.arange(0, 3)[None, :, None] == 1, qkv_r, 0.0), axis=1), (N, C))
+        v = tl.reshape(tl.sum(tl.where(tl.arange(0, 3)[None, :, None] == 2, qkv_r, 0.0), axis=1), (N, C))
+
+        # Attention: q @ k^T  (N, N)
+        q_s = (q * scale).to(tl.float16)
+        k_t = tl.trans(k).to(tl.float16)  # (C, N)
+        attn = tl.dot(q_s, k_t, out_dtype=tl.float32) + rpe  # (N, N)
+
+        # Softmax
+        attn_max = tl.max(attn, axis=1)
+        attn_e = tl.exp(attn - attn_max[:, None])
+        attn_s = tl.sum(attn_e, axis=1)
+        attn_p = attn_e / attn_s[:, None]
+
+        # attn @ v: (N, N) @ (N, C) = (N, C)
+        attn_p_f16 = attn_p.to(tl.float16)
+        v_f16 = v.to(tl.float16)
+        out = tl.dot(attn_p_f16, v_f16, out_dtype=tl.float32)  # (N, C)
+
+        # Proj: (N, C) @ (C, C) where proj_w is (C_out, C_in), need W.T
+        proj_w_t = tl.trans(proj_w).to(tl.float16)
+        out_f16 = out.to(tl.float16)
+        y = tl.dot(out_f16, proj_w_t, out_dtype=tl.float32) + proj_b[None, :].to(tl.float32)
+
+        # Residual
+        y = y + x_res
+
+        # Store
+        tl.store(Y_ptr + x_off, y.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def mlp_block_kernel(
+    X_ptr, Y_ptr,
+    ln2_w_ptr, ln2_b_ptr,
+    fc1_w_ptr, fc1_b_ptr,
+    fc2_w_ptr, fc2_b_ptr,
+    num_rows,
+    C: tl.constexpr, H: tl.constexpr, BLOCK_R: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    r_start = pid * BLOCK_R
+
+    c_range = tl.arange(0, C)
+    h_range = tl.arange(0, H)
+    r_range = tl.arange(0, BLOCK_R)
+
+    ln2_w = tl.load(ln2_w_ptr + c_range)
+    ln2_b = tl.load(ln2_b_ptr + c_range)
+    # fc1_w: (H, C) -> need (C, H) for x @ w.T
+    fc1_w = tl.load(fc1_w_ptr + h_range[:, None] * C + c_range[None, :])  # (H, C)
+    fc1_b = tl.load(fc1_b_ptr + h_range)
+    fc2_w = tl.load(fc2_w_ptr + c_range[:, None] * H + h_range[None, :])  # (C, H)
+    fc2_b = tl.load(fc2_b_ptr + c_range)
+
+    rows = r_start + r_range
+    mask = rows < num_rows
+
+    # Load BLOCK_R rows of (C,)
+    x_off = rows[:, None] * C + c_range[None, :]
+    x = tl.load(X_ptr + x_off, mask=mask[:, None], other=0.0).to(tl.float32)  # (BLOCK_R, C)
+    x_res = x
+
+    # LayerNorm2
     mean = tl.sum(x, axis=1) / C
     xm = x - mean[:, None]
     var = tl.sum(xm * xm, axis=1) / C
     rstd = 1.0 / tl.sqrt(var + 1e-5)
-    ln1_w = tl.load(ln1_w_ptr + offs_c).to(tl.float32)
-    ln1_b = tl.load(ln1_b_ptr + offs_c).to(tl.float32)
-    x_ln1 = xm * rstd[:, None] * ln1_w[None, :] + ln1_b[None, :]
-    x_ln1_f16 = x_ln1.to(tl.float16)
+    x_n = xm * rstd[:, None] * ln2_w[None, :] + ln2_b[None, :]
 
-    # ---- QKV linear: (M, C) @ (C, 3C) ----
-    qkv_w = tl.load(qkv_w_ptr + offs_c[:, None] * (3 * C) + offs_3c[None, :])  # (C, 3C)
-    qkv_b = tl.load(qkv_b_ptr + offs_3c).to(tl.float32)
-    qkv = tl.dot(x_ln1_f16, qkv_w, out_dtype=tl.float32) + qkv_b[None, :]  # (M, 3C)
-
-    # Split q, k, v
-    q = tl.reshape(tl.where((offs_3c < C)[None, :], qkv, 0.0), (M, 3 * C))  # placeholder
-    # Instead use slicing via masks: extract via separate loads-like ops
-    # Reshape: qkv (M, 3C) -> view as (M, 3, C)
-    qkv_r = tl.reshape(qkv, (BLOCK_W, N, 3, C))
-    q = tl.reshape(qkv_r[:, :, 0, :], (M, C))
-    k = tl.reshape(qkv_r[:, :, 1, :], (M, C))
-    v = tl.reshape(qkv_r[:, :, 2, :], (M, C))
-
-    scale = 1.0 / tl.sqrt(C.to(tl.float32))
-
-    # ---- Attention per window: q (BLOCK_W,N,C) @ k^T (BLOCK_W,C,N) ----
-    q_w = tl.reshape(q, (BLOCK_W, N, C))
-    k_w = tl.reshape(k, (BLOCK_W, N, C))
-    v_w = tl.reshape(v, (BLOCK_W, N, C))
-
-    # rpe bias (1, H=1, N, N) -> (N, N)
-    rpe = tl.load(rpe_ptr + offs_n[:, None] * N + offs_n[None, :]).to(tl.float32)
-
-    # compute attn per window using batched-style flatten: treat as BLOCK_W independent NxN
-    # Flatten batched matmul as block-diag-free via loop unroll using tl.dot on (BLOCK_W*N, C) x (C, N) per window — we'll do per-window using reshape trick:
-    # attn_bw[w] = q_w[w] @ k_w[w].T  ; do it by computing q_flat @ k_flat^T then masking same-window pairs
-    # Simpler: use tl.dot on (M, C) and (C, M_other) — but we want per-window. Use explicit loop:
-    out_attn = tl.zeros((BLOCK_W, N, C), dtype=tl.float32)
-    for w in tl.static_range(0, BLOCK_W):
-        qw = tl.reshape(q_w[w, :, :], (N, C)).to(tl.float16)
-        kw = tl.reshape(k_w[w, :, :], (N, C)).to(tl.float16)
-        vw = tl.reshape(v_w[w, :, :], (N, C)).to(tl.float16)
-        # attn = q @ k^T * scale + rpe
-        kw_t = tl.trans(kw)
-        attn = tl.dot(qw, kw_t, out_dtype=tl.float32) * scale + rpe
-        # softmax along last dim
-        attn_max = tl.max(attn, axis=1)
-        attn = attn - attn_max[:, None]
-        attn_e = tl.exp(attn)
-        attn_s = tl.sum(attn_e, axis=1)
-        attn_p = (attn_e / attn_s[:, None]).to(tl.float16)
-        # ctx = attn_p @ v
-        ctx = tl.dot(attn_p, vw, out_dtype=tl.float32)  # (N, C)
-        # store into out_attn[w]
-        mask_w = (tl.arange(0, BLOCK_W) == w)[:, None, None]
-        out_attn = tl.where(mask_w, tl.reshape(ctx, (1, N, C)), out_attn)
-
-    ctx_m = tl.reshape(out_attn, (M, C)).to(tl.float16)
-
-    # ---- proj linear: (M, C) @ (C, C) ----
-    proj_w = tl.load(proj_w_ptr + offs_c[:, None] * C + offs_c[None, :])  # (C, C)
-    proj_b = tl.load(proj_b_ptr + offs_c).to(tl.float32)
-    proj_out = tl.dot(ctx_m, proj_w, out_dtype=tl.float32) + proj_b[None, :]
-
-    # residual: x_orig + proj_out
-    x1 = x + proj_out  # fp32 (M, C)
-
-    # ---- LN2 ----
-    mean2 = tl.sum(x1, axis=1) / C
-    xm2 = x1 - mean2[:, None]
-    var2 = tl.sum(xm2 * xm2, axis=1) / C
-    rstd2 = 1.0 / tl.sqrt(var2 + 1e-5)
-    ln2_w = tl.load(ln2_w_ptr + offs_c).to(tl.float32)
-    ln2_b = tl.load(ln2_b_ptr + offs_c).to(tl.float32)
-    x_ln2 = xm2 * rstd2[:, None] * ln2_w[None, :] + ln2_b[None, :]
-    x_ln2_f16 = x_ln2.to(tl.float16)
-
-    # ---- fc1: (M, C) @ (C, H) ----
-    offs_h_full = tl.arange(0, H)
-    fc1_w = tl.load(fc1_w_ptr + offs_c[:, None] * H + offs_h_full[None, :])  # (C, H)
-    fc1_b = tl.load(fc1_b_ptr + offs_h_full).to(tl.float32)
-    h_out = tl.dot(x_ln2_f16, fc1_w, out_dtype=tl.float32) + fc1_b[None, :]  # (M, H)
+    # fc1: (BLOCK_R, C) @ (C, H)
+    fc1_w_t = tl.trans(fc1_w).to(tl.float16)
+    x_n_f16 = x_n.to(tl.float16)
+    h = tl.dot(x_n_f16, fc1_w_t, out_dtype=tl.float32) + fc1_b[None, :].to(tl.float32)
 
     # GELU (tanh approx)
-    k0 = 0.7978845608028654
-    k1 = 0.044715
-    h_g = 0.5 * h_out * (1.0 + tl.extra.libdevice.tanh(k0 * (h_out + k1 * h_out * h_out * h_out)))
+    h_g = 0.5 * h * (1.0 + tl.extra.cuda.libdevice.tanh(0.7978845608028654 * (h + 0.044715 * h * h * h)))
+
+    # fc2: (BLOCK_R, H) @ (H, C). fc2_w is (C, H), need transpose
+    fc2_w_t = tl.trans(fc2_w).to(tl.float16)  # (H, C)
     h_g_f16 = h_g.to(tl.float16)
+    y = tl.dot(h_g_f16, fc2_w_t, out_dtype=tl.float32) + fc2_b[None, :].to(tl.float32)
 
-    # ---- fc2: (M, H) @ (H, C) ----
-    fc2_w = tl.load(fc2_w_ptr + offs_h_full[:, None] * C + offs_c[None, :])  # (H, C)
-    fc2_b = tl.load(fc2_b_ptr + offs_c).to(tl.float32)
-    fc2_out = tl.dot(h_g_f16, fc2_w, out_dtype=tl.float32) + fc2_b[None, :]
+    y = y + x_res
 
-    y = (x1 + fc2_out).to(tl.float16)
-
-    # store
-    y_ptrs = Y_ptr + win_idx_row[:, None] * (N * C) + tok_idx_row[:, None] * C + offs_c[None, :]
-    tl.store(y_ptrs, y, mask=row_valid[:, None])
+    tl.store(Y_ptr + x_off, y.to(tl.float16), mask=mask[:, None])
 
 
 class ModelNew(nn.Module):
@@ -194,44 +224,44 @@ class ModelNew(nn.Module):
         Wh, Ww = self.window_size
         nH, nW = H // Wh, W // Ww
         N = Wh * Ww
-        hidden = self.hidden
 
-        # window partition: (B, H, W, C) -> (B*nH*nW, N, C)
-        xw = x.view(B, nH, Wh, nW, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, N, C)
-        n_windows = xw.shape[0]
+        # Window partition
+        x_win = x.view(B, nH, Wh, nW, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, N, C)
+        num_windows = x_win.shape[0]
 
-        out = torch.empty_like(xw)
-
-        # Prepare weights in proper layouts (already in fp16)
-        qkv_w = self.qkv.weight.t().contiguous()  # (C, 3C)
-        qkv_b = self.qkv.bias.contiguous()
-        proj_w = self.proj.weight.t().contiguous()  # (C, C)
-        proj_b = self.proj.bias.contiguous()
-        fc1_w = self.fc1.weight.t().contiguous()  # (C, H)
-        fc1_b = self.fc1.bias.contiguous()
-        fc2_w = self.fc2.weight.t().contiguous()  # (H, C)
-        fc2_b = self.fc2.bias.contiguous()
-
-        rpe = self.rpe_bias.to(torch.float16).contiguous()
-
-        BLOCK_W = 8
-        grid = ((n_windows + BLOCK_W - 1) // BLOCK_W,)
-
-        _swin_block_kernel[grid](
-            xw, out,
+        # Kernel A: attention block (LN1 + QKV + attn + proj + residual)
+        out_a = torch.empty_like(x_win)
+        BLOCK_W = 4
+        grid_a = (triton.cdiv(num_windows, BLOCK_W),)
+        attn_block_kernel[grid_a](
+            x_win, out_a,
             self.norm1.weight, self.norm1.bias,
-            qkv_w, qkv_b,
-            proj_w, proj_b,
-            rpe,
+            self.qkv.weight, self.qkv.bias,
+            self.proj.weight, self.proj.bias,
+            self.rpe_bias,
+            num_windows,
+            C=C, N=N, BLOCK_W=BLOCK_W,
+            num_warps=2,
+        )
+
+        # Window reverse
+        out_a = out_a.view(B, nH, nW, Wh, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
+
+        # Kernel B: MLP block over all rows (B*H*W, C)
+        total_rows = B * H * W
+        out_b = torch.empty_like(out_a)
+        out_a_flat = out_a.view(total_rows, C)
+        out_b_flat = out_b.view(total_rows, C)
+        BLOCK_R = 64
+        grid_b = (triton.cdiv(total_rows, BLOCK_R),)
+        mlp_block_kernel[grid_b](
+            out_a_flat, out_b_flat,
             self.norm2.weight, self.norm2.bias,
-            fc1_w, fc1_b,
-            fc2_w, fc2_b,
-            n_windows,
-            C=C, N=N, H=hidden,
-            BLOCK_W=BLOCK_W,
+            self.fc1.weight, self.fc1.bias,
+            self.fc2.weight, self.fc2.bias,
+            total_rows,
+            C=C, H=self.hidden, BLOCK_R=BLOCK_R,
             num_warps=4,
         )
 
-        # window reverse
-        y = out.view(B, nH, nW, Wh, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
-        return y
+        return out_b

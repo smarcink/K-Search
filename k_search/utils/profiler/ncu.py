@@ -415,60 +415,7 @@ def _render_single_kernel(metrics: NcuMetrics) -> list[str]:
         stalls_str = ", ".join(f"{name} ({val:.2f} ratio)" for name, val in metrics.top_stall_reasons)
         lines.append(f"- profiler_top_stalls: {stalls_str}")
 
-    diagnosis = _diagnose_kernel(metrics)
-    if diagnosis:
-        lines.append("- profiler_diagnosis: " + "; ".join(diagnosis))
-
     return lines
-
-
-def _diagnose_kernel(metrics: NcuMetrics) -> list[str]:
-    """Return cautious, prompt-friendly profiler interpretations."""
-    notes: list[str] = []
-
-    occ = metrics.sm_occupancy_pct
-    regs = metrics.registers_per_thread
-    smem = metrics.shared_mem_per_block_bytes
-    mem_pct = metrics.memory_throughput_pct
-    comp_pct = metrics.compute_throughput_pct
-    tc = metrics.tensor_core_utilization_pct
-
-    if occ is not None and occ < 35.0:
-        if regs is not None and regs >= 96:
-            notes.append("low occupancy likely tied to high register pressure")
-        elif smem is not None and smem >= 48 * 1024:
-            notes.append("low occupancy likely tied to shared-memory footprint")
-        else:
-            notes.append("low occupancy may limit latency hiding")
-
-    if tc is not None and tc < 1.0:
-        notes.append("tensor cores inactive; relevant if this kernel has fp16/bf16 matmul-like work")
-
-    stall_map = {name: val for name, val in metrics.top_stall_reasons}
-    if stall_map.get("long_scoreboard", 0.0) >= 1.0:
-        notes.append("long scoreboard stalls suggest memory dependency latency")
-    elif stall_map.get("short_scoreboard", 0.0) >= 1.0:
-        notes.append("short scoreboard stalls suggest dependency latency")
-    if stall_map.get("math_pipe_throttle", 0.0) >= 1.0:
-        notes.append("math pipeline throttle suggests compute issue pressure")
-    if stall_map.get("wait", 0.0) >= 1.0:
-        notes.append("wait stalls suggest synchronization or scheduling latency")
-
-    if mem_pct is not None and comp_pct is not None:
-        if mem_pct >= 60.0 and mem_pct > comp_pct * 1.3:
-            notes.append("DRAM throughput is high, so memory bandwidth is likely important")
-        elif comp_pct >= 60.0 and comp_pct > mem_pct * 1.3:
-            notes.append("SM throughput is high, so compute pipeline efficiency is important")
-        elif mem_pct < 20.0 and comp_pct < 30.0:
-            notes.append("low DRAM and SM throughput points away from simple bandwidth saturation")
-
-    deduped: list[str] = []
-    for note in notes:
-        if note not in deduped:
-            deduped.append(note)
-        if len(deduped) >= 3:
-            break
-    return deduped
 
 
 def render_profiler_summary(metrics: NcuMetrics | list[NcuMetrics]) -> str:

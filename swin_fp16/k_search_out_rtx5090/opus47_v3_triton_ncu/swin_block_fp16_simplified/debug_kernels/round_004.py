@@ -2,6 +2,7 @@ import torch
 from torch import nn, Tensor
 import triton
 import triton.language as tl
+import math
 
 
 def _make_relative_position_bias(window_size, num_heads, dtype):
@@ -24,127 +25,138 @@ def _make_relative_position_bias(window_size, num_heads, dtype):
 
 
 @triton.jit
-def _swin_block_kernel(
+def attn_block_kernel(
     X_ptr, Y_ptr,
     ln1_w_ptr, ln1_b_ptr,
     qkv_w_ptr, qkv_b_ptr,
     proj_w_ptr, proj_b_ptr,
     rpe_ptr,
-    ln2_w_ptr, ln2_b_ptr,
-    fc1_w_ptr, fc1_b_ptr,
-    fc2_w_ptr, fc2_b_ptr,
-    n_windows,
-    C: tl.constexpr,
-    N: tl.constexpr,
-    HID: tl.constexpr,
-    M: tl.constexpr,
+    num_windows,
+    C: tl.constexpr, N: tl.constexpr,
     BLOCK_W: tl.constexpr,
-    INV_SQRT_C: tl.constexpr,
 ):
     pid = tl.program_id(0)
     w_start = pid * BLOCK_W
 
-    offs_m = tl.arange(0, M)
-    offs_c = tl.arange(0, C)
-    offs_h = tl.arange(0, HID)
-    offs_n = tl.arange(0, N)
+    c_range = tl.arange(0, C)
+    n_range = tl.arange(0, N)
 
-    win_idx_row = offs_m // N + w_start
-    tok_idx_row = offs_m % N
-    row_valid = win_idx_row < n_windows
+    ln1_w = tl.load(ln1_w_ptr + c_range)
+    ln1_b = tl.load(ln1_b_ptr + c_range)
 
-    # Load X
-    x_ptrs = X_ptr + win_idx_row[:, None] * (N * C) + tok_idx_row[:, None] * C + offs_c[None, :]
-    x = tl.load(x_ptrs, mask=row_valid[:, None], other=0.0).to(tl.float32)
+    q_w = tl.load(qkv_w_ptr + (c_range[:, None]) * C + c_range[None, :])
+    k_w = tl.load(qkv_w_ptr + (c_range[:, None] + C) * C + c_range[None, :])
+    v_w = tl.load(qkv_w_ptr + (c_range[:, None] + 2 * C) * C + c_range[None, :])
+    q_b = tl.load(qkv_b_ptr + c_range)
+    k_b = tl.load(qkv_b_ptr + c_range + C)
+    v_b = tl.load(qkv_b_ptr + c_range + 2 * C)
 
-    # LN1
+    q_wt = tl.trans(q_w).to(tl.float16)
+    k_wt = tl.trans(k_w).to(tl.float16)
+    v_wt = tl.trans(v_w).to(tl.float16)
+
+    proj_w = tl.load(proj_w_ptr + c_range[:, None] * C + c_range[None, :])
+    proj_b = tl.load(proj_b_ptr + c_range)
+    proj_w_t = tl.trans(proj_w).to(tl.float16)
+
+    rpe = tl.load(rpe_ptr + n_range[:, None] * N + n_range[None, :])
+
+    scale = 1.0 / tl.sqrt(tl.full([], C, tl.float32))
+
+    for wi in tl.static_range(0, BLOCK_W):
+        w_idx = w_start + wi
+        mask = w_idx < num_windows
+
+        x_off = w_idx * N * C + n_range[:, None] * C + c_range[None, :]
+        x = tl.load(X_ptr + x_off, mask=mask, other=0.0).to(tl.float32)
+        x_res = x
+
+        mean = tl.sum(x, axis=1) / C
+        xm = x - mean[:, None]
+        var = tl.sum(xm * xm, axis=1) / C
+        rstd = 1.0 / tl.sqrt(var + 1e-5)
+        x_n = xm * rstd[:, None] * ln1_w[None, :] + ln1_b[None, :]
+
+        x_n_f16 = x_n.to(tl.float16)
+
+        q = tl.dot(x_n_f16, q_wt, out_dtype=tl.float32) + q_b[None, :]
+        k = tl.dot(x_n_f16, k_wt, out_dtype=tl.float32) + k_b[None, :]
+        v = tl.dot(x_n_f16, v_wt, out_dtype=tl.float32) + v_b[None, :]
+
+        q_s = (q * scale).to(tl.float16)
+        k_t = tl.trans(k).to(tl.float16)
+        attn = tl.dot(q_s, k_t, out_dtype=tl.float32) + rpe
+
+        attn_max = tl.max(attn, axis=1)
+        attn_e = tl.exp(attn - attn_max[:, None])
+        attn_s = tl.sum(attn_e, axis=1)
+        attn_p = (attn_e / attn_s[:, None]).to(tl.float16)
+
+        v_f16 = v.to(tl.float16)
+        out = tl.dot(attn_p, v_f16, out_dtype=tl.float32)
+
+        out_f16 = out.to(tl.float16)
+        y = tl.dot(out_f16, proj_w_t, out_dtype=tl.float32) + proj_b[None, :]
+
+        y = y + x_res
+
+        tl.store(Y_ptr + x_off, y.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def mlp_block_kernel(
+    X_ptr, Y_ptr,
+    ln2_w_ptr, ln2_b_ptr,
+    fc1_w_ptr, fc1_b_ptr,
+    fc2_w_ptr, fc2_b_ptr,
+    num_rows,
+    C: tl.constexpr, H: tl.constexpr, BLOCK_R: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    r_start = pid * BLOCK_R
+
+    c_range = tl.arange(0, C)
+    h_range = tl.arange(0, H)
+    r_range = tl.arange(0, BLOCK_R)
+
+    ln2_w = tl.load(ln2_w_ptr + c_range)
+    ln2_b = tl.load(ln2_b_ptr + c_range)
+    fc1_wt = tl.load(fc1_w_ptr + h_range[None, :] * C + c_range[:, None]).to(tl.float16)
+    fc1_b = tl.load(fc1_b_ptr + h_range)
+    fc2_wt = tl.load(fc2_w_ptr + c_range[None, :] * H + h_range[:, None]).to(tl.float16)
+    fc2_b = tl.load(fc2_b_ptr + c_range)
+
+    rows = r_start + r_range
+    mask = rows < num_rows
+
+    x_off = rows[:, None] * C + c_range[None, :]
+    x = tl.load(X_ptr + x_off, mask=mask[:, None], other=0.0).to(tl.float32)
+    x_res = x
+
     mean = tl.sum(x, axis=1) / C
     xm = x - mean[:, None]
     var = tl.sum(xm * xm, axis=1) / C
     rstd = 1.0 / tl.sqrt(var + 1e-5)
-    ln1_w = tl.load(ln1_w_ptr + offs_c).to(tl.float32)
-    ln1_b = tl.load(ln1_b_ptr + offs_c).to(tl.float32)
-    x_ln1 = xm * rstd[:, None] * ln1_w[None, :] + ln1_b[None, :]
-    x_ln1_f16 = x_ln1.to(tl.float16)
+    x_n = xm * rstd[:, None] * ln2_w[None, :] + ln2_b[None, :]
 
-    # QKV: three (C,C) matmuls
-    qw_ptr = qkv_w_ptr + offs_c[:, None] * (3 * C) + offs_c[None, :]
-    kw_ptr = qkv_w_ptr + offs_c[:, None] * (3 * C) + (C + offs_c[None, :])
-    vw_ptr = qkv_w_ptr + offs_c[:, None] * (3 * C) + (2 * C + offs_c[None, :])
-    qw = tl.load(qw_ptr)
-    kw = tl.load(kw_ptr)
-    vw = tl.load(vw_ptr)
-    qb = tl.load(qkv_b_ptr + offs_c).to(tl.float32)
-    kb = tl.load(qkv_b_ptr + (C + offs_c)).to(tl.float32)
-    vb = tl.load(qkv_b_ptr + (2 * C + offs_c)).to(tl.float32)
+    x_n_f16 = x_n.to(tl.float16)
+    h = tl.dot(x_n_f16, fc1_wt, out_dtype=tl.float32) + fc1_b[None, :]
 
-    q = tl.dot(x_ln1_f16, qw, out_dtype=tl.float32) + qb[None, :]
-    k = tl.dot(x_ln1_f16, kw, out_dtype=tl.float32) + kb[None, :]
-    v = tl.dot(x_ln1_f16, vw, out_dtype=tl.float32) + vb[None, :]
+    h_g = 0.5 * h * (1.0 + tl.extra.cuda.libdevice.tanh(0.7978845608028654 * (h + 0.044715 * h * h * h)))
 
-    scale: tl.constexpr = INV_SQRT_C
-
-    q_w = tl.reshape(q, (BLOCK_W, N, C))
-    k_w = tl.reshape(k, (BLOCK_W, N, C))
-    v_w = tl.reshape(v, (BLOCK_W, N, C))
-
-    rpe = tl.load(rpe_ptr + offs_n[:, None] * N + offs_n[None, :]).to(tl.float32)
-
-    out_attn = tl.zeros((BLOCK_W, N, C), dtype=tl.float32)
-    for w in tl.static_range(0, BLOCK_W):
-        qw_ = tl.reshape(q_w[w, :, :], (N, C)).to(tl.float16)
-        kw_ = tl.reshape(k_w[w, :, :], (N, C)).to(tl.float16)
-        vw_ = tl.reshape(v_w[w, :, :], (N, C)).to(tl.float16)
-        kw_t = tl.trans(kw_)
-        attn = tl.dot(qw_, kw_t, out_dtype=tl.float32) * scale + rpe
-        attn_max = tl.max(attn, axis=1)
-        attn = attn - attn_max[:, None]
-        attn_e = tl.exp(attn)
-        attn_s = tl.sum(attn_e, axis=1)
-        attn_p = (attn_e / attn_s[:, None]).to(tl.float16)
-        ctx = tl.dot(attn_p, vw_, out_dtype=tl.float32)
-        mask_w = (tl.arange(0, BLOCK_W) == w)[:, None, None]
-        out_attn = tl.where(mask_w, tl.reshape(ctx, (1, N, C)), out_attn)
-
-    ctx_m = tl.reshape(out_attn, (M, C)).to(tl.float16)
-
-    # proj: (M,C) @ (C,C)
-    proj_w = tl.load(proj_w_ptr + offs_c[:, None] * C + offs_c[None, :])
-    proj_b = tl.load(proj_b_ptr + offs_c).to(tl.float32)
-    proj_out = tl.dot(ctx_m, proj_w, out_dtype=tl.float32) + proj_b[None, :]
-
-    x1 = x + proj_out
-
-    # LN2
-    mean2 = tl.sum(x1, axis=1) / C
-    xm2 = x1 - mean2[:, None]
-    var2 = tl.sum(xm2 * xm2, axis=1) / C
-    rstd2 = 1.0 / tl.sqrt(var2 + 1e-5)
-    ln2_w = tl.load(ln2_w_ptr + offs_c).to(tl.float32)
-    ln2_b = tl.load(ln2_b_ptr + offs_c).to(tl.float32)
-    x_ln2 = xm2 * rstd2[:, None] * ln2_w[None, :] + ln2_b[None, :]
-    x_ln2_f16 = x_ln2.to(tl.float16)
-
-    # fc1: (M,C) @ (C,HID)
-    fc1_w = tl.load(fc1_w_ptr + offs_c[:, None] * HID + offs_h[None, :])
-    fc1_b = tl.load(fc1_b_ptr + offs_h).to(tl.float32)
-    h_out = tl.dot(x_ln2_f16, fc1_w, out_dtype=tl.float32) + fc1_b[None, :]
-
-    # GELU tanh
-    k0 = 0.7978845608028654
-    k1 = 0.044715
-    h_g = 0.5 * h_out * (1.0 + tl.extra.libdevice.tanh(k0 * (h_out + k1 * h_out * h_out * h_out)))
     h_g_f16 = h_g.to(tl.float16)
+    y = tl.dot(h_g_f16, fc2_wt, out_dtype=tl.float32) + fc2_b[None, :]
 
-    # fc2: (M,HID) @ (HID,C)
-    fc2_w = tl.load(fc2_w_ptr + offs_h[:, None] * C + offs_c[None, :])
-    fc2_b = tl.load(fc2_b_ptr + offs_c).to(tl.float32)
-    fc2_out = tl.dot(h_g_f16, fc2_w, out_dtype=tl.float32) + fc2_b[None, :]
+    y = y + x_res
 
-    y = (x1 + fc2_out).to(tl.float16)
+    tl.store(Y_ptr + x_off, y.to(tl.float16), mask=mask[:, None])
 
-    y_ptrs = Y_ptr + win_idx_row[:, None] * (N * C) + tok_idx_row[:, None] * C + offs_c[None, :]
-    tl.store(y_ptrs, y, mask=row_valid[:, None])
+
+def _next_pow2(x):
+    p = 1
+    while p < x:
+        p *= 2
+    return p
 
 
 class ModelNew(nn.Module):
@@ -175,56 +187,45 @@ class ModelNew(nn.Module):
 
         self.half()
 
-        self._cached = False
-
-    def _prepare_weights(self):
-        if self._cached:
-            return
-        self._qkv_w_t = self.qkv.weight.t().contiguous()
-        self._qkv_b = self.qkv.bias.contiguous()
-        self._proj_w_t = self.proj.weight.t().contiguous()
-        self._proj_b = self.proj.bias.contiguous()
-        self._fc1_w_t = self.fc1.weight.t().contiguous()
-        self._fc1_b = self.fc1.bias.contiguous()
-        self._fc2_w_t = self.fc2.weight.t().contiguous()
-        self._fc2_b = self.fc2.bias.contiguous()
-        self._rpe_f16 = self.rpe_bias.to(torch.float16).contiguous()
-        self._cached = True
-
     def forward(self, x: Tensor) -> Tensor:
-        self._prepare_weights()
         B, H, W, C = x.shape
         Wh, Ww = self.window_size
         nH, nW = H // Wh, W // Ww
         N = Wh * Ww
-        hidden = self.hidden
 
-        xw = x.view(B, nH, Wh, nW, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, N, C)
-        n_windows = xw.shape[0]
+        x_win = x.view(B, nH, Wh, nW, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, N, C)
+        num_windows = x_win.shape[0]
 
-        out = torch.empty_like(xw)
-
-        BLOCK_W = 8
-        M = BLOCK_W * N
-        grid = ((n_windows + BLOCK_W - 1) // BLOCK_W,)
-
-        inv_sqrt_c = 1.0 / (C ** 0.5)
-
-        _swin_block_kernel[grid](
-            xw, out,
+        out_a = torch.empty_like(x_win)
+        BLOCK_W = 4
+        grid_a = (triton.cdiv(num_windows, BLOCK_W),)
+        attn_block_kernel[grid_a](
+            x_win, out_a,
             self.norm1.weight, self.norm1.bias,
-            self._qkv_w_t, self._qkv_b,
-            self._proj_w_t, self._proj_b,
-            self._rpe_f16,
-            self.norm2.weight, self.norm2.bias,
-            self._fc1_w_t, self._fc1_b,
-            self._fc2_w_t, self._fc2_b,
-            n_windows,
-            C=C, N=N, HID=hidden, M=M,
-            BLOCK_W=BLOCK_W,
-            INV_SQRT_C=inv_sqrt_c,
-            num_warps=4,
+            self.qkv.weight, self.qkv.bias,
+            self.proj.weight, self.proj.bias,
+            self.rpe_bias,
+            num_windows,
+            C=C, N=N, BLOCK_W=BLOCK_W,
+            num_warps=2,
         )
 
-        y = out.view(B, nH, nW, Wh, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
-        return y
+        out_a = out_a.view(B, nH, nW, Wh, Ww, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
+
+        total_rows = B * H * W
+        out_b = torch.empty_like(out_a)
+        out_a_flat = out_a.view(total_rows, C)
+        out_b_flat = out_b.view(total_rows, C)
+        BLOCK_R = 32
+        grid_b = (triton.cdiv(total_rows, BLOCK_R),)
+        mlp_block_kernel[grid_b](
+            out_a_flat, out_b_flat,
+            self.norm2.weight, self.norm2.bias,
+            self.fc1.weight, self.fc1.bias,
+            self.fc2.weight, self.fc2.bias,
+            total_rows,
+            C=C, H=self.hidden, BLOCK_R=BLOCK_R,
+            num_warps=2,
+        )
+
+        return out_b
