@@ -284,8 +284,10 @@ def profile_only(
     kernel_src_path: str,
     device: str,
     precision: str,
+    profile_warmup: int = 2,
+    profile_repeats: int = 1,
 ) -> None:
-    """Compile + load ModelNew, run it once between profiler markers.
+    """Compile + load ModelNew, run it between profiler markers.
 
     The host profiler (e.g. ncu --profile-from-start off) captures only the
     kernels launched between cudaProfilerStart/Stop. Warmup runs outside the
@@ -302,16 +304,20 @@ def profile_only(
     _, new_model, get_inputs_fn = _load_models(ref_path, kernel_src_path, device, dtype)
 
     inputs = get_inputs_fn()
+    profile_warmup = max(0, int(profile_warmup))
+    profile_repeats = max(1, int(profile_repeats))
 
     # Warmup outside the profiled region (triggers Triton autotune / cudnn algo selection).
-    with torch.no_grad():
-        new_model(*inputs)
+    for _ in range(profile_warmup):
+        with torch.no_grad():
+            new_model(*inputs)
     _synchronize(device)
 
     # Profiled region — ncu captures every kernel launched between Start/Stop.
     torch.cuda.cudart().cudaProfilerStart()
-    with torch.no_grad():
-        new_model(*inputs)
+    for _ in range(profile_repeats):
+        with torch.no_grad():
+            new_model(*inputs)
     _synchronize(device)
     torch.cuda.cudart().cudaProfilerStop()
 
@@ -434,6 +440,14 @@ def main():
         help="Compile + load ModelNew, then run it once between cudaProfilerStart/Stop "
              "for an external profiler (ncu, etc.) to capture. No correctness/timing.",
     )
+    parser.add_argument(
+        "--profile-warmup", type=int, default=2,
+        help="Number of unprofiled warmup runs before cudaProfilerStart in --profile-only mode.",
+    )
+    parser.add_argument(
+        "--profile-repeats", type=int, default=1,
+        help="Number of profiled ModelNew repeats between cudaProfilerStart/Stop.",
+    )
     args = parser.parse_args()
 
     if args.profile_only:
@@ -442,6 +456,8 @@ def main():
             kernel_src_path=args.kernel_src_path,
             device=args.device,
             precision=args.precision,
+            profile_warmup=args.profile_warmup,
+            profile_repeats=args.profile_repeats,
         )
         return
 

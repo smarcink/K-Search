@@ -318,6 +318,18 @@ def main():
              "(NCU on CUDA; planned VTune for XPU). No-op on backends without a wired-up profiler.",
     )
     parser.add_argument(
+        "--profile-warmup",
+        type=int,
+        default=2,
+        help="Number of unprofiled warmup runs before profiler capture when --enable-profiling is set.",
+    )
+    parser.add_argument(
+        "--profile-repeats",
+        type=int,
+        default=1,
+        help="Number of profiled candidate runs captured by the profiler when --enable-profiling is set.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose output: print kernel source and profiler report after each evaluation.",
@@ -357,6 +369,8 @@ def main():
             precision=args.cuda_kernel_precision,
             rtol=args.rtol,
             atol=args.atol,
+            profile_warmup=args.profile_warmup,
+            profile_repeats=args.profile_repeats,
             artifacts_dir=args.artifacts_dir,
             enable_profiling=args.enable_profiling,
             verbose=args.verbose,
@@ -373,6 +387,8 @@ def main():
             precision=args.triton_precision,
             num_correct_trials=args.triton_num_correct_trials,
             num_perf_trials=args.triton_num_perf_trials,
+            profile_warmup=args.profile_warmup,
+            profile_repeats=args.profile_repeats,
             artifacts_dir=args.artifacts_dir,
             enable_profiling=args.enable_profiling,
             verbose=args.verbose,

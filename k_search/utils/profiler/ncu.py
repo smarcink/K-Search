@@ -45,26 +45,33 @@ NCU_AVAILABLE: bool = NCU_PATH is not None
 
 # Selected for maximum diagnostic value with minimum profiling overhead.
 # Using selective --metrics instead of --set full reduces profiling from ~60s to ~15s.
-NCU_METRICS = [
+# Keep a small core set so we can retry if optional diagnostics are unsupported
+# by a particular GPU / Nsight Compute version.
+NCU_CORE_METRICS = [
+    # Kernel duration. Used to rank multi-kernel reports by runtime contribution.
+    "gpu__time_duration.sum",
     # Occupancy
     "sm__warps_active.avg.pct_of_peak_sustained_active",
     # Compute throughput (% of peak)
     "sm__throughput.avg.pct_of_peak_sustained_elapsed",
     # Memory (DRAM) throughput (% of peak)
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
-    # L1 cache hit rate
-    "l1tex__t_sector_hit_rate.pct",
-    # L2 cache hit rate
-    "lts__t_sector_hit_rate.pct",
     # Achieved DRAM bandwidth (bytes/sec)
     "dram__bytes.sum.per_second",
-    # Tensor core utilization
-    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
     # Registers per thread
     "launch__registers_per_thread",
     # Shared memory per block (dynamic + static)
     "launch__shared_mem_per_block_dynamic",
     "launch__shared_mem_per_block_static",
+]
+
+NCU_OPTIONAL_METRICS = [
+    # L1 cache hit rate
+    "l1tex__t_sector_hit_rate.pct",
+    # L2 cache hit rate
+    "lts__t_sector_hit_rate.pct",
+    # Tensor core utilization
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
     # Stall reasons (top contributors to warp stalls)
     "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio",
     "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio",
@@ -73,6 +80,9 @@ NCU_METRICS = [
     "smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio",
 ]
 
+NCU_METRICS = NCU_CORE_METRICS + NCU_OPTIONAL_METRICS
+
+NCU_CORE_METRICS_STR = ",".join(NCU_CORE_METRICS)
 NCU_METRICS_STR = ",".join(NCU_METRICS)
 
 
@@ -93,6 +103,7 @@ class NcuMetrics:
     tensor_core_utilization_pct: float | None = None
     registers_per_thread: int | None = None
     shared_mem_per_block_bytes: int | None = None
+    duration_us: float | None = None
     top_stall_reasons: list[tuple[str, float]] = field(default_factory=list)
     raw_csv: str = ""
     kernel_name: str = ""
@@ -115,59 +126,76 @@ def _run_ncu_subprocess(
             print("[ncu] SKIPPED: ncu binary not found on PATH")
         return None
 
-    ncu_cmd = [
-        NCU_PATH,
-        "--metrics", NCU_METRICS_STR,
-        "--csv",
-        "--target-processes", "all",
-        # Lock clocks for reproducible measurements
-        "--clock-control", "base",
-        # Only profile kernels between cudaProfilerStart/Stop markers
-        "--profile-from-start", "off",
-    ]
+    def _build_cmd(metrics_str: str) -> list[str]:
+        ncu_cmd = [
+            NCU_PATH,
+            "--metrics", metrics_str,
+            "--csv",
+            "--target-processes", "all",
+            # Lock clocks for reproducible measurements
+            "--clock-control", "base",
+            # Only profile kernels between cudaProfilerStart/Stop markers
+            "--profile-from-start", "off",
+        ]
+        if kernel_name_filter:
+            ncu_cmd.extend(["--kernel-name", kernel_name_filter])
+        ncu_cmd.append("--")
+        ncu_cmd.extend(cmd)
+        return ncu_cmd
 
-    if kernel_name_filter:
-        ncu_cmd.extend(["--kernel-name-base", kernel_name_filter])
+    attempts = [("full", NCU_METRICS_STR)]
+    if NCU_CORE_METRICS_STR != NCU_METRICS_STR:
+        attempts.append(("core", NCU_CORE_METRICS_STR))
 
-    ncu_cmd.append("--")
-    ncu_cmd.extend(cmd)
+    for label, metrics_str in attempts:
+        ncu_cmd = _build_cmd(metrics_str)
 
-    if verbose:
-        print(f"[ncu] Running: {' '.join(ncu_cmd)}")
-
-    try:
-        result = subprocess.run(
-            ncu_cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
         if verbose:
-            print(f"[ncu] FAILED: timed out after {timeout}s")
-        return None
-    except Exception as e:
+            print(f"[ncu] Running ({label} metrics): {' '.join(ncu_cmd)}")
+
+        try:
+            result = subprocess.run(
+                ncu_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            if verbose:
+                print(f"[ncu] FAILED ({label} metrics): timed out after {timeout}s")
+            return None
+        except Exception as e:
+            if verbose:
+                print(f"[ncu] FAILED ({label} metrics): exception: {e}")
+            return None
+
         if verbose:
-            print(f"[ncu] FAILED: exception: {e}")
-        return None
+            print(f"[ncu] Return code ({label} metrics): {result.returncode}")
+            if result.stderr.strip():
+                print(f"[ncu] stderr ({label}, last 2000 chars):\n{result.stderr[-2000:]}")
+            if not result.stdout.strip():
+                print(f"[ncu] stdout ({label}): (empty)")
+            else:
+                print(f"[ncu] stdout length ({label}): {len(result.stdout)} chars")
 
-    if verbose:
-        print(f"[ncu] Return code: {result.returncode}")
-        if result.stderr.strip():
-            print(f"[ncu] stderr (last 2000 chars):\n{result.stderr[-2000:]}")
-        if not result.stdout.strip():
-            print(f"[ncu] stdout: (empty)")
-        else:
-            print(f"[ncu] stdout length: {len(result.stdout)} chars")
+        if result.returncode != 0:
+            if label == "full" and len(attempts) > 1 and verbose:
+                print("[ncu] Full metric collection failed; retrying with core metrics only")
+            continue
 
-    if result.returncode != 0:
-        return None
+        csv_output = result.stdout
+        if not csv_output.strip():
+            if label == "full" and len(attempts) > 1 and verbose:
+                print("[ncu] Full metric collection produced no CSV; retrying with core metrics only")
+            continue
 
-    csv_output = result.stdout
-    if not csv_output.strip():
-        return None
+        parsed = _parse_ncu_csv(csv_output)
+        if parsed:
+            return parsed
+        if label == "full" and len(attempts) > 1 and verbose:
+            print("[ncu] Full metric CSV was not parseable; retrying with core metrics only")
 
-    return _parse_ncu_csv(csv_output)
+    return None
 
 
 # Substrings (case-insensitive) that identify PyTorch / cuBLAS / cuDNN
@@ -199,6 +227,25 @@ def _is_infrastructure_kernel(name: str) -> bool:
     return any(p.lower() in n for p in _INFRA_KERNEL_PATTERNS)
 
 
+def _duration_to_us(value: float, unit: str | None) -> float | None:
+    """Convert an NCU duration metric value to microseconds."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = str(unit or "").strip().lower()
+    if u in ("ns", "nsecond", "nseconds", "nanosecond", "nanoseconds"):
+        return val / 1000.0
+    if u in ("us", "usecond", "useconds", "microsecond", "microseconds"):
+        return val
+    if u in ("ms", "msecond", "mseconds", "millisecond", "milliseconds"):
+        return val * 1000.0
+    if u in ("s", "sec", "second", "seconds"):
+        return val * 1_000_000.0
+    # Nsight Compute commonly reports gpu__time_duration.sum in nanoseconds.
+    return val / 1000.0
+
+
 def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
     """Parse ncu --csv output into a list of NcuMetrics (one per kernel launch)."""
     try:
@@ -216,11 +263,13 @@ def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
 
         kernels: dict[str, dict[str, float]] = {}
         kernel_names: dict[str, str] = {}
+        kernel_units: dict[str, dict[str, str]] = {}
 
         for row in reader:
             launch_id = row.get("ID", "").strip()
             metric_name = row.get("Metric Name", "").strip()
             metric_value_str = row.get("Metric Value", "").strip()
+            metric_unit = (row.get("Metric Unit", "") or row.get("Unit", "") or "").strip()
             if not launch_id or not metric_name or not metric_value_str:
                 continue
 
@@ -233,6 +282,7 @@ def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
                 continue
 
             kernels.setdefault(launch_id, {})[metric_name] = val
+            kernel_units.setdefault(launch_id, {})[metric_name] = metric_unit
 
         if not kernels:
             return None
@@ -254,6 +304,10 @@ def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
 
             m = NcuMetrics()
             m.kernel_name = kernel_name
+
+            duration = _get("gpu__time_duration.sum")
+            if duration is not None:
+                m.duration_us = _duration_to_us(duration, kernel_units.get(kid, {}).get("gpu__time_duration.sum"))
 
             m.sm_occupancy_pct = _get("sm__warps_active.avg.pct_of_peak_sustained_active")
             m.compute_throughput_pct = _get(throughput_metric)
@@ -297,8 +351,12 @@ def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
         if filtered:
             result = filtered
 
-        # Sort by compute throughput descending (heaviest kernel first)
-        result.sort(key=lambda m: m.compute_throughput_pct or 0.0, reverse=True)
+        # Sort by runtime contribution when available; throughput alone does
+        # not identify the kernel that dominates end-to-end latency.
+        if any(m.duration_us is not None for m in result):
+            result.sort(key=lambda m: m.duration_us or 0.0, reverse=True)
+        else:
+            result.sort(key=lambda m: m.compute_throughput_pct or 0.0, reverse=True)
 
         if result:
             result[0].raw_csv = csv_text[:3000]
@@ -319,17 +377,17 @@ def _render_single_kernel(metrics: NcuMetrics) -> list[str]:
 
     mem_pct = metrics.memory_throughput_pct
     comp_pct = metrics.compute_throughput_pct
-    bound_hint = ""
-    if mem_pct is not None and comp_pct is not None:
-        if mem_pct > comp_pct * 1.5:
-            bound_hint = " — kernel is MEMORY-BOUND"
-        elif comp_pct > mem_pct * 1.5:
-            bound_hint = " — kernel is COMPUTE-BOUND"
+
+    if metrics.duration_us is not None:
+        if metrics.duration_us >= 1000.0:
+            lines.append(f"- profiler_duration: {metrics.duration_us / 1000.0:.3f} ms")
+        else:
+            lines.append(f"- profiler_duration: {metrics.duration_us:.1f} us")
 
     if mem_pct is not None:
-        lines.append(f"- profiler_memory_throughput: {mem_pct:.1f}% of peak{bound_hint if 'MEMORY' in bound_hint else ''}")
+        lines.append(f"- profiler_memory_throughput: {mem_pct:.1f}% of peak")
     if comp_pct is not None:
-        lines.append(f"- profiler_compute_throughput: {comp_pct:.1f}% of peak{bound_hint if 'COMPUTE' in bound_hint else ''}")
+        lines.append(f"- profiler_compute_throughput: {comp_pct:.1f}% of peak")
 
     tc = metrics.tensor_core_utilization_pct
     if tc is not None:
@@ -354,10 +412,63 @@ def _render_single_kernel(metrics: NcuMetrics) -> list[str]:
         lines.append(f"- profiler_shared_mem_per_block: {metrics.shared_mem_per_block_bytes} bytes")
 
     if metrics.top_stall_reasons:
-        stalls_str = ", ".join(f"{name} ({val:.1%})" for name, val in metrics.top_stall_reasons)
+        stalls_str = ", ".join(f"{name} ({val:.2f} ratio)" for name, val in metrics.top_stall_reasons)
         lines.append(f"- profiler_top_stalls: {stalls_str}")
 
+    diagnosis = _diagnose_kernel(metrics)
+    if diagnosis:
+        lines.append("- profiler_diagnosis: " + "; ".join(diagnosis))
+
     return lines
+
+
+def _diagnose_kernel(metrics: NcuMetrics) -> list[str]:
+    """Return cautious, prompt-friendly profiler interpretations."""
+    notes: list[str] = []
+
+    occ = metrics.sm_occupancy_pct
+    regs = metrics.registers_per_thread
+    smem = metrics.shared_mem_per_block_bytes
+    mem_pct = metrics.memory_throughput_pct
+    comp_pct = metrics.compute_throughput_pct
+    tc = metrics.tensor_core_utilization_pct
+
+    if occ is not None and occ < 35.0:
+        if regs is not None and regs >= 96:
+            notes.append("low occupancy likely tied to high register pressure")
+        elif smem is not None and smem >= 48 * 1024:
+            notes.append("low occupancy likely tied to shared-memory footprint")
+        else:
+            notes.append("low occupancy may limit latency hiding")
+
+    if tc is not None and tc < 1.0:
+        notes.append("tensor cores inactive; relevant if this kernel has fp16/bf16 matmul-like work")
+
+    stall_map = {name: val for name, val in metrics.top_stall_reasons}
+    if stall_map.get("long_scoreboard", 0.0) >= 1.0:
+        notes.append("long scoreboard stalls suggest memory dependency latency")
+    elif stall_map.get("short_scoreboard", 0.0) >= 1.0:
+        notes.append("short scoreboard stalls suggest dependency latency")
+    if stall_map.get("math_pipe_throttle", 0.0) >= 1.0:
+        notes.append("math pipeline throttle suggests compute issue pressure")
+    if stall_map.get("wait", 0.0) >= 1.0:
+        notes.append("wait stalls suggest synchronization or scheduling latency")
+
+    if mem_pct is not None and comp_pct is not None:
+        if mem_pct >= 60.0 and mem_pct > comp_pct * 1.3:
+            notes.append("DRAM throughput is high, so memory bandwidth is likely important")
+        elif comp_pct >= 60.0 and comp_pct > mem_pct * 1.3:
+            notes.append("SM throughput is high, so compute pipeline efficiency is important")
+        elif mem_pct < 20.0 and comp_pct < 30.0:
+            notes.append("low DRAM and SM throughput points away from simple bandwidth saturation")
+
+    deduped: list[str] = []
+    for note in notes:
+        if note not in deduped:
+            deduped.append(note)
+        if len(deduped) >= 3:
+            break
+    return deduped
 
 
 def render_profiler_summary(metrics: NcuMetrics | list[NcuMetrics]) -> str:
@@ -370,12 +481,18 @@ def render_profiler_summary(metrics: NcuMetrics | list[NcuMetrics]) -> str:
     all_lines: list[str] = []
     multi = len(kernel_list) > 1
 
+    total_duration_us = sum(m.duration_us or 0.0 for m in kernel_list)
+
     for idx, km in enumerate(kernel_list):
         if multi:
             label = km.kernel_name or f"kernel_{idx}"
             if len(label) > 80:
                 label = label[:77] + "..."
-            all_lines.append(f"[Kernel {idx}: {label}]")
+            if total_duration_us > 0 and km.duration_us is not None:
+                share = 100.0 * km.duration_us / total_duration_us
+                all_lines.append(f"[Kernel {idx}: {label} ({share:.1f}% profiled time)]")
+            else:
+                all_lines.append(f"[Kernel {idx}: {label}]")
 
         lines = _render_single_kernel(km)
         all_lines.extend(lines)
@@ -411,6 +528,8 @@ def _single_metrics_to_dict(metrics: NcuMetrics) -> dict[str, Any]:
         d["registers_per_thread"] = metrics.registers_per_thread
     if metrics.shared_mem_per_block_bytes is not None:
         d["shared_mem_per_block_bytes"] = metrics.shared_mem_per_block_bytes
+    if metrics.duration_us is not None:
+        d["duration_us"] = round(metrics.duration_us, 3)
     if metrics.top_stall_reasons:
         d["top_stall_reasons"] = [(name, round(val, 4)) for name, val in metrics.top_stall_reasons]
     if metrics.kernel_name:
@@ -447,6 +566,7 @@ def _dict_to_metrics(metrics_dict: dict[str, Any]) -> list[NcuMetrics]:
                 tensor_core_utilization_pct=kd.get("tensor_core_utilization_pct"),
                 registers_per_thread=kd.get("registers_per_thread"),
                 shared_mem_per_block_bytes=kd.get("shared_mem_per_block_bytes"),
+                duration_us=kd.get("duration_us"),
                 top_stall_reasons=kd.get("top_stall_reasons", []),
                 kernel_name=kd.get("kernel_name", ""),
             )

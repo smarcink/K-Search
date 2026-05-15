@@ -219,7 +219,7 @@ def _try_pass_params(module, model):
 
 
 def _run_profile_only(args):
-    """Profile-only mode: compile kernel, load ref model, run kernel once for ncu profiling.
+    """Profile-only mode: compile kernel, load ref model, run kernel for ncu profiling.
 
     Uses CUDA profiler API markers (cudaProfilerStart/Stop) to delimit the
     region of interest.  ncu is invoked with --profile-from-start off so it
@@ -234,16 +234,21 @@ def _run_profile_only(args):
     inputs = get_inputs_fn()
     inputs = [x.to(dtype=dtype, device="cuda") if isinstance(x, torch.Tensor) else x for x in inputs]
 
+    profile_warmup = max(0, int(getattr(args, "profile_warmup", 2) or 0))
+    profile_repeats = max(1, int(getattr(args, "profile_repeats", 1) or 1))
+
     # Warmup: allocates GPU resources, triggers any lazy init.
     # NOT profiled because profiling hasn't started yet (--profile-from-start off).
-    module.run(*inputs)
+    for _ in range(profile_warmup):
+        module.run(*inputs)
     torch.cuda.synchronize()
 
     # Start profiling region — ncu captures all kernel launches after this.
     torch.cuda.cudart().cudaProfilerStart()
 
     # Profiled run: ALL kernels launched here are captured by ncu.
-    module.run(*inputs)
+    for _ in range(profile_repeats):
+        module.run(*inputs)
     torch.cuda.synchronize()
 
     # Stop profiling region.
@@ -262,6 +267,14 @@ def main():
     parser.add_argument(
         "--profile-only", action="store_true",
         help="Compile and run kernel once for ncu profiling. No correctness/timing."
+    )
+    parser.add_argument(
+        "--profile-warmup", type=int, default=2,
+        help="Number of unprofiled warmup runs before cudaProfilerStart in --profile-only mode."
+    )
+    parser.add_argument(
+        "--profile-repeats", type=int, default=1,
+        help="Number of profiled module.run() repeats between cudaProfilerStart/Stop."
     )
     args = parser.parse_args()
 
