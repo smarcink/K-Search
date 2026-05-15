@@ -1,0 +1,419 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 0.9935,
+      "mean_vs_baseline_factor": null,
+      "profiler": {
+        "kernels": [
+          {
+            "achieved_bandwidth_gb_s": 73.51,
+            "compute_throughput_pct": 50.83,
+            "duration_us": 1300.928,
+            "kernel_name": "swin_block_kernel_wpc",
+            "l1_hit_rate_pct": 17.15,
+            "l2_hit_rate_pct": 72.18,
+            "memory_throughput_pct": 8.04,
+            "registers_per_thread": 179,
+            "shared_mem_per_block_bytes": 30720,
+            "sm_occupancy_pct": 16.29,
+            "tensor_core_utilization_pct": 28.11,
+            "top_stall_reasons": [
+              [
+                "wait",
+                0.88
+              ],
+              [
+                "math_pipe_throttle",
+                0.69
+              ],
+              [
+                "not_selected",
+                0.31
+              ]
+            ]
+          }
+        ],
+        "profiler_backend": "ncu"
+      },
+      "reference_latency_ms": 8.728,
+      "speedup_factor": 5.3634,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1a",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.4,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell): plenty of tensor-core throughput at fp16; small inner C=32 limits tensor-core utilization for attention QK/AV matmuls (16x16x32). Linear layers fc1 (32->128) and fc2 (128->32) are GEMV-like at per-token granularity but can be tiled by token blocks.",
+            "notes": "Block: B=1, H=720, W=1280, C=32, window 4x4 (N=16), heads=1, mlp_ratio=4 -> hidden=128. Tokens total = 921600. Windows = 57600. Attention per window is tiny (16x16x32). Bandwidth-bound overall.",
+            "rating_0_to_10": 6.0,
+            "risk": "Small C may underutilize tensor cores; fusion is the main lever."
+          },
+          "memory_bandwidth": {
+            "notes": "Activation tensor is 921600 x 32 fp16 = ~56 MB; reading/writing this multiple times across LN/QKV/attn/proj/LN/FC1/GELU/FC2 dominates. Weights are tiny (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32) and fit easily in shared/registers.",
+            "rating_0_to_10": 8.0,
+            "risk": "Multiple global round-trips in baseline; fusion can drastically reduce DRAM traffic."
+          },
+          "register_pressure": {
+            "notes": "Per-window working set: N=16 tokens x C=32 fp16 (=1KB) plus hidden 128 (=4KB). Q,K,V,attn(16x16), softmax workspace easily fit per-CTA in shared. Weights: qkv 6KB, proj 2KB, fc1 8KB, fc2 8KB -> ~24KB shared/constant per CTA, very tractable.",
+            "rating_0_to_10": 7.0,
+            "risk": "If fully fused per-window, register usage for fc1 hidden (128) per token may be high; can iterate over tokens."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: fused transformer block (LayerNorm + windowed self-attention (1 head, window 4x4) + residual + LayerNorm + MLP(32->128->32 GELU) + residual). Reductions: LN mean/var, softmax. Dense, no shifts. 2) Canonical: y1 = x + Proj(Softmax(Q*K^T/sqrt(C)+RPE) V) where Q,K,V from Linear(LN(x)); y2 = y1 + FC2(GELU(FC1(LN(y1)))). 3) Shapes: x (1,720,1280,32) fp16. Window (4,4) -> N=16 tokens per window. nH=180,nW=320 -> 57600 windows. Weights tiny. 4) Regimes: (a) Attention path is bandwidth-bound (small C, tiny GEMMs), (b) MLP path bandwidth-bound (hidden=128 small), (c) LN reductions trivial; overall DRAM traffic dominates. 5) Knobs: fuse entire block per window CTA; cache weights in shared; vectorize loads (fp16x2); use tl.dot for 16x16x32 matmuls; tile multiple windows per CTA to amortize weight loads; choose between two kernels (attn-fused, mlp-fused) vs single mega-kernel. 6) Skeleton: per-CTA load WINDOWS_PER_CTA windows of N x C; compute LN1; QKV via tl.dot with weight tile in shared; compute attn 16x16 + RPE + softmax; AV; proj; add residual; LN2; FC1 (16xC) x (Cxhidden); GELU; FC2; add residual; store. 7) Families considered: (A) Single mega-kernel fusing whole block per window-group [TOP - working set fits], (B) Two fused kernels split at residual2 (attn-fused, mlp-fused), (C) Per-op Triton kernels matching torch.compile (baseline). Family A preferred since weights total ~24KB easily fit in SMEM and intermediates fit in regs. RPE bias (16x16 fp16 = 512B) loaded once per CTA from constant. Need to be careful with LN fp32 accumulation for numerical match.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single Triton kernel that, per CTA, processes one or a small group of 4x4 windows end-to-end: LN1 -> QKV (tl.dot with weights in shared) -> attn(16x16)+RPE+softmax -> AV -> Proj+residual -> LN2 -> FC1(32->128) -> GELU -> FC2(128->32) -> residual -> store. All weights cached in shared memory (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32). Use fp32 accumulators for LN mean/var and matmul accum; fp16 storage. Use tl.dot for the matmuls; window is 16 tokens x 32 channels (perfect 16x16x32 tensor-core tile).",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.18,
+          "rationale": "Eliminates ~6-8 DRAM round-trips of the 56MB activation tensor. Working set per CTA is small enough to fit, and the 16x16x32 tile maps cleanly onto Blackwell tensor cores.",
+          "score_0_to_1": 0.9,
+          "title": "Mega-fused per-window Swin block kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "16x16x32 tl.dot tiles align with mma.m16n16k16 fp16; hidden=128 via two 16x16x128 dots or one 16x128 accum.",
+            "notes": "Tensor core util 28%; 16x16 tiles on Blackwell underutilized.",
+            "rating_0_to_10": 6.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "DRAM round-trips eliminated; only 7.85% mem throughput used.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "179 regs/thread caps occupancy at ~16%.",
+            "rating_0_to_10": 4.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "Best known solution: 5.51x over compile, 0.979ms. Bottleneck: register pressure (179/thread) -> occupancy 16%. Children explore tuning/reg reduction (n1a) and further fusion/algorithmic refinements.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.9792,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.9792,
+              "ref_eager_time_ms": 8.639,
+              "score": 5.5078,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 5.5078,
+              "speedup_over_eager": 8.8224
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 71.78,
+                  "compute_throughput_pct": 50.79,
+                  "duration_us": 1299.2,
+                  "kernel_name": "swin_block_kernel_wpc",
+                  "l1_hit_rate_pct": 17.17,
+                  "l2_hit_rate_pct": 73.32,
+                  "memory_throughput_pct": 7.85,
+                  "registers_per_thread": 179,
+                  "shared_mem_per_block_bytes": 30720,
+                  "sm_occupancy_pct": 16.29,
+                  "tensor_core_utilization_pct": 28.08,
+                  "top_stall_reasons": [
+                    [
+                      "wait",
+                      0.88
+                    ],
+                    [
+                      "math_pipe_throttle",
+                      0.69
+                    ],
+                    [
+                      "not_selected",
+                      0.31
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 8.639,
+            "speedup_factor": 5.5078,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "fb57e50aca4418d02181287cff40d2f1a2eee49e"
+        }
+      },
+      {
+        "action": {
+          "description": "Two fused Triton kernels: (1) LN1 + QKV + attention(softmax+RPE) + AV + Proj + residual1, writing y1 to global; (2) LN2 + FC1 + GELU + FC2 + residual2. Each kernel keeps its respective weights in shared. Simpler than mega-fusion; one extra round-trip of y1 vs n1.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.5,
+          "rationale": "Lower implementation risk than full fusion; still saves 4-6 DRAM round trips vs baseline. Good fallback if n1 hits register pressure issues.",
+          "score_0_to_1": 0.15,
+          "title": "Two-kernel fusion: attention-block + MLP-block"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.3,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Same 16x16x32 tiles; MLP kernel uses 16x32x128 and 16x128x32 dots.",
+            "notes": "Each sub-kernel still tensor-core efficient.",
+            "rating_0_to_10": 7.0,
+            "risk": "Slight reuse loss vs n1."
+          },
+          "memory_bandwidth": {
+            "notes": "One extra read+write of 56MB y1 vs n1; still much better than baseline's many trips.",
+            "rating_0_to_10": 8.0,
+            "risk": "Minor; DRAM traffic ~2x of n1."
+          },
+          "register_pressure": {
+            "notes": "Lower per-kernel pressure; easier to tune WINDOWS_PER_CTA per kernel.",
+            "rating_0_to_10": 8.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "De-prioritized: splitting fusion re-introduces HBM roundtrips; dominated by n1's 5.51x.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Process multiple windows (e.g., 4 or 8) per CTA within the mega-fused kernel so that the QKV/proj/fc1/fc2 weight tiles loaded into shared memory are amortized across more tokens. Tune WINDOWS_PER_CTA, num_warps, num_stages for RTX5090.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.3,
+          "rationale": "Weights are tiny but loading them once per window wastes bandwidth; batching windows improves arithmetic intensity per CTA and increases occupancy of tensor cores.",
+          "score_0_to_1": 0.2,
+          "title": "Window batching (WINDOWS_PER_CTA tuning)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.3,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Effective M dimension grows from 16 to 16*WPC, helping mma efficiency.",
+            "notes": "Better tensor-core occupancy; larger M tile.",
+            "rating_0_to_10": 8.0,
+            "risk": "Attn softmax is still per-window (block-diagonal) so must keep per-window N=16 grouping inside the kernel."
+          },
+          "memory_bandwidth": {
+            "notes": "Amortizes weight loads; reduces total CTA count.",
+            "rating_0_to_10": 8.0,
+            "risk": "Diminishing returns past a point."
+          },
+          "register_pressure": {
+            "notes": "Hidden accumulator (16*WPC x 128) grows linearly; cap WPC at 2-4.",
+            "rating_0_to_10": 5.0,
+            "risk": "Spilling if WPC too large."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "De-prioritized as root sibling; tuning belongs under n1/n1a.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.22,
+          "rationale": "",
+          "score_0_to_1": 0.45,
+          "title": "Reduce register pressure + tune WPC/num_warps for higher occupancy"
+        },
+        "choice": "WPC=4, num_warps=4, num_stages=2",
+        "confidence_0_to_1": 0.6,
+        "decision": "Reduced register pressure attempt by tuning WPC=4/num_warps=4",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Tensor core util 28%, math_pipe_throttle stall present",
+            "rating_0_to_10": 6.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "BW still ~73 GB/s; not bandwidth bound",
+            "rating_0_to_10": 4.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "179 regs/thread unchanged; occupancy stuck at 16.29%",
+            "rating_0_to_10": 3.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Mega-fused per-window Swin block kernel doing LN+QKV+attn+proj+LN+MLP in one kernel; WPC=4. bottleneck=compute/latency with high register pressure limiting occupancy. FOLLOW_THROUGH: aligned_with_intent=no; intent was to reduce regs and raise occupancy, but current code did not change WPC/num_warps materially and registers stayed at 179 with same 16.29% occupancy. UPDATE_BELIEF: Eval slightly regressed (5.36x vs 5.51x); simply changing WPC/num_warps without restructuring won't reduce regs. next bet: split attention from MLP stages with shared-memory staging, or convert big preloaded weights to streamed tl.dot tiles to cut live registers. PERF_GAP: expected 0.22x baseline, observed ~0.113x baseline (0.9935/8.728); reason: register pressure unchanged so occupancy gain didn't materialize.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.9935,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.9935,
+              "ref_eager_time_ms": 8.728,
+              "score": 5.3634,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 5.3634,
+              "speedup_over_eager": 8.7849
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 73.51,
+                  "compute_throughput_pct": 50.83,
+                  "duration_us": 1300.928,
+                  "kernel_name": "swin_block_kernel_wpc",
+                  "l1_hit_rate_pct": 17.15,
+                  "l2_hit_rate_pct": 72.18,
+                  "memory_throughput_pct": 8.04,
+                  "registers_per_thread": 179,
+                  "shared_mem_per_block_bytes": 30720,
+                  "sm_occupancy_pct": 16.29,
+                  "tensor_core_utilization_pct": 28.11,
+                  "top_stall_reasons": [
+                    [
+                      "wait",
+                      0.88
+                    ],
+                    [
+                      "math_pipe_throttle",
+                      0.69
+                    ],
+                    [
+                      "not_selected",
+                      0.31
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 8.728,
+            "speedup_factor": 5.3634,
+            "status": "passed"
+          },
+          "parent_solution_id": "fb57e50aca4418d02181287cff40d2f1a2eee49e",
+          "solution_id": "992fd5b6a9a1d514b48777dc48978467dd490827"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Tensor core util 28%, math_pipe_throttle stall present",
+            "rating_0_to_10": 6.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "BW still ~73 GB/s; not bandwidth bound",
+            "rating_0_to_10": 4.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "179 regs/thread unchanged; occupancy stuck at 16.29%",
+            "rating_0_to_10": 3.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 30,
+        "node_id": "node_swin_block_fp16_simplified_r30_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "992fd5b6a9a1d514b48777dc48978467dd490827",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin block in fp16 on input (1,720,1280,32): LN -> windowed self-attention (window 4x4, single head, no shift, with relative-position bias) -> residual -> LN -> MLP(32->128 GELU ->32) -> residual. Each window has only N=16 tokens and C=32 channels; all weights are tiny (qkv 32x96, proj 32x32, fc1 32x128, fc2 128x32 \u2248 24KB total fp16). The workload is strongly DRAM-bandwidth-bound: the ~56MB activation tensor would otherwise be streamed through DRAM many times across the op sequence. Key constraints: fp16 storage with fp32 accumulation for LN/softmax/matmul for numerical parity; 57600 windows; tensor-core-friendly 16x16x32 tiles; RPE is a fixed 16x16 fp16 broadcast bias.",
+  "open_questions": [
+    "Exact tolerance required vs reference (LN/softmax fp32 accumulation must match torch.compile output within ~1e-2 fp16)?",
+    "Is the input always contiguous (B,H,W,C) with H,W divisible by 4 at benchmark time?",
+    "Best WINDOWS_PER_CTA on RTX5090 (1, 2, or 4) given register budget for hidden 16*WPC x 128 fp32 accumulator?",
+    "Should weights be preloaded once via tl.load into shared per CTA, or kept as constants/inline arguments?",
+    "Will Triton's tl.dot accept M=16 tiles efficiently on Blackwell, or does it require padding M to 32?",
+    "Does the RPE bias need to be reshaped/transposed for efficient broadcast inside the kernel?",
+    "Is there benefit to converting fc1/fc2 weights to a packed/transposed layout at __init__ time for better tl.dot operand layout?",
+    "How much does torch.compile already fuse here, i.e., what is the realistic speedup ceiling?"
+  ]
+}

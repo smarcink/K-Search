@@ -24,9 +24,7 @@
             "args": [
                 "swin_fp16/swin_block_fp16_simplified.py",
                 "swin_fp16/triton_opus46_copy",
-                "swin_fp16/opus47_triton_v2",
-                "swin_fp16/opus47_ncu_v2",
-                "swin_fp16/opus47_v2",
+                "swin_fp16/opus47_v3_ncu",
                 "--precision", "fp16",
                 "--warmup", "100",
                 "--iters", "1000", 

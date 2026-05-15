@@ -1,1 +1,0 @@
-# Test: reduce register pressure in mlp kernel
