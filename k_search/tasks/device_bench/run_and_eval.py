@@ -228,6 +228,95 @@ def _measure_latency(
 
 
 # ---------------------------------------------------------------------------
+# Model loading helper (shared by evaluate() and profile_only())
+# ---------------------------------------------------------------------------
+
+def _load_models(
+    ref_path: str,
+    kernel_src_path: str,
+    device: str,
+    dtype: torch.dtype,
+):
+    """Load ref + new model, copy weights, move to device, return (ref, new, get_inputs_fn)."""
+    ref_mod = _load_module_from_file(ref_path, "_device_bench_ref")
+    if not hasattr(ref_mod, "Model"):
+        raise RuntimeError(f"Reference file {ref_path} must define a 'Model' class")
+    if not hasattr(ref_mod, "get_inputs"):
+        raise RuntimeError(f"Reference file {ref_path} must define a 'get_inputs()' function")
+
+    init_inputs = ref_mod.get_init_inputs() if hasattr(ref_mod, "get_init_inputs") else []
+    ref_model = ref_mod.Model(*init_inputs)
+    if hasattr(ref_model, "half") and dtype == torch.float16:
+        ref_model = ref_model.half()
+    elif hasattr(ref_model, "bfloat16") and dtype == torch.bfloat16:
+        ref_model = ref_model.bfloat16()
+
+    def ref_get_inputs():
+        inputs = ref_mod.get_inputs()
+        return _move_inputs_to_device(inputs, device, dtype)
+
+    sol_mod = _load_module_from_file(kernel_src_path, "_device_bench_sol")
+    if not hasattr(sol_mod, "ModelNew"):
+        raise RuntimeError(f"Solution file {kernel_src_path} must define a 'ModelNew' class")
+
+    new_model = sol_mod.ModelNew(*init_inputs)
+    if hasattr(new_model, "half") and dtype == torch.float16:
+        new_model = new_model.half()
+    elif hasattr(new_model, "bfloat16") and dtype == torch.bfloat16:
+        new_model = new_model.bfloat16()
+
+    _copy_weights(new_model, ref_model, sol_mod)
+
+    ref_model = ref_model.to(device)
+    new_model = new_model.to(device)
+    ref_model.eval()
+    new_model.eval()
+
+    return ref_model, new_model, ref_get_inputs
+
+
+# ---------------------------------------------------------------------------
+# Profile-only mode (for hardware profilers like NCU / VTune)
+# ---------------------------------------------------------------------------
+
+def profile_only(
+    ref_path: str,
+    kernel_src_path: str,
+    device: str,
+    precision: str,
+) -> None:
+    """Compile + load ModelNew, run it once between profiler markers.
+
+    The host profiler (e.g. ncu --profile-from-start off) captures only the
+    kernels launched between cudaProfilerStart/Stop. Warmup runs outside the
+    marked region so JIT compilation / autotune don't pollute the metrics.
+    """
+    backend = device.split(":")[0]
+    if backend != "cuda":
+        raise RuntimeError(
+            f"profile_only currently supports CUDA only (got device={device}). "
+            "Add a backend-specific profiler hook (e.g. VTune for XPU) to extend."
+        )
+
+    dtype = _get_precision_dtype(precision)
+    _, new_model, get_inputs_fn = _load_models(ref_path, kernel_src_path, device, dtype)
+
+    inputs = get_inputs_fn()
+
+    # Warmup outside the profiled region (triggers Triton autotune / cudnn algo selection).
+    with torch.no_grad():
+        new_model(*inputs)
+    _synchronize(device)
+
+    # Profiled region — ncu captures every kernel launched between Start/Stop.
+    torch.cuda.cudart().cudaProfilerStart()
+    with torch.no_grad():
+        new_model(*inputs)
+    _synchronize(device)
+    torch.cuda.cudart().cudaProfilerStop()
+
+
+# ---------------------------------------------------------------------------
 # Main evaluation flow
 # ---------------------------------------------------------------------------
 
@@ -251,45 +340,8 @@ def evaluate(
     print(f"[INFO] Performance trials: {num_perf_trials}")
     print("=" * 60)
 
-    # ---- Load reference module ----
-    print("[INFO] Loading reference module...")
-    ref_mod = _load_module_from_file(ref_path, "_device_bench_ref")
-
-    if not hasattr(ref_mod, "Model"):
-        raise RuntimeError(f"Reference file {ref_path} must define a 'Model' class")
-    if not hasattr(ref_mod, "get_inputs"):
-        raise RuntimeError(f"Reference file {ref_path} must define a 'get_inputs()' function")
-
-    init_inputs = ref_mod.get_init_inputs() if hasattr(ref_mod, "get_init_inputs") else []
-    ref_model = ref_mod.Model(*init_inputs)
-    if hasattr(ref_model, "half") and dtype == torch.float16:
-        ref_model = ref_model.half()
-    elif hasattr(ref_model, "bfloat16") and dtype == torch.bfloat16:
-        ref_model = ref_model.bfloat16()
-
-    def ref_get_inputs():
-        inputs = ref_mod.get_inputs()
-        return _move_inputs_to_device(inputs, device, dtype)
-
-    # ---- Load solution module ----
-    print("[INFO] Loading solution module...")
-    sol_mod = _load_module_from_file(kernel_src_path, "_device_bench_sol")
-
-    if not hasattr(sol_mod, "ModelNew"):
-        raise RuntimeError(f"Solution file {kernel_src_path} must define a 'ModelNew' class")
-
-    new_model = sol_mod.ModelNew(*init_inputs)
-    if hasattr(new_model, "half") and dtype == torch.float16:
-        new_model = new_model.half()
-    elif hasattr(new_model, "bfloat16") and dtype == torch.bfloat16:
-        new_model = new_model.bfloat16()
-
-    _copy_weights(new_model, ref_model, sol_mod)
-
-    ref_model = ref_model.to(device)
-    new_model = new_model.to(device)
-    ref_model.eval()
-    new_model.eval()
+    print("[INFO] Loading reference + solution modules...")
+    ref_model, new_model, ref_get_inputs = _load_models(ref_path, kernel_src_path, device, dtype)
 
     # ---- Correctness ----
     print("[INFO] Checking correctness...")
@@ -377,7 +429,21 @@ def main():
     parser.add_argument("--num-correct-trials", type=int, default=5)
     parser.add_argument("--num-perf-trials", type=int, default=100)
     parser.add_argument("--num-warmup", type=int, default=10)
+    parser.add_argument(
+        "--profile-only", action="store_true",
+        help="Compile + load ModelNew, then run it once between cudaProfilerStart/Stop "
+             "for an external profiler (ncu, etc.) to capture. No correctness/timing.",
+    )
     args = parser.parse_args()
+
+    if args.profile_only:
+        profile_only(
+            ref_path=args.ref_path,
+            kernel_src_path=args.kernel_src_path,
+            device=args.device,
+            precision=args.precision,
+        )
+        return
 
     evaluate(
         ref_path=args.ref_path,

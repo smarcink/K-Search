@@ -132,6 +132,8 @@ class DeviceBenchTask:
         timeout: int = 300,
         artifacts_dir: str | None = None,
         name: str | None = None,
+        enable_profiling: bool = False,
+        verbose: bool = False,
     ) -> None:
         self._ref_path = str(Path(ref_path).resolve())
         self._cfg = DeviceBenchTaskConfig(
@@ -144,7 +146,13 @@ class DeviceBenchTask:
         )
         self._name = str(name or Path(ref_path).stem)
         self._ksearch_artifacts_dir = str(artifacts_dir) if artifacts_dir else None
+        self._enable_profiling = bool(enable_profiling)
+        self._verbose = bool(verbose)
         self._solutions: dict[str, Solution] = {}
+
+        # Hardware profiler selected by device backend (NCU on CUDA; no-op on XPU).
+        from k_search.utils.profiler import select_profiler
+        self._profiler = select_profiler(self._cfg.device)
 
         # Feedback state (updated after each eval round)
         self._last_round_trace_logs_for_prompt: str = ""
@@ -481,97 +489,144 @@ Your implementation will be evaluated for:
             )
 
         except subprocess.TimeoutExpired:
+            if kernel_src_path:
+                try: os.unlink(kernel_src_path)
+                except Exception: pass
             return self._failed_eval(f"Evaluation timed out after {self._cfg.timeout} seconds", round_num)
         except Exception as e:
+            if kernel_src_path:
+                try: os.unlink(kernel_src_path)
+                except Exception: pass
             return self._failed_eval(f"Evaluation error: {type(e).__name__}: {e}", round_num)
+
+        # NB: kernel_src_path is intentionally kept alive past this point so that
+        # the optional profiling pass can re-import the same source. It is unlinked
+        # in the try/finally wrapping the parsing + profiling block below.
+        try:
+
+            stdout = result.stdout
+            stderr = result.stderr
+
+            if result.returncode != 0:
+                excerpt = self._extract_error_excerpt(stdout, stderr)
+                rc_info = f"(exit code {result.returncode})"
+                if result.returncode < 0:
+                    import signal as _sig
+                    try:
+                        sig_name = _sig.Signals(-result.returncode).name
+                        rc_info = f"(killed by {sig_name}, exit code {result.returncode})"
+                    except (ValueError, AttributeError):
+                        rc_info = f"(killed by signal {-result.returncode})"
+                return self._failed_eval(f"Evaluation failed {rc_info}:\n{excerpt}", round_num)
+
+            # Parse structured output
+            speedup_eager = self._extract_metric(stdout, "Speedup over eager:", r"([0-9.]+)x")
+            speedup_compile = self._extract_metric(stdout, "Speedup over torch.compile:", r"([0-9.]+)x")
+            kernel_time = self._extract_metric(stdout, "Custom Kernel exec time:", r"([0-9.]+) ms")
+            ref_eager_time = self._extract_metric(stdout, "PyTorch Reference Eager exec time:", r"([0-9.]+) ms")
+            compile_time = self._extract_metric(stdout, "torch.compile exec time:", r"([0-9.]+) ms")
+
+            # Use speedup over torch.compile as the primary score
+            primary_speedup = speedup_compile if speedup_compile and speedup_compile > 0 else speedup_eager
+            primary_score_name = "speedup_over_compile" if (speedup_compile and speedup_compile > 0) else "speedup_over_eager"
+
+            if speedup_eager and speedup_eager > 0:
+                # Build informative trace log for LLM prompts
+                trace_parts = [f"Custom kernel: {kernel_time:.4f} ms"]
+                if ref_eager_time:
+                    trace_parts.append(f"PyTorch eager: {ref_eager_time:.4f} ms (speedup: {speedup_eager:.2f}x)")
+                if compile_time and speedup_compile:
+                    trace_parts.append(f"torch.compile: {compile_time:.4f} ms (speedup: {speedup_compile:.2f}x)")
+                    if speedup_compile < 1.0:
+                        trace_parts.append(f"*** Your kernel is SLOWER than torch.compile ({speedup_compile:.2f}x) — you need to beat {compile_time:.4f} ms")
+                self._last_round_trace_logs_for_prompt = "\n".join(trace_parts)
+                self._last_round_passed_count = 1
+                self._last_round_total_workloads = 1
+
+                log_line = f"Speedup: {speedup_eager:.2f}x over eager"
+                if speedup_compile:
+                    log_line += f", {speedup_compile:.2f}x over torch.compile"
+
+                er = EvalResult(
+                    status="passed",
+                    latency_ms=kernel_time,
+                    reference_latency_ms=ref_eager_time,
+                    mean_vs_baseline_factor=None,
+                    speedup_factor=primary_speedup,
+                    log_excerpt=log_line,
+                    metrics={
+                        "score_name": primary_score_name,
+                        "score": float(primary_speedup) if primary_speedup else None,
+                        "speedup_over_eager": speedup_eager,
+                        "speedup_over_compile": speedup_compile,
+                        "kernel_time_ms": kernel_time,
+                        "ref_eager_time_ms": ref_eager_time,
+                    },
+                )
+
+                # Optional hardware profiling pass (best-effort, never fails the eval).
+                if self._enable_profiling:
+                    er = self._run_profiling(er, kernel_src_path, env, repo_root)
+
+                self._print_summary(round_num, er, passed=True)
+                return er
+            else:
+                excerpt = self._extract_eval_excerpt(stdout)
+                self._last_round_trace_logs_for_prompt = excerpt
+                self._last_round_passed_count = 0
+                self._last_round_total_workloads = 1
+
+                er = EvalResult(
+                    status="failed",
+                    latency_ms=None,
+                    reference_latency_ms=None,
+                    mean_vs_baseline_factor=None,
+                    speedup_factor=None,
+                    log_excerpt=excerpt,
+                    metrics={
+                        "score_name": "speedup_over_compile",
+                        "score": None,
+                    },
+                )
+                self._print_summary(round_num, er, passed=False)
+                return er
         finally:
             if kernel_src_path:
-                try:
-                    os.unlink(kernel_src_path)
-                except Exception:
-                    pass
+                try: os.unlink(kernel_src_path)
+                except Exception: pass
 
-        stdout = result.stdout
-        stderr = result.stderr
+    def _run_profiling(self, eval_result: "EvalResult", kernel_src_path: str, env: dict, repo_root: Path) -> "EvalResult":
+        """Run hardware profiling on a passed kernel and attach metrics to EvalResult."""
+        try:
+            if not self._profiler.available():
+                if self._verbose:
+                    print(f"[{self._name}] [profiler] backend '{self._profiler.name}' not available; skipping")
+                return eval_result
 
-        if result.returncode != 0:
-            excerpt = self._extract_error_excerpt(stdout, stderr)
-            rc_info = f"(exit code {result.returncode})"
-            if result.returncode < 0:
-                import signal as _sig
-                try:
-                    sig_name = _sig.Signals(-result.returncode).name
-                    rc_info = f"(killed by {sig_name}, exit code {result.returncode})"
-                except (ValueError, AttributeError):
-                    rc_info = f"(killed by signal {-result.returncode})"
-            return self._failed_eval(f"Evaluation failed {rc_info}:\n{excerpt}", round_num)
+            profile_cmd = [
+                sys.executable,
+                "-u",
+                "-m", "k_search.tasks.device_bench.run_and_eval",
+                f"--ref-path={self._ref_path}",
+                f"--kernel-src-path={kernel_src_path}",
+                f"--device={self._cfg.device}",
+                f"--precision={self._cfg.precision}",
+                "--profile-only",
+            ]
 
-        # Parse structured output
-        speedup_eager = self._extract_metric(stdout, "Speedup over eager:", r"([0-9.]+)x")
-        speedup_compile = self._extract_metric(stdout, "Speedup over torch.compile:", r"([0-9.]+)x")
-        kernel_time = self._extract_metric(stdout, "Custom Kernel exec time:", r"([0-9.]+) ms")
-        ref_eager_time = self._extract_metric(stdout, "PyTorch Reference Eager exec time:", r"([0-9.]+) ms")
-        compile_time = self._extract_metric(stdout, "torch.compile exec time:", r"([0-9.]+) ms")
-
-        # Use speedup over torch.compile as the primary score
-        primary_speedup = speedup_compile if speedup_compile and speedup_compile > 0 else speedup_eager
-        primary_score_name = "speedup_over_compile" if (speedup_compile and speedup_compile > 0) else "speedup_over_eager"
-
-        if speedup_eager and speedup_eager > 0:
-            # Build informative trace log for LLM prompts
-            trace_parts = [f"Custom kernel: {kernel_time:.4f} ms"]
-            if ref_eager_time:
-                trace_parts.append(f"PyTorch eager: {ref_eager_time:.4f} ms (speedup: {speedup_eager:.2f}x)")
-            if compile_time and speedup_compile:
-                trace_parts.append(f"torch.compile: {compile_time:.4f} ms (speedup: {speedup_compile:.2f}x)")
-                if speedup_compile < 1.0:
-                    trace_parts.append(f"*** Your kernel is SLOWER than torch.compile ({speedup_compile:.2f}x) — you need to beat {compile_time:.4f} ms")
-            self._last_round_trace_logs_for_prompt = "\n".join(trace_parts)
-            self._last_round_passed_count = 1
-            self._last_round_total_workloads = 1
-
-            log_line = f"Speedup: {speedup_eager:.2f}x over eager"
-            if speedup_compile:
-                log_line += f", {speedup_compile:.2f}x over torch.compile"
-
-            er = EvalResult(
-                status="passed",
-                latency_ms=kernel_time,
-                reference_latency_ms=ref_eager_time,
-                mean_vs_baseline_factor=None,
-                speedup_factor=primary_speedup,
-                log_excerpt=log_line,
-                metrics={
-                    "score_name": primary_score_name,
-                    "score": float(primary_speedup) if primary_speedup else None,
-                    "speedup_over_eager": speedup_eager,
-                    "speedup_over_compile": speedup_compile,
-                    "kernel_time_ms": kernel_time,
-                    "ref_eager_time_ms": ref_eager_time,
-                },
-            )
-            self._print_summary(round_num, er, passed=True)
-            return er
-        else:
-            excerpt = self._extract_eval_excerpt(stdout)
-            self._last_round_trace_logs_for_prompt = excerpt
-            self._last_round_passed_count = 0
-            self._last_round_total_workloads = 1
-
-            er = EvalResult(
-                status="failed",
-                latency_ms=None,
-                reference_latency_ms=None,
-                mean_vs_baseline_factor=None,
-                speedup_factor=None,
-                log_excerpt=excerpt,
-                metrics={
-                    "score_name": "speedup_over_compile",
-                    "score": None,
-                },
-            )
-            self._print_summary(round_num, er, passed=False)
-            return er
+            metrics_dict = self._profiler.run(profile_cmd, timeout=120, verbose=self._verbose)
+            if metrics_dict is not None:
+                metrics_dict["profiler_backend"] = self._profiler.name
+                eval_result.profiler_metrics = metrics_dict
+                if self._verbose:
+                    print(f"[{self._name}] [profiler] attached {self._profiler.name} metrics "
+                          f"({len(metrics_dict.get('kernels', []))} kernels)")
+            elif self._verbose:
+                print(f"[{self._name}] [profiler] no metrics parsed from {self._profiler.name} output")
+        except Exception as e:
+            if self._verbose:
+                print(f"[{self._name}] [profiler] error (non-fatal): {type(e).__name__}: {e}")
+        return eval_result
 
     # ------------------------------------------------------------------
     # Task protocol: feedback for prompts

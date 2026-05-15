@@ -318,14 +318,15 @@ def main():
         help="dtype for cuda_kernel eval",
     )
     parser.add_argument(
-        "--enable-ncu-profiling",
+        "--enable-profiling",
         action="store_true",
-        help="Run NVIDIA Nsight Compute (ncu) profiling on passed kernels to collect hardware metrics for the LLM.",
+        help="Run hardware profiler on passed kernels to collect metrics for the LLM "
+             "(NCU on CUDA; planned VTune for XPU). No-op on backends without a wired-up profiler.",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable verbose output: print kernel source and NCU profiler report after each evaluation.",
+        help="Enable verbose output: print kernel source and profiler report after each evaluation.",
     )
 
     # Device Bench options (unified for CUDA / XPU / any accelerator)
@@ -362,7 +363,7 @@ def main():
             rtol=args.rtol,
             atol=args.atol,
             artifacts_dir=args.artifacts_dir,
-            enable_ncu_profiling=args.enable_ncu_profiling,
+            enable_profiling=args.enable_profiling,
             verbose=args.verbose,
         )
     elif task_source == "device_bench":
@@ -378,6 +379,8 @@ def main():
             num_correct_trials=args.device_bench_num_correct_trials,
             num_perf_trials=args.device_bench_num_perf_trials,
             artifacts_dir=args.artifacts_dir,
+            enable_profiling=args.enable_profiling,
+            verbose=args.verbose,
         )
     else:
         raise ValueError(f"Unsupported task_source: {task_source}")

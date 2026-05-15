@@ -171,37 +171,21 @@ class EvalResult:
         return lines
 
     def profiler_summary_lines(self) -> list[str]:
-        """Return rendered profiler summary lines, or empty list if no profiling data."""
+        """Return rendered profiler summary lines, or empty list if no profiling data.
+
+        The profiler backend is selected by the `profiler_backend` field on
+        `profiler_metrics` (defaults to "ncu" for back-compat with the
+        NCU-shaped dicts produced today).
+        """
         if not self.profiler_metrics:
             return []
         try:
-            from k_search.utils.ncu_profiler import NcuMetrics, render_profiler_summary
-
-            # New format: {"kernels": [{...}, {...}, ...]}
-            kernel_dicts = self.profiler_metrics.get("kernels", [])
-            if not kernel_dicts:
-                # Legacy single-kernel format (backward compat)
-                kernel_dicts = [self.profiler_metrics]
-
-            kernel_list: list[NcuMetrics] = []
-            for kd in kernel_dicts:
-                m = NcuMetrics(
-                    sm_occupancy_pct=kd.get("sm_occupancy_pct"),
-                    compute_throughput_pct=kd.get("compute_throughput_pct"),
-                    memory_throughput_pct=kd.get("memory_throughput_pct"),
-                    l1_hit_rate_pct=kd.get("l1_hit_rate_pct"),
-                    l2_hit_rate_pct=kd.get("l2_hit_rate_pct"),
-                    achieved_bandwidth_gb_s=kd.get("achieved_bandwidth_gb_s"),
-                    tensor_core_utilization_pct=kd.get("tensor_core_utilization_pct"),
-                    registers_per_thread=kd.get("registers_per_thread"),
-                    shared_mem_per_block_bytes=kd.get("shared_mem_per_block_bytes"),
-                    top_stall_reasons=kd.get("top_stall_reasons", []),
-                    kernel_name=kd.get("kernel_name", ""),
-                )
-                kernel_list.append(m)
-
-            rendered = render_profiler_summary(kernel_list)
-            return rendered.splitlines() if rendered else []
+            backend = str(self.profiler_metrics.get("profiler_backend") or "ncu").lower()
+            if backend == "ncu":
+                from k_search.utils.profiler.ncu import NcuProfiler
+                return NcuProfiler().summary_lines(self.profiler_metrics)
+            # Unknown backend: nothing to render.
+            return []
         except Exception:
             return []
 
