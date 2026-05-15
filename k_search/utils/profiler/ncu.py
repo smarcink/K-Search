@@ -170,6 +170,35 @@ def _run_ncu_subprocess(
     return _parse_ncu_csv(csv_output)
 
 
+# Substrings (case-insensitive) that identify PyTorch / cuBLAS / cuDNN
+# infrastructure kernels we want to hide from the profiler report. The point
+# of profiling is to give the LLM feedback on the kernel IT generated, not on
+# the surrounding torch glue (residual adds, casts, layernorm helpers, etc.).
+_INFRA_KERNEL_PATTERNS: tuple[str, ...] = (
+    "at::native::",
+    "at::elementwise_kernel",
+    "at::vectorized_elementwise_kernel",
+    "at::gpu_kernel",
+    "at::reduce_kernel",
+    "aten::",
+    "cudnn::",
+    "cudnn_",
+    "cublas",
+    "cutlass::",
+    "thrust::",
+    "void at::",          # most templated at:: launches
+    "scalar_tensor",
+    "_kernel_impl_nocast",
+)
+
+
+def _is_infrastructure_kernel(name: str) -> bool:
+    if not name:
+        return False
+    n = name.lower()
+    return any(p.lower() in n for p in _INFRA_KERNEL_PATTERNS)
+
+
 def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
     """Parse ncu --csv output into a list of NcuMetrics (one per kernel launch)."""
     try:
@@ -260,6 +289,13 @@ def _parse_ncu_csv(csv_text: str) -> list[NcuMetrics] | None:
             m.top_stall_reasons = stalls[:3]
 
             result.append(m)
+
+        # Filter out PyTorch / library infrastructure kernels so the report
+        # focuses on the user-generated kernel(s) (Triton, hand-written CUDA, etc.).
+        # If the filter would drop everything, keep the original list.
+        filtered = [m for m in result if not _is_infrastructure_kernel(m.kernel_name)]
+        if filtered:
+            result = filtered
 
         # Sort by compute throughput descending (heaviest kernel first)
         result.sort(key=lambda m: m.compute_throughput_pct or 0.0, reverse=True)

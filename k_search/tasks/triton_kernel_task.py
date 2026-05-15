@@ -772,6 +772,17 @@ Your implementation will be evaluated for:
 
         print(self._last_round_summary_line, flush=True)
 
+        # When verbose, print the hardware profiler report (mirrors CudaKernelTask).
+        if passed and self._verbose:
+            backend_label = self._profiler.name.upper()
+            if er.profiler_metrics:
+                print(f"\n--- {backend_label} Profiler Report ---")
+                for line in er.profiler_summary_lines():
+                    print(f"  {line}")
+            elif self._enable_profiling:
+                print(f"\n--- {backend_label} Profiler Report ---")
+                print("  (no profiler data collected)")
+
         if not passed:
             excerpt = er.log_excerpt or ""
             if excerpt:

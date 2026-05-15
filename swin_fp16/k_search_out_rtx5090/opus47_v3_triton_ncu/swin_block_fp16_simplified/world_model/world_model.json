@@ -1,0 +1,213 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "root",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 Blackwell, fp16 tensor cores, large SM count; small N=16 attention windows; C=32 channels; hidden=128 MLP.",
+            "notes": "Dim=32, hidden=128, N=16 are tiny \u2014 most matmuls underutilize tensor cores unless we batch many windows per block.",
+            "rating_0_to_10": 6.0,
+            "risk": "Small K dimension (32) limits tensor-core efficiency; need to batch windows."
+          },
+          "memory_bandwidth": {
+            "notes": "Block has many sequential ops (LN, qkv, attn, proj, residual, LN, fc1, gelu, fc2, residual). Each unfused op roundtrips through HBM. Working set per pixel is tiny (32 ch fp16 = 64B). Total tensor ~57MB.",
+            "rating_0_to_10": 8.0,
+            "risk": "Memory-bound overall; fusion is key. Weight matrices: qkv(32x96=6KB), proj(32x32=2KB), fc1(32x128=8KB), fc2(128x32=8KB) all fit in shared mem easily."
+          },
+          "register_pressure": {
+            "notes": "Per-window working set: N=16 tokens \u00d7 C=32 = 512 fp16 = 1KB. Hidden activations 16\u00d7128=4KB. All weights together ~24KB fp16. Fits comfortably in shared memory of a CTA.",
+            "rating_0_to_10": 7.0,
+            "risk": "Full-fusion feasible per window in shared memory."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: Swin block (LN->WMSA(W=4x4,h=1,C=32)->residual->LN->MLP(ratio=4)->residual). Input 1x720x1280x32 fp16. Windows: 180x320=57600 windows, each N=16 tokens. DIMS: C=32 small, hidden=128 small, N=16 small => all matmuls are tiny per window. LAYOUT: input (B,H,W,C) contig; window partition is a reshape+permute. WEIGHTS small (~24KB total fp16): qkv 32->96, proj 32->32, fc1 32->128, fc2 128->32; rpe_bias (1,1,16,16). BOTTLENECKS by regime: (a) full eager => HBM roundtrip per op dominates (memory-bound). (b) torch.compile fused => still likely several kernels; LN+matmul fusion limited. (c) custom single-kernel per window => compute could become limiter for the 4 GEMMs but tiny K=32 still underutilizes TC. STRATEGY: FULL FUSION \u2014 one kernel processes a batch of windows; load weights once into shared mem (or even constants), do LN1 (reduce over C=32), qkv, attn (N x N = 16x16), softmax+rpe, proj, residual, LN2, fc1+GELU, fc2, residual, store. Window partition can be done implicitly by computing source indices. Multiple windows per program improve TC utilization (e.g., BLOCK_W windows -> effective M=BLOCK_W*N for matmuls). KEY OPS in canonical form: For each window w (size 4x4=16 tokens, 32 ch): x_in = input gather; y1 = LN(x_in); qkv = y1 @ Wqkv + bqkv; q,k,v split; a = softmax(q@k^T/sqrt(C) + rpe); h = a@v @ Wproj + bproj + x_in; y2 = LN(h); m = GELU(y2@Wfc1+b1) @ Wfc2 + b2; out = h + m. CONSTRAINTS: fp16 IO, fp32 accumulate for LN and matmul. OPEN ACTIONS: (1) single fused triton kernel per group-of-windows; (2) fused LN+QKV+attn kernel then fused proj+residual+LN2+MLP kernel; (3) keep PyTorch for window partition but fuse MLP block. SELF_CHECK families differ in fusion granularity \u2014 mutually exclusive top-level strategies.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "init"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Write a single Triton kernel that, per program, processes a batch of BLOCK_W windows (each N=16 tokens, C=32). Load all weights (qkv, proj, fc1, fc2, biases, rpe, LN gammas/betas) into registers/shared once per program. Inside the kernel perform: gather input window, LN1, qkv via tl.dot, attention with softmax+rpe, attn@v, proj, add residual, LN2, fc1+GELU, fc2, add residual, scatter to output. Use fp32 accumulators for LN and matmuls, fp16 storage.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.4,
+          "rationale": "Full fusion eliminates ~10 HBM roundtrips. Weight set ~24KB fits in shared memory. Multiple windows per program (e.g., 8 or 16) increases effective M for tl.dot so tensor cores are usefully utilized despite tiny K=32.",
+          "score_0_to_1": 0.8,
+          "title": "Fully fused per-window-batch Triton kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "tl.dot on Blackwell wants M,N>=16 and K multiple of 16; C=32 K is ok; with BLOCK_W*N = 8*16=128 M dim, fc1 becomes 128x32 @ 32x128, decent.",
+            "notes": "Batching windows raises arithmetic intensity per kernel launch.",
+            "rating_0_to_10": 8.0,
+            "risk": "Register/shared pressure if BLOCK_W too large; softmax over N=16 trivial."
+          },
+          "memory_bandwidth": {
+            "notes": "Input/output each read/written once. Weights loaded once per program (broadcast across windows in same program).",
+            "rating_0_to_10": 9.0,
+            "risk": "Need to verify gather pattern for window partition stays coalesced."
+          },
+          "register_pressure": {
+            "notes": "Per-program tiles: x (BLOCK_W*16, 32), hidden (BLOCK_W*16, 128). With BLOCK_W=4 -> 64x128 fp32 = 32KB accumulators; with BLOCK_W=8 -> 64KB. Tunable.",
+            "rating_0_to_10": 6.0,
+            "risk": "Spilling if BLOCK_W too large; tune to 2-8."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fusion",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This is a top-level alternative \u2014 incompatible with splitting attention vs MLP across kernels. Top priority because weight set easily fits and memory-bound block benefits most from fusion.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Two Triton kernels: K1 fuses LN1 + QKV + attention(softmax+rpe) + attn@v + proj + residual1; K2 fuses LN2 + fc1 + GELU + fc2 + residual2. Each kernel processes batches of windows / token-rows. Avoids the worst register pressure of full fusion while still eliminating most HBM roundtrips.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.55,
+          "rationale": "Slightly easier to implement than full fusion; still ~1 HBM roundtrip vs ~10 for eager. The intermediate (B,H,W,C) tensor between K1 and K2 is small (57MB) and can stay in HBM cheaply.",
+          "score_0_to_1": 0.6,
+          "title": "Two-kernel split: attention-block + MLP-block"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Same matmul shapes; can pick different BLOCK sizes per kernel.",
+            "notes": "Good TC fit with sufficient BLOCK_W.",
+            "rating_0_to_10": 7.0,
+            "risk": "MLP K=128 makes fc2 matmul a real workload."
+          },
+          "memory_bandwidth": {
+            "notes": "One extra HBM roundtrip vs full fusion (~57MB).",
+            "rating_0_to_10": 7.0,
+            "risk": "Still significantly better than eager but loses some bw saving."
+          },
+          "register_pressure": {
+            "notes": "Lower than full fusion; each kernel sees smaller working set.",
+            "rating_0_to_10": 8.0,
+            "risk": "Manageable."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_two_kernel",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Alternative granularity to full fusion \u2014 cannot coexist as a single plan; tradeoff between implementation difficulty and HBM savings.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement an MLP-only fused kernel (LN2 + fc1 + GELU + fc2 + residual) since the MLP path is heaviest (hidden=128). Use PyTorch (or simple Triton) for the attention path. Easier and lower-risk first step; gives a quick performance baseline and validates Triton tooling.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.75,
+          "rationale": "MLP dominates FLOPs (32->128->32 vs 32->96 + 16x16 attn). Fusing LN+matmul+GELU+matmul+residual removes 4 HBM roundtrips on the largest activations. Low risk warm-up implementation.",
+          "score_0_to_1": 0.55,
+          "title": "MLP-only fused Triton kernel (warm-up)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Per-row workload (C=32 hidden=128); tile rows for TC.",
+            "notes": "Straightforward LN+GEMM+activation+GEMM fusion.",
+            "rating_0_to_10": 7.0,
+            "risk": "Tile choice for fc2 K=128."
+          },
+          "memory_bandwidth": {
+            "notes": "Eliminates LN2, fc1 output (4x bigger), GELU, fc2 output round trips.",
+            "rating_0_to_10": 8.0,
+            "risk": "Attention path still unfused."
+          },
+          "register_pressure": {
+            "notes": "Mid-size hidden tile (rows x 128 fp32) per program.",
+            "rating_0_to_10": 8.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_mlp_only",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Distinct from full/two-kernel fusion by leaving attention to PyTorch \u2014 mutually exclusive with the broader-fusion siblings as a final plan, but useful as a stepping-stone alternative.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin block (single head, no shift, window 4x4, dim=32, mlp_ratio=4) on a 1x720x1280x32 fp16 input. Composed of LN1, QKV linear, scaled dot-product attention with relative position bias over N=16 tokens, output projection + residual, LN2, MLP (32->128->32 with GELU) + residual. All weight matrices are tiny (<= 32x128) and the per-window working set (N=16, C=32, hidden=128) fits easily in shared memory/registers, so the kernel is overwhelmingly memory-bandwidth bound under eager execution. Goal: a fused Triton kernel (ideally a single kernel) that processes a batch of windows per program, holding weights in shared memory and intermediates in registers, to eliminate ~10 HBM roundtrips. tl.dot is used for the four matmuls; softmax is over N=16 (trivial). fp32 accumulators for LN and GEMMs; fp16 storage.",
+  "open_questions": [
+    "What BLOCK_W (windows per program) gives best TC utilization vs register pressure on RTX5090 (try 2,4,8)?",
+    "Does Triton's tl.dot accept K=32 efficiently on Blackwell, or should we pad/group windows to grow M further?",
+    "Is the window-partition gather pattern (stride along W with Ww=4) coalesced when launching one program per (nH, nW) tile?",
+    "Should LN1 and LN2 use Welford or two-pass; with N*C=512 fp16 elements per window, two-pass in fp32 is cheap and stable \u2014 confirm.",
+    "Does torch.compile already fuse LN+linear or attention here on RTX5090, setting a high baseline we must beat?",
+    "Is rpe_bias broadcast across all 57600 windows identical (yes per spec) so we can preload it once per program?",
+    "Are weights stored row- or column-major after nn.Linear, and what layout maximizes tl.dot throughput (transpose at kernel start)?",
+    "Memory alignment: input tensor shape 1x720x1280x32 fp16 \u2014 last dim 32*2=64B, naturally aligned; verify strides for the reshape/permute path."
+  ]
+}
