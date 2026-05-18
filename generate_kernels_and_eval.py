@@ -253,7 +253,7 @@ def main():
     parser.add_argument("--base-url", default=None, help="Provider base URL. For Claude/Anthropic models a GNAI OpenAI URL is auto-rewritten to the /providers/anthropic path; or pass it directly (e.g. https://gnai.intel.com/api/providers/anthropic)")
     parser.add_argument("--api-key", default=None, help="API key; if omitted, uses LLM_API_KEY env var")
     parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel. 'cuda' uses the CUDA kernel task; 'triton'/'python' uses the Triton kernel task.")
-    parser.add_argument("--target-gpu", default=None, help="Target GPU architecture hint (e.g. 'H100', 'RTX 5090'). Mutually exclusive with --hw-spec. Defaults to 'H100' if neither is given.")
+    parser.add_argument("--target-gpu", default=None, help="Target GPU architecture hint (e.g. 'H100', 'RTX 5090'). Mutually exclusive with --hw-spec.")
     parser.add_argument("--hw-spec", default=None, help="Path to a HW spec JSON file. Mutually exclusive with --target-gpu.")
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
 
@@ -341,7 +341,7 @@ def main():
 
     # Triton Kernel options (unified for CUDA / XPU / any accelerator)
     parser.add_argument("--triton-device", default=None,
-                        help="Device string for Triton kernel task (e.g. cuda:0, xpu:0). Defaults to cuda:0.")
+                        help="Device string for Triton kernel task (e.g. cuda:0, xpu:0). Required for --language=triton.")
     parser.add_argument(
         "--triton-precision",
         default="fp16",
@@ -357,6 +357,14 @@ def main():
         parser.error("--hw-spec and --target-gpu are mutually exclusive; provide one or the other, not both.")
     if not args.target_gpu and not args.hw_spec:
         parser.error("Either --target-gpu or --hw-spec must be provided.")
+
+    # When --hw-spec is provided, extract target_gpu from the spec's "name" field.
+    if args.hw_spec and not args.target_gpu:
+        from k_search.hw_specs import HWSpec
+        args.target_gpu = HWSpec.from_file(args.hw_spec).name
+
+    if not args.target_gpu:
+        parser.error("Could not determine target GPU. Provide --target-gpu or a valid --hw-spec with a 'name' field.")
 
     api_key = args.api_key or os.getenv("LLM_API_KEY")
     if not api_key:
@@ -390,9 +398,12 @@ def main():
         if not task_path:
             raise ValueError("--task-path is required for --language=triton (path to reference .py file with Model class)")
 
+        if not args.triton_device:
+            raise ValueError("--triton-device is required for --language=triton (e.g. cuda:0, xpu:0)")
+
         task = TritonKernelTask(
             ref_path=task_path,
-            device=args.triton_device or "cuda:0",
+            device=args.triton_device,
             precision=args.triton_precision,
             num_correct_trials=args.triton_num_correct_trials,
             num_perf_trials=args.triton_num_perf_trials,
@@ -411,7 +422,7 @@ def main():
         base_url=args.base_url,
         api_key=api_key,
         language=args.language,
-        target_gpu=args.target_gpu or "",
+        target_gpu=args.target_gpu,
         max_opt_rounds=args.max_opt_rounds,
         save_solutions=args.save_solutions,
         save_results=not args.no_save_results,
