@@ -6,11 +6,11 @@ from __future__ import annotations
 
 # CUDA-specific hints
 # Note: keep these hints generic (avoid naming specific low-level instructions).
-CUDA_OPTIMIZATION_HINTS = "** You MUST use MMA to utilize the tensor cores on H100! ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."
+CUDA_OPTIMIZATION_HINTS = "** You MUST use MMA to utilize the tensor cores on NVidia GPU! ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."
 
 # Intel XPU Triton hints
 XPU_TRITON_OPTIMIZATION_HINTS = """
-** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
+** You MUST use MMA to utilize the Intel Xe Matrix Extensions on Intel GPU! For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
 
 Key Triton performance principles for Intel XPU:
 - This kernel targets an Intel GPU (Xe2 / Battlemage architecture), NOT an NVIDIA GPU.
