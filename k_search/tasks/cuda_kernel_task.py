@@ -316,10 +316,10 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
     def _run_ncu_profiling(self, eval_result: EvalResult, tmp_dir: str, env: dict) -> EvalResult:
         """Run ncu profiling on a passed kernel and attach metrics to the EvalResult."""
         try:
-            from k_search.utils.ncu_profiler import (
+            from k_search.utils.profiler.ncu import (
                 NCU_AVAILABLE,
+                _run_ncu_subprocess,
                 metrics_to_dict,
-                run_ncu_profile,
             )
 
             if not NCU_AVAILABLE:
@@ -336,14 +336,15 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
                 f"--profile-repeats={self._cfg.profile_repeats}",
             ]
 
-            ncu_metrics = run_ncu_profile(profile_cmd, timeout=120, verbose=self._verbose)
+            ncu_metrics = _run_ncu_subprocess(profile_cmd, timeout=120, verbose=self._verbose)
             if ncu_metrics is not None:
                 eval_result.profiler_metrics = metrics_to_dict(ncu_metrics)
             elif self._verbose:
                 print("[ncu] No metrics parsed from ncu output")
-        except Exception:
+        except Exception as e:
             # Profiling is best-effort; never fail the eval
-            pass
+            if self._verbose:
+                print(f"[ncu] Profiling exception: {e}")
         return eval_result
 
     def _print_debug_report(self, eval_result: EvalResult, kernel_cu: str) -> None:
