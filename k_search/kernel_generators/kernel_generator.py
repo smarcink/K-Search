@@ -34,6 +34,7 @@ class KernelGenerator:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: str = "medium",  # only used for openai reasoning models
+        hw_spec_path: Optional[str] = None,
     ):
         """
         Args:
@@ -43,11 +44,17 @@ class KernelGenerator:
             api_key: API key (if None, uses LLM_API_KEY environment variable)
             base_url: Base URL for the API (need to provide for non-openai api models)
             reasoning_effort: Reasoning effort for OpenAI reasoning models ("low", "medium", "high", default: "medium")
+            hw_spec_path: Optional path to a JSON HW spec file; if None, resolved from target_gpu via registry
         """
         self.model_name = model_name
         self.language = language
         self.target_gpu = target_gpu
         self.reasoning_effort = reasoning_effort
+
+        # Resolve hardware spec
+        from k_search.hw_specs import get_hw_spec
+        hw = get_hw_spec(target_gpu, spec_path=hw_spec_path)
+        self._hw_spec_text: str = hw.render_for_prompt() if hw else ""
 
         if api_key is None:
             api_key = os.getenv("LLM_API_KEY")
@@ -396,6 +403,7 @@ class KernelGenerator:
                     definition_text,
                     self.target_gpu,
                     per_task_requirement=per_req,
+                    hw_spec=self._hw_spec_text,
                 )
             prompt = _append_baseline_hint(prompt)
             print(prompt)
@@ -618,6 +626,7 @@ class KernelGenerator:
                         current_best=current_best_for_prompt,
                         previous_round_summary=previous_round_summary_for_prompt,
                         per_task_requirement=per_req,
+                        hw_spec=self._hw_spec_text,
                     )
                 opt_prompt = _append_baseline_hint(opt_prompt)
                 print(opt_prompt)

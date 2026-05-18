@@ -111,6 +111,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
             llm_call=_llm_call,
             target_gpu=self.target_gpu,
             language=self.language,
+            hw_spec_text=self._hw_spec_text,
             config=WorldModelConfig(
                 enabled=bool(enable_world_model),
                 max_chars_per_block=self._world_model_max_chars,
@@ -551,6 +552,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                             action_text=chosen_action_text,
                             code_format=_code_format_text(),
                             target_gpu=self.target_gpu,
+                            hw_spec=self._hw_spec_text,
                         )
                     else:
                         prompt = get_generate_code_from_spec_with_action_prompt_from_text(
@@ -559,6 +561,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                             action_text=chosen_action_text,
                             code_format=_code_format_text(),
                             target_gpu=self.target_gpu,
+                            hw_spec=self._hw_spec_text,
                         )
                 else:
                     if parent_is_root or not base_raw_code:
@@ -602,6 +605,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
                                 base_code=base_for_debug,
+                                hw_spec=self._hw_spec_text,
                             )
                         else:
                             prompt = get_improve_from_spec_prompt_from_text(
@@ -615,6 +619,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
                                 base_code=base_for_debug,
+                                hw_spec=self._hw_spec_text,
                             )
                     else:
                         has_passed_in_cycle = cycle_best_solution is not None
@@ -653,6 +658,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 max_rounds=max_dai,
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
+                                hw_spec=self._hw_spec_text,
                             )
                         else:
                             prompt = get_improve_generated_code_prompt_from_text(
@@ -666,6 +672,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 max_rounds=max_dai,
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
+                                hw_spec=self._hw_spec_text,
                             )
 
                 prompt = prompt + "\n\n" + render_world_model_section(self._wm.get(task.name), max_chars=self._world_model_max_chars)

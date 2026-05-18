@@ -863,16 +863,22 @@ def build_world_model_prompts(
     chosen_action_text: Optional[str],
     prediction: Optional[Prediction],
     max_chars_per_block: int = 6000,
+    hw_spec_text: str = "",
 ) -> WorldModelPrompts:
     """Construct prompts to init/refine the world model as strict JSON."""
     schema = json.dumps(WORLD_MODEL_JSON_SCHEMA_GUIDE, indent=2, sort_keys=True)
     prev = (previous_world_model_json or "").strip()
 
+    hw_block = ""
+    if hw_spec_text and hw_spec_text.strip():
+        hw_block = f"\n{hw_spec_text.strip()}\n\n"
+
     init_prompt = (
         "You are a GPU kernel performance engineer.\n"
         "Create an initial WORLD MODEL for the kernel problem below.\n\n"
         f"Target GPU: {target_gpu}\n"
-        f"Language: {language}\n\n"
+        f"Language: {language}\n"
+        f"{hw_block}"
         "Kernel Specification:\n"
         f"{_truncate(definition_text, max_chars_per_block)}\n\n"
         "Return ONLY a single valid JSON object matching this schema guide (keys must exist; fill strings/lists as needed):\n"
@@ -961,6 +967,7 @@ def build_decision_tree_edit_prompt(
     prediction: Optional[Prediction],
     eval_result: Optional[EvalResult],
     max_chars: int = 6000,
+    hw_spec_text: str = "",
 ) -> str:
     """
     Ask the model for a small edit script (ops) to update/insert/split decision tree nodes.
@@ -1031,7 +1038,8 @@ def build_decision_tree_edit_prompt(
     return (
         "You are the WORLD MODEL module.\n"
         "Output ONLY a JSON edit script (no markdown, no extra text).\n\n"
-        f"Target GPU: {target_gpu}\nLanguage: {language}\n\n"
+        f"Target GPU: {target_gpu}\nLanguage: {language}\n"
+        f"{('\n' + str(hw_spec_text or '').strip() + '\n\n') if str(hw_spec_text or '').strip() else '\n'}"
         "Kernel specification (reference):\n"
         f"{def_s}\n\n"
         "Current world model (compact):\n"

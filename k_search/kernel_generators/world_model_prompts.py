@@ -20,6 +20,8 @@ TRITON_ACTION_PROMPT = """You are implementing a SPECIFIC NEXT ACTION on top of 
 Original Specification:
 {definition}
 
+{hw_spec}
+
 Known-Good Base Implementation (start from this; do not include any other previous code):
 {base_code}
 
@@ -43,6 +45,8 @@ CUDA_ACTION_PROMPT = """You are implementing a SPECIFIC NEXT ACTION on top of a 
 
 Original Specification:
 {definition}
+
+{hw_spec}
 
 Known-Good Base Implementation (start from this; do not include any other previous code):
 {base_code}
@@ -68,6 +72,8 @@ The current implementation may be buggy OR already correct-but-slower-than-desir
 
 Original Specification:
 {definition}
+
+{hw_spec}
 
 Known-Good Base Implementation (reference):
 {base_code}
@@ -106,6 +112,8 @@ The current implementation may be buggy OR already correct-but-slower-than-desir
 Original Specification:
 {definition}
 
+{hw_spec}
+
 Known-Good Base Implementation (reference):
 {base_code}
 
@@ -143,6 +151,8 @@ The current implementation may be correct-but-slower-than-desired, or it may hav
 Original Specification:
 {definition}
 
+{hw_spec}
+
 Cycle-Best Base Implementation (reference):
 {base_code}
 
@@ -175,6 +185,8 @@ The current implementation may be correct-but-slower-than-desired, or it may hav
 
 Original Specification:
 {definition}
+
+{hw_spec}
 
 Cycle-Best Base Implementation (reference):
 {base_code}
@@ -210,9 +222,11 @@ def get_generate_code_from_action_prompt_from_text(
     action_text: str,
     code_format: str = "",
     target_gpu: str = "H100",
+    hw_spec: str = "",
 ) -> str:
     """Task-agnostic variant: accepts rendered definition text."""
     lang = (language or "").lower()
+    hw_spec_text = str(hw_spec or "").strip()
     if lang == "triton":
         hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return TRITON_ACTION_PROMPT.format(
@@ -222,6 +236,7 @@ def get_generate_code_from_action_prompt_from_text(
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
             hints=hints,
+            hw_spec=hw_spec_text,
         )
     if lang == "cuda":
         return CUDA_ACTION_PROMPT.format(
@@ -231,6 +246,7 @@ def get_generate_code_from_action_prompt_from_text(
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
             hints=CUDA_OPTIMIZATION_HINTS,
+            hw_spec=hw_spec_text,
         )
     raise ValueError(f"Unsupported language for action prompt: {language}")
 
@@ -242,12 +258,14 @@ def get_generate_code_from_spec_with_action_prompt_from_text(
     action_text: str,
     code_format: str = "",
     target_gpu: str = "H100",
+    hw_spec: str = "",
 ) -> str:
     """
     Task-agnostic variant: accepts rendered definition text.
     Used when the chosen action's parent is the WM root: start from spec + action only.
     """
     lang = (language or "").lower()
+    hw_spec_text = str(hw_spec or "").strip()
     if lang == "triton":
         hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return (
@@ -259,6 +277,7 @@ def get_generate_code_from_spec_with_action_prompt_from_text(
                 target_gpu=target_gpu,
                 code_format=str(code_format or "").strip(),
                 hints=hints,
+                hw_spec=hw_spec_text,
             )
         )
     if lang == "cuda":
@@ -271,6 +290,7 @@ def get_generate_code_from_spec_with_action_prompt_from_text(
                 target_gpu=target_gpu,
                 code_format=str(code_format or "").strip(),
                 hints=CUDA_OPTIMIZATION_HINTS,
+                hw_spec=hw_spec_text,
             )
         )
     raise ValueError(f"Unsupported language for spec+action prompt: {language}")
@@ -289,6 +309,7 @@ def get_debug_and_improve_from_spec_prompt_from_text(
     target_gpu: str = "H100",
     perf_summary: str = "",
     base_code: str = "(no base code; start from spec)",
+    hw_spec: str = "",
 ) -> str:
     return get_debug_generated_code_prompt_from_text(
         language,
@@ -302,6 +323,7 @@ def get_debug_and_improve_from_spec_prompt_from_text(
         max_rounds=max_rounds,
         target_gpu=target_gpu,
         perf_summary=perf_summary,
+        hw_spec=hw_spec,
     )
 
 
@@ -318,6 +340,7 @@ def get_debug_generated_code_prompt_from_text(
     max_rounds: int = 5,
     target_gpu: str = "H100",
     perf_summary: str = "",
+    hw_spec: str = "",
 ) -> str:
     """Task-agnostic variant: accepts rendered definition + rendered trace logs."""
     lang = (language or "").lower()
@@ -329,6 +352,7 @@ def get_debug_generated_code_prompt_from_text(
         mr = 1
     if dr > mr:
         dr = mr
+    hw_spec_text = str(hw_spec or "").strip()
     if lang == "triton":
         hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return TRITON_DEBUG_PROMPT.format(
@@ -343,6 +367,7 @@ def get_debug_generated_code_prompt_from_text(
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
             hints=hints,
+            hw_spec=hw_spec_text,
         )
     if lang == "cuda":
         return CUDA_DEBUG_PROMPT.format(
@@ -357,6 +382,7 @@ def get_debug_generated_code_prompt_from_text(
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
             hints=CUDA_OPTIMIZATION_HINTS,
+            hw_spec=hw_spec_text,
         )
     raise ValueError(f"Unsupported language for debug prompt: {language}")
 
@@ -373,6 +399,7 @@ def get_improve_from_spec_prompt_from_text(
     target_gpu: str = "H100",
     perf_summary: str = "",
     base_code: str = "(no base code; start from spec)",
+    hw_spec: str = "",
 ) -> str:
     return get_improve_generated_code_prompt_from_text(
         language,
@@ -385,6 +412,7 @@ def get_improve_from_spec_prompt_from_text(
         max_rounds=max_rounds,
         target_gpu=target_gpu,
         perf_summary=perf_summary,
+        hw_spec=hw_spec,
     )
 
 
@@ -400,6 +428,7 @@ def get_improve_generated_code_prompt_from_text(
     max_rounds: int = 5,
     target_gpu: str = "H100",
     perf_summary: str = "",
+    hw_spec: str = "",
 ) -> str:
     """Task-agnostic variant: accepts rendered definition + rendered trace logs."""
     lang = (language or "").lower()
@@ -411,6 +440,7 @@ def get_improve_generated_code_prompt_from_text(
         mr = 1
     if dr > mr:
         dr = mr
+    hw_spec_text = str(hw_spec or "").strip()
     if lang == "triton":
         hints = XPU_TRITON_OPTIMIZATION_HINTS if _is_intel_gpu(target_gpu) else TRITON_OPTIMIZATION_HINTS
         return TRITON_IMPROVE_PROMPT.format(
@@ -424,6 +454,7 @@ def get_improve_generated_code_prompt_from_text(
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
             hints=hints,
+            hw_spec=hw_spec_text,
         )
     if lang == "cuda":
         return CUDA_IMPROVE_PROMPT.format(
@@ -437,6 +468,7 @@ def get_improve_generated_code_prompt_from_text(
             target_gpu=target_gpu,
             code_format=str(code_format or "").strip(),
             hints=CUDA_OPTIMIZATION_HINTS,
+            hw_spec=hw_spec_text,
         )
     raise ValueError(f"Unsupported language for improve prompt: {language}")
 

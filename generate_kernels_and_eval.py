@@ -99,6 +99,7 @@ def generate_and_evaluate(
     wm_stagnation_window: int = 5,
     wm_max_difficulty: Optional[int] = None,
     artifacts_dir: Optional[str] = None,
+    hw_spec_path: Optional[str] = None,
 ) -> None:
     """
     Generate exactly one solution for the task, then run final evaluation.
@@ -174,6 +175,7 @@ def generate_and_evaluate(
             base_url=base_url,
             artifacts_dir=artifacts_dir,
             wm_max_difficulty=wm_max_difficulty,
+            hw_spec_path=hw_spec_path,
         )
     else:
         # Non-world-model mode: baseline-style generator (task-driven).
@@ -185,6 +187,7 @@ def generate_and_evaluate(
             target_gpu=target_gpu,
             api_key=api_key,
             base_url=base_url,
+            hw_spec_path=hw_spec_path,
         )
 
     # Generate exactly one solution.
@@ -251,6 +254,7 @@ def main():
     parser.add_argument("--api-key", default=None, help="API key; if omitted, uses LLM_API_KEY env var")
     parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel. 'cuda' uses the CUDA kernel task; 'triton'/'python' uses the Triton kernel task.")
     parser.add_argument("--target-gpu", default="H100", help="Target GPU architecture hint for prompts")
+    parser.add_argument("--hw-spec", default=None, help="Path to a HW spec JSON file, or omit to auto-resolve from --target-gpu")
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
 
     # Benchmark configuration
@@ -413,6 +417,7 @@ def main():
         wm_stagnation_window=args.wm_stagnation_window,
         wm_max_difficulty=args.wm_max_difficulty,
         artifacts_dir=args.artifacts_dir,
+        hw_spec_path=args.hw_spec,
         enable_wandb=args.wandb,
         wandb_project=args.wandb_project,
         run_name=args.run_name,
