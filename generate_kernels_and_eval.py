@@ -389,7 +389,7 @@ def main():
             profile_warmup=args.profile_warmup,
             profile_repeats=args.profile_repeats,
             artifacts_dir=args.artifacts_dir,
-            enable_profiling=args.enable_profiling,
+            enable_ncu_profiling=args.enable_profiling,
             verbose=args.verbose,
         )
     elif language in ("triton", "python"):

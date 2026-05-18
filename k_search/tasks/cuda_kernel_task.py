@@ -41,6 +41,8 @@ class CudaKernelTaskConfig:
     precision: str = "fp16"
     rtol: float = 1e-2
     atol: float = 1e-2
+    profile_warmup: int = 2
+    profile_repeats: int = 1
     max_failure_excerpt_chars: int = 4000
 
 
@@ -72,6 +74,8 @@ class CudaKernelTask:
         precision: str = "fp16",
         rtol: float = 1e-2,
         atol: float = 1e-2,
+        profile_warmup: int = 2,
+        profile_repeats: int = 1,
         artifacts_dir: str | None = None,
         name: str | None = None,
         enable_ncu_profiling: bool = False,
@@ -89,6 +93,8 @@ class CudaKernelTask:
             precision=str(precision),
             rtol=float(rtol),
             atol=float(atol),
+            profile_warmup=max(0, int(profile_warmup)),
+            profile_repeats=max(1, int(profile_repeats)),
         )
         self._name = str(name or Path(self._ref_path).stem)
         self._artifacts_dir = str(artifacts_dir) if artifacts_dir else None
@@ -326,6 +332,8 @@ Your CUDA code should handle the specific shapes/dtypes from those functions.
                 "--kernel-dir", tmp_dir,
                 "--precision", self._cfg.precision,
                 "--profile-only",
+                f"--profile-warmup={self._cfg.profile_warmup}",
+                f"--profile-repeats={self._cfg.profile_repeats}",
             ]
 
             ncu_metrics = run_ncu_profile(profile_cmd, timeout=120, verbose=self._verbose)
