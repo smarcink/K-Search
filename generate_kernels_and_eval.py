@@ -253,8 +253,8 @@ def main():
     parser.add_argument("--base-url", default=None, help="Provider base URL. For Claude/Anthropic models a GNAI OpenAI URL is auto-rewritten to the /providers/anthropic path; or pass it directly (e.g. https://gnai.intel.com/api/providers/anthropic)")
     parser.add_argument("--api-key", default=None, help="API key; if omitted, uses LLM_API_KEY env var")
     parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel. 'cuda' uses the CUDA kernel task; 'triton'/'python' uses the Triton kernel task.")
-    parser.add_argument("--target-gpu", default="H100", help="Target GPU architecture hint for prompts")
-    parser.add_argument("--hw-spec", default=None, help="Path to a HW spec JSON file, or omit to auto-resolve from --target-gpu")
+    parser.add_argument("--target-gpu", default=None, help="Target GPU architecture hint (e.g. 'H100', 'RTX 5090'). Mutually exclusive with --hw-spec. Defaults to 'H100' if neither is given.")
+    parser.add_argument("--hw-spec", default=None, help="Path to a HW spec JSON file. Mutually exclusive with --target-gpu.")
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
 
     # Benchmark configuration
@@ -353,6 +353,11 @@ def main():
 
     args = parser.parse_args()
 
+    if args.hw_spec and args.target_gpu:
+        parser.error("--hw-spec and --target-gpu are mutually exclusive; provide one or the other, not both.")
+    if not args.target_gpu and not args.hw_spec:
+        parser.error("Either --target-gpu or --hw-spec must be provided.")
+
     api_key = args.api_key or os.getenv("LLM_API_KEY")
     if not api_key:
         raise ValueError("API key is required (pass --api-key or set LLM_API_KEY)")
@@ -406,7 +411,7 @@ def main():
         base_url=args.base_url,
         api_key=api_key,
         language=args.language,
-        target_gpu=args.target_gpu,
+        target_gpu=args.target_gpu or "",
         max_opt_rounds=args.max_opt_rounds,
         save_solutions=args.save_solutions,
         save_results=not args.no_save_results,

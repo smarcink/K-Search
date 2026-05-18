@@ -48,13 +48,16 @@ class KernelGenerator:
         """
         self.model_name = model_name
         self.language = language
-        self.target_gpu = target_gpu
+        self.target_gpu = target_gpu or ""
         self.reasoning_effort = reasoning_effort
 
         # Resolve hardware spec
         from k_search.hw_specs import get_hw_spec
-        hw = get_hw_spec(target_gpu, spec_path=hw_spec_path)
+        hw = get_hw_spec(target_gpu or "", spec_path=hw_spec_path)
         self._hw_spec_text: str = hw.render_for_prompt() if hw else ""
+        # If a spec was resolved, use its canonical name as the target_gpu label in prompts.
+        if hw:
+            self.target_gpu = hw.name
 
         if api_key is None:
             api_key = os.getenv("LLM_API_KEY")
