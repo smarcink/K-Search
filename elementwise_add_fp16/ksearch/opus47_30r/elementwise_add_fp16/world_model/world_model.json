@@ -1,0 +1,720 @@
+{
+  "computed_signals": {
+    "round_index": 28,
+    "trace": {
+      "latency_ms": 0.5285,
+      "mean_vs_baseline_factor": null,
+      "profiler": {
+        "kernels": [
+          {
+            "achieved_bandwidth_gb_s": 470.65,
+            "compute_throughput_pct": 2.65,
+            "duration_us": 797.344,
+            "kernel_name": "add_kernel",
+            "l1_hit_rate_pct": 0.0,
+            "l2_hit_rate_pct": 0.02,
+            "memory_throughput_pct": 51.48,
+            "registers_per_thread": 40,
+            "shared_mem_per_block_bytes": 0,
+            "sm_occupancy_pct": 82.03,
+            "tensor_core_utilization_pct": 0.0,
+            "top_stall_reasons": [
+              [
+                "long_scoreboard",
+                209.26
+              ],
+              [
+                "short_scoreboard",
+                24.2
+              ],
+              [
+                "wait",
+                0.99
+              ]
+            ]
+          }
+        ],
+        "profiler_backend": "ncu"
+      },
+      "reference_latency_ms": 0.5578,
+      "speedup_factor": 1.0539,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n4_child_grid_stride_vec4",
+    "nodes": [
+      {
+        "action": {
+          "description": "Root analysis node",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "Dummy root capturing analysis",
+          "score_0_to_1": 0.0,
+          "title": "root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.6,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell) ~1.7TB/s HBM-class bandwidth equivalent (GDDR7); fp16 elementwise add is bandwidth bound. No tensor core use.",
+            "notes": "Trivial compute: 1 FLOP per 3 fp16 elements moved (2 loads, 1 store).",
+            "rating_0_to_10": 2.0,
+            "risk": "Low compute intensity; cannot leverage tensor cores."
+          },
+          "memory_bandwidth": {
+            "notes": "Total bytes = 16*2048*2048*2*3 = ~402 MB. Pure memory bound.",
+            "rating_0_to_10": 10.0,
+            "risk": "Achievable speedup limited by HW peak bandwidth."
+          },
+          "register_pressure": {
+            "notes": "Minimal; just hold a tile of x,y,out in registers.",
+            "rating_0_to_10": 2.0,
+            "risk": "Negligible."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: dense elementwise binary add, no reductions, contiguous fp16 tensors of shape (16,2048,2048) => 67108864 elements. 2) Math: out[i]=x[i]+y[i]; fully independent per element, flatten to 1D. 3) Layout: all contiguous fp16; read x,y once, write out once; no reuse. 4) Regimes: (a) small N -> launch overhead dominates; (b) medium -> occupancy/coalescing matters; (c) large N (our case, 64M elts) -> pure DRAM bandwidth bound \u2014 only knob is achieving peak bandwidth via vectorized 128-bit loads, good occupancy, and minimal launch overhead. 5) Knobs: BLOCK_SIZE (1024..8192), num_warps (4/8), num_stages, vectorization (load as .uint4 / multiple elements per thread), grid 1D vs 2D, masked tail handling, possibly torch.empty vs empty_like. 6) Skeleton: 1D grid, each program loads BLOCK contiguous elements of x and y, adds, stores, with mask on tail. 7) Families: F1=Single fused 1D vectorized kernel (best, fits trivially); F2=2D grid mapping by (batch, spatial) (no benefit, same bandwidth); F3=Multi-element-per-thread unrolled kernel for ILP. Full fusion is the natural baseline since the op is already a single elementwise. Best limiter: DRAM BW (~1.7TB/s); theoretical min latency ~ 402MB/1.7TB/s \u2248 0.24ms.",
+        "overall_rating_0_to_10": 0.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Autotune over BLOCK_SIZE in {1024,2048,4096,8192} and num_warps in {4,8} using triton.autotune keyed on n_elements, to pick best config for the specific RTX5090.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.09,
+          "rationale": "Removes guesswork; picks empirically best config on the target HW.",
+          "score_0_to_1": 0.78,
+          "title": "Autotuned elementwise add"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Autotune amortized once; runtime selection negligible.",
+            "notes": "Occupancy 89%, compute 3.8%; clearly memory-bound elementwise.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 456 GB/s, ~50% of peak; bandwidth-bound, room to improve via vectorization.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "22 regs/thread; comfortable.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "CURRENT: does=autotuned 1D elementwise add over BLOCK_SIZE/num_warps. bottleneck=memory bandwidth (~50% peak, long_scoreboard stalls). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: autotune gave 1.09x over compile, modest. Next bet: vectorized loads (e.g., 128-bit via tl.load with vector dtypes or multi-element per thread) to better saturate HBM.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.5998,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.5998,
+              "ref_eager_time_ms": 0.6326,
+              "score": 1.0877,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.0877,
+              "speedup_over_eager": 1.0546
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 456.08,
+                  "compute_throughput_pct": 3.77,
+                  "duration_us": 864.16,
+                  "kernel_name": "add_kernel",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 0.01,
+                  "memory_throughput_pct": 49.88,
+                  "registers_per_thread": 22,
+                  "shared_mem_per_block_bytes": 0,
+                  "sm_occupancy_pct": 89.01,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      341.78
+                    ],
+                    [
+                      "short_scoreboard",
+                      11.25
+                    ],
+                    [
+                      "wait",
+                      1.99
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 0.6326,
+            "speedup_factor": 1.0877,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "88c0d6f5c700422629d6e7c6612e8f240b684e1e"
+        }
+      },
+      {
+        "action": {
+          "description": "Reinterpret the fp16 tensors as fp32 (or uint4 packed) buffers when N is even, halving the number of elements processed and effectively doing vectorized 2-fp16 adds via bit-level packing (or by casting pairs). This can reduce indexing overhead and ensure 128-bit transactions.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.18,
+          "rationale": "Triton typically already vectorizes contiguous fp16 loads, but explicit packing to wider types may yield marginal speedup by guaranteeing wide transactions and fewer iterations.",
+          "score_0_to_1": 0.6,
+          "title": "Packed-vector fp16x2 add"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "fp16x2 add is a single SASS HFMA2/HADD2 instruction.",
+            "notes": "Forces wide loads; requires N%2==0 (true here: 64M).",
+            "rating_0_to_10": 7.0,
+            "risk": "Triton may already do this; gains could be marginal."
+          },
+          "memory_bandwidth": {
+            "notes": "Same total bytes; might improve effective utilization slightly.",
+            "rating_0_to_10": 8.0,
+            "risk": "Negligible if compiler already vectorizes."
+          },
+          "register_pressure": {
+            "notes": "Lower (half count of registers for same logical elements).",
+            "rating_0_to_10": 3.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n4",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Despite the 'packed' framing, the active code path uses add_kernel_fp16 (autotuned BLOCK_SIZE/num_warps over plain fp16 contiguous loads); the fp32-view packing path is a no-op stub. bottleneck: memory bandwidth (mem throughput 51%, achieved BW ~470 GB/s vs RTX5090 peak ~1.7TB/s; long_scoreboard dominates stalls). FOLLOW_THROUGH: aligned_with_intent: no. if_no: Intent was bit-level fp16x2 packing via fp32/uint32 reinterpret to guarantee 128-bit transactions; actually implemented is just an autotuned plain fp16 elementwise add (packing code present but unused). UPDATE_BELIEF: Eval passed at 1.15x over compile / 1.02x over eager \u2014 the autotune sweep is what helped, not packing. PERF_GAP: expected 1.18x vs observed 1.15x (close, but for wrong reason). Next bet: grid-stride loop with fewer CTAs to amortize launch + improve L2 reuse, and/or actually implement true fp16x2 vectorized loads via tl.load with vector dtype.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.5458,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.5458,
+              "ref_eager_time_ms": 0.558,
+              "score": 1.1495,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.1495,
+              "speedup_over_eager": 1.0223
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 469.9,
+                  "compute_throughput_pct": 2.58,
+                  "duration_us": 830.336,
+                  "kernel_name": "add_kernel_fp16",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 0.02,
+                  "memory_throughput_pct": 51.39,
+                  "registers_per_thread": 40,
+                  "shared_mem_per_block_bytes": 0,
+                  "sm_occupancy_pct": 81.5,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      201.59
+                    ],
+                    [
+                      "short_scoreboard",
+                      22.35
+                    ],
+                    [
+                      "wait",
+                      1.04
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 0.558,
+            "speedup_factor": 1.1495,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "4b44d9b47e0b29595ef6b226f4debb224e3af115"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.07,
+          "rationale": "",
+          "score_0_to_1": 0.62,
+          "title": "Vectorized loads (multi-elem per thread)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "compute negligible (2.67%)",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "471 GB/s, ~52% mem throughput; bandwidth-bound",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "40 regs/thread, occupancy dropped to 82%",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3a",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Autotuned elementwise fp16 add with BLOCK_SIZE/num_warps sweep. bottleneck=memory bandwidth (long_scoreboard dominates). FOLLOW_THROUGH: aligned_with_intent=partial; intent was multi-elem per thread vectorization but current code is single-element per lane via large BLOCK_SIZE. UPDATE_BELIEF: speedup 1.07x over compile, slightly below 1.15x prediction. Next bet: explicit vectorization via fp32/uint32 reinterpretation or 2D tile with ILP to widen LDG.128.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n3",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.5369,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.5369,
+              "ref_eager_time_ms": 0.5592,
+              "score": 1.0658,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.0658,
+              "speedup_over_eager": 1.0414
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 471.34,
+                  "compute_throughput_pct": 2.67,
+                  "duration_us": 799.872,
+                  "kernel_name": "add_kernel",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 0.02,
+                  "memory_throughput_pct": 51.55,
+                  "registers_per_thread": 40,
+                  "shared_mem_per_block_bytes": 0,
+                  "sm_occupancy_pct": 81.95,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      204.49
+                    ],
+                    [
+                      "short_scoreboard",
+                      24.92
+                    ],
+                    [
+                      "wait",
+                      0.99
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 0.5592,
+            "speedup_factor": 1.0658,
+            "status": "passed"
+          },
+          "parent_solution_id": "88c0d6f5c700422629d6e7c6612e8f240b684e1e",
+          "solution_id": "b4df5931f675bd62bfe481b01327fa58d2fa21ab"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.08,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Grid-stride loop with larger tiles"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3b",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Triton elementwise add with autotuned BLOCK_SIZE/num_warps configs; one tile per program. bottleneck=memory bandwidth (long_scoreboard dominates, ~470 GB/s achieved). FOLLOW_THROUGH: aligned_with_intent=no; intent was grid-stride loop with larger tiles, but current_code is single-tile-per-program (no grid-stride). UPDATE_BELIEF: passed at 1.05x but below n4_child_grid_stride (1.19x); larger autotune block alone isn't enough. Next bet: pursue vectorized loads (fp16x2/vec4) under n4_child_grid_stride to reduce issued memory instructions.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n3",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.5285,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.5285,
+              "ref_eager_time_ms": 0.5578,
+              "score": 1.0539,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.0539,
+              "speedup_over_eager": 1.0555
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 470.65,
+                  "compute_throughput_pct": 2.65,
+                  "duration_us": 797.344,
+                  "kernel_name": "add_kernel",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 0.02,
+                  "memory_throughput_pct": 51.48,
+                  "registers_per_thread": 40,
+                  "shared_mem_per_block_bytes": 0,
+                  "sm_occupancy_pct": 82.03,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      209.26
+                    ],
+                    [
+                      "short_scoreboard",
+                      24.2
+                    ],
+                    [
+                      "wait",
+                      0.99
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 0.5578,
+            "speedup_factor": 1.0539,
+            "status": "passed"
+          },
+          "parent_solution_id": "88c0d6f5c700422629d6e7c6612e8f240b684e1e",
+          "solution_id": "ddd25ce842b58eaa64b758d88db0be5aeebf8e4b"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.7,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "compute negligible (2.67%)",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "471 GB/s, ~52% mem throughput; bandwidth-bound",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "40 regs/thread, occupancy dropped to 82%",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 8,
+        "node_id": "node_elementwise_add_fp16_r8_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n3a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "b4df5931f675bd62bfe481b01327fa58d2fa21ab",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.19,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Grid-stride loop"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.75,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Trivial compute; HW fit fine but ceiling near DRAM BW.",
+            "rating_0_to_10": 4.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "466 GB/s achieved, 51% mem throughput; bandwidth-bound elementwise.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "40 regs/thread, occupancy 81%.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n4_child_grid_stride",
+        "node_type": "decision",
+        "notes": "CURRENT: best leaf at 1.19x speedup, 0.523ms, 466 GB/s. bottleneck=memory bandwidth. Next: vectorize loads.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n4",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.5231,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.5231,
+              "ref_eager_time_ms": 0.558,
+              "score": 1.1945,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.1945,
+              "speedup_over_eager": 1.0667
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 466.73,
+                  "compute_throughput_pct": 2.66,
+                  "duration_us": 798.016,
+                  "kernel_name": "add_kernel_fp16",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 0.02,
+                  "memory_throughput_pct": 51.05,
+                  "registers_per_thread": 40,
+                  "shared_mem_per_block_bytes": 0,
+                  "sm_occupancy_pct": 81.36,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      190.45
+                    ],
+                    [
+                      "short_scoreboard",
+                      15.47
+                    ],
+                    [
+                      "wait",
+                      1.14
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 0.558,
+            "speedup_factor": 1.1945,
+            "status": "passed"
+          },
+          "parent_solution_id": "4b44d9b47e0b29595ef6b226f4debb224e3af115",
+          "solution_id": "6ed4112db94bc44cb527a973ba8adccff320c88f"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.7,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Trivial compute; HW fit fine but ceiling near DRAM BW.",
+            "rating_0_to_10": 4.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "466 GB/s achieved, 51% mem throughput; bandwidth-bound elementwise.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "40 regs/thread, occupancy 81%.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 21,
+        "node_id": "node_elementwise_add_fp16_r21_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n4_child_grid_stride",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6ed4112db94bc44cb527a973ba8adccff320c88f",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.22,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Per-thread vec4 (4 elems/thread) inside grid-stride"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n4_child_grid_stride_vec4",
+        "node_type": "decision",
+        "notes": "Each thread loads 4 contiguous fp16 elements (effectively a 64-bit load) within the grid-stride loop to cut issued memory instructions ~4x and reduce long_scoreboard stalls. SELF_CHECK: this is a refinement child of grid-stride (not a sibling alternative); excludes the deprioritized true_fp16x2 path which used a different packing API.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n4_child_grid_stride",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6ed4112db94bc44cb527a973ba8adccff320c88f",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 28,
+        "node_id": "node_elementwise_add_fp16_r28_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n3b",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "ddd25ce842b58eaa64b758d88db0be5aeebf8e4b",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Dense elementwise fp16 add of two contiguous tensors of shape (16,2048,2048) = 67,108,864 elements. The operation is trivially parallel with zero reuse and no reductions, so it is strictly DRAM-bandwidth bound on RTX5090 (~1.7TB/s class). Total traffic \u2248 402 MB (2 loads + 1 store, fp16), giving a theoretical lower bound around ~0.24 ms. The only meaningful optimization axes are: (a) ensuring fully coalesced, wide (128-bit) loads/stores, (b) choosing BLOCK_SIZE and num_warps that saturate memory bandwidth while maintaining high SM occupancy, and (c) minimizing launch and indexing overhead. Tensor cores are irrelevant. Correctness requires only matching x+y in fp16 with proper tail masking.",
+  "open_questions": [
+    "What BLOCK_SIZE / num_warps combination empirically saturates RTX5090 GDDR7 bandwidth for fp16 elementwise ops?",
+    "Does Triton on this toolchain automatically emit 128-bit vectorized loads for contiguous fp16, or do we need explicit packing?",
+    "Is torch.compile's generated kernel already near peak bandwidth, leaving little headroom to beat it?",
+    "Does using torch.empty (uninitialized output) vs empty_like have any measurable effect at this size?",
+    "Should we use a 1D flat grid or a 2D grid mapped to (batch, spatial) for better SM scheduling on Blackwell?",
+    "Are there alignment guarantees on the input tensors that allow assuming N is divisible by a large vector width (here 64M is divisible by everything reasonable)?",
+    "What is the measured reference latency from torch.compile to set a realistic speedup target?"
+  ]
+}

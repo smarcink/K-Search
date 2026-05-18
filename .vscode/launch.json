@@ -64,6 +64,7 @@
                 "conv_pooling_fp16_cuda/reference.py",
                 "conv_pooling_fp16_cuda/opus47_v1",
                 "conv_pooling_fp16_cuda/opus47_v2_ncu",
+                "conv_pooling_fp16_cuda/torch_compile_baseline",
                 "--precision", "fp16",
                 "--warmup", "100",
                 "--iters", "1000", 
@@ -81,13 +82,14 @@
             "justMyCode": true,
             "args": [
                 "elementwise_add_fp16/elementwise_add_fp16.py",  // path to reference
-                "elementwise_add_fp16/sonnet46",
+                "elementwise_add_fp16/sonnet46_10r",
+                "elementwise_add_fp16/opus47_30r",
                 "--precision", "fp16",
-                //"--compile-mode", "default",
-                "--warmup", "100",
-                "--iters", "1000",
+                "--compile-mode", "default",
+                "--warmup", "200",
+                "--iters", "5000",
                 "--atol", "1e-2",
-                //"--shape", "64", "1024", "1024"
+                //"--shape", "16", "2048", "2048"
             ]
         }
     ]

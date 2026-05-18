@@ -41,8 +41,6 @@ class CudaKernelTaskConfig:
     precision: str = "fp16"
     rtol: float = 1e-2
     atol: float = 1e-2
-    profile_warmup: int = 2
-    profile_repeats: int = 1
     max_failure_excerpt_chars: int = 4000
 
 
@@ -74,11 +72,9 @@ class CudaKernelTask:
         precision: str = "fp16",
         rtol: float = 1e-2,
         atol: float = 1e-2,
-        profile_warmup: int = 2,
-        profile_repeats: int = 1,
         artifacts_dir: str | None = None,
         name: str | None = None,
-        enable_profiling: bool = False,
+        enable_ncu_profiling: bool = False,
         verbose: bool = False,
     ) -> None:
         self._ref_path = str(Path(ref_path).resolve())
@@ -93,18 +89,12 @@ class CudaKernelTask:
             precision=str(precision),
             rtol=float(rtol),
             atol=float(atol),
-            profile_warmup=max(0, int(profile_warmup)),
-            profile_repeats=max(1, int(profile_repeats)),
         )
         self._name = str(name or Path(self._ref_path).stem)
         self._artifacts_dir = str(artifacts_dir) if artifacts_dir else None
-        self._enable_profiling = bool(enable_profiling)
+        self._enable_ncu_profiling = bool(enable_ncu_profiling)
         self._verbose = bool(verbose)
         self._solutions: dict[str, Solution] = {}
-
-        # Hardware profiler (NCU on CUDA; no-op on backends without one wired up).
-        from k_search.utils.profiler import select_profiler
-        self._profiler = select_profiler("cuda")
 
         # Feedback state for world-model prompts
         self._last_round_trace_logs: str = ""
@@ -120,38 +110,6 @@ class CudaKernelTask:
         return self._name
 
     def get_definition_text(self, language: str | None = None) -> str:
-        # If the reference directory contains initial kernel source files,
-        # include them in the definition to give the LLM a concrete working example.
-        initial_kernel_section = ""
-        ref_dir = Path(self._ref_path).parent
-        # Look for initial_kernel/ directory or kernel files alongside reference
-        kernel_dirs = [ref_dir / "initial_kernel", ref_dir]
-        for kd in kernel_dirs:
-            kh = kd / "kernel.h"
-            kcu = kd / "kernel.cu"
-            mcpp = kd / "main.cpp"
-            if kh.exists() and kcu.exists() and mcpp.exists():
-                initial_kernel_section = f"""
-## Working Initial Kernel (use as base / reference for correct structure)
-
-kernel.h:
-```c
-{kh.read_text()}
-```
-
-kernel.cu:
-```cuda
-{kcu.read_text()}
-```
-
-main.cpp:
-```cpp
-{mcpp.read_text()}
-```
-
-"""
-                break
-
         return f"""# CUDA Kernel Optimization Task
 
 **Reference Module**: {Path(self._ref_path).name}
@@ -167,7 +125,7 @@ Your implementation must produce numerically equivalent outputs (rtol={self._cfg
 ```python
 {self._ref_code}
 ```
-{initial_kernel_section}
+
 ## Your Task
 Write optimized CUDA code that replaces the `forward()` computation.
 The `run()` function in main.cpp will receive the same input tensors as `Model.forward()`
@@ -175,21 +133,6 @@ and must return a list containing the same output tensor(s).
 
 The model will be instantiated with `get_init_inputs()` args and run with `get_inputs()` tensors.
 Your CUDA code should handle the specific shapes/dtypes from those functions.
-
-IMPORTANT: If the reference model has learnable parameters (weights, biases, etc.),
-your implementation MUST expose a `set_params` function via pybind11 so the evaluator
-can pass the model's trained parameters to your kernel before calling `run()`.
-
-The evaluator will call `set_params` with ALL of the model's state_dict tensors as
-positional arguments, in `model.state_dict()` order. This includes both nn.Parameter
-tensors AND registered buffers (e.g. position encodings, masks). For example, if
-the model has state_dict keys:
-  rpe_bias, norm.weight, norm.bias, linear.weight, linear.bias
-then `set_params` will be called as:
-  set_params(rpe_bias, norm_weight, norm_bias, linear_weight, linear_bias)
-
-Each argument is a `torch::Tensor` already on CUDA with the appropriate dtype.
-Your `set_params` must store these tensors (or copies) for use in subsequent `run()` calls.
 """
 
     def get_code_format_text(self, *, language: str, target_gpu: str) -> str:
@@ -337,9 +280,9 @@ Your `set_params` must store these tensors (or copies) for use in subsequent `ru
             # Parse evaluator JSON output
             eval_result = self._parse_eval_output(stdout)
 
-            # Run hardware profiling if enabled and kernel passed
-            if self._enable_profiling and eval_result.is_passed():
-                eval_result = self._run_profiling(eval_result, tmp_dir, env)
+            # Run ncu profiling if enabled and kernel passed
+            if self._enable_ncu_profiling and eval_result.is_passed():
+                eval_result = self._run_ncu_profiling(eval_result, tmp_dir, env)
 
             # Verbose output
             if self._verbose:
@@ -364,12 +307,16 @@ Your `set_params` must store these tensors (or copies) for use in subsequent `ru
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _run_profiling(self, eval_result: EvalResult, tmp_dir: str, env: dict) -> EvalResult:
-        """Run hardware profiling on a passed kernel and attach metrics to the EvalResult."""
+    def _run_ncu_profiling(self, eval_result: EvalResult, tmp_dir: str, env: dict) -> EvalResult:
+        """Run ncu profiling on a passed kernel and attach metrics to the EvalResult."""
         try:
-            if not self._profiler.available():
-                if self._verbose:
-                    print(f"[profiler] backend '{self._profiler.name}' not available; skipping")
+            from k_search.utils.ncu_profiler import (
+                NCU_AVAILABLE,
+                metrics_to_dict,
+                run_ncu_profile,
+            )
+
+            if not NCU_AVAILABLE:
                 return eval_result
 
             evaluator_path = Path(__file__).parent / "cuda_kernel_eval.py"
@@ -379,16 +326,13 @@ Your `set_params` must store these tensors (or copies) for use in subsequent `ru
                 "--kernel-dir", tmp_dir,
                 "--precision", self._cfg.precision,
                 "--profile-only",
-                "--profile-warmup", str(self._cfg.profile_warmup),
-                "--profile-repeats", str(self._cfg.profile_repeats),
             ]
 
-            metrics_dict = self._profiler.run(profile_cmd, timeout=120, verbose=self._verbose)
-            if metrics_dict is not None:
-                metrics_dict["profiler_backend"] = self._profiler.name
-                eval_result.profiler_metrics = metrics_dict
+            ncu_metrics = run_ncu_profile(profile_cmd, timeout=120, verbose=self._verbose)
+            if ncu_metrics is not None:
+                eval_result.profiler_metrics = metrics_to_dict(ncu_metrics)
             elif self._verbose:
-                print("[profiler] No metrics parsed from profiler output")
+                print("[ncu] No metrics parsed from ncu output")
         except Exception:
             # Profiling is best-effort; never fail the eval
             pass
@@ -406,13 +350,12 @@ Your `set_params` must store these tensors (or copies) for use in subsequent `ru
         print(kernel_cu)
 
         # Print profiler report
-        backend_label = self._profiler.name.upper()
         if eval_result.profiler_metrics:
-            print(f"\n--- {backend_label} Profiler Report ---")
+            print(f"\n--- NCU Profiler Report ---")
             for line in eval_result.profiler_summary_lines():
                 print(f"  {line}")
-        elif self._enable_profiling and eval_result.is_passed():
-            print(f"\n--- {backend_label} Profiler Report ---")
+        elif self._enable_ncu_profiling and eval_result.is_passed():
+            print(f"\n--- NCU Profiler Report ---")
             print("  (no profiler data collected)")
 
         print(f"{sep}\n")

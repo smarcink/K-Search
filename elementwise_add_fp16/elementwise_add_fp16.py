@@ -32,8 +32,8 @@ Model = ElementwiseAdd
 def get_inputs():
     """Return input tensors for benchmarking (fp16, on GPU)."""
     device = get_device()
-    x = torch.randn(64, 4096, 4096, dtype=torch.float16, device=device)
-    y = torch.randn(64, 4096, 4096, dtype=torch.float16, device=device)
+    x = torch.randn(16, 2048, 2048, dtype=torch.float16, device=device)
+    y = torch.randn(16, 2048, 2048, dtype=torch.float16, device=device)
     return [x, y]
 
 

@@ -1,0 +1,382 @@
+{
+  "computed_signals": {
+    "round_index": 9,
+    "trace": {
+      "latency_ms": 0.0294,
+      "mean_vs_baseline_factor": null,
+      "profiler": {
+        "kernels": [
+          {
+            "achieved_bandwidth_gb_s": 368.52,
+            "compute_throughput_pct": 3.92,
+            "duration_us": 45.536,
+            "kernel_name": "elementwise_add_kernel",
+            "l1_hit_rate_pct": 0.0,
+            "l2_hit_rate_pct": 0.26,
+            "memory_throughput_pct": 40.39,
+            "registers_per_thread": 30,
+            "shared_mem_per_block_bytes": 0,
+            "sm_occupancy_pct": 78.67,
+            "tensor_core_utilization_pct": 0.0,
+            "top_stall_reasons": [
+              [
+                "long_scoreboard",
+                230.03
+              ],
+              [
+                "short_scoreboard",
+                6.12
+              ],
+              [
+                "wait",
+                1.62
+              ]
+            ]
+          }
+        ],
+        "profiler_backend": "ncu"
+      },
+      "reference_latency_ms": 0.0118,
+      "speedup_factor": 1.6788,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "node_C1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.85,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 (Blackwell) has very high memory bandwidth (~1.8 TB/s) and 128B cache lines. FP16 elementwise add is purely memory-bound; arithmetic intensity ~0.25 FLOP/byte (1 add / 4 bytes read+write per element). Tensor cores are not beneficial here.",
+            "notes": "Pure elementwise kernel \u2014 arithmetic intensity far below roofline compute threshold. No matrix ops, no reductions. All parallelism is trivially independent across 16*512*512=4,194,304 elements.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Dominant bottleneck: 3 tensors * 4M elements * 2 bytes = 25.2 MB total traffic. RTX5090 bandwidth ~1.8 TB/s => theoretical minimum ~14 \u00b5s. Achieving close to peak requires 128-byte coalesced accesses, large vector loads (128-bit), and maximal occupancy.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Extremely low register usage per thread when loading fp16 vectors. With BLOCK_SIZE=1024 and 8 fp16 elements per load (128-bit), register pressure is negligible.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS SUMMARY:\n1) CLASSIFICATION: Pure elementwise binary operation (addition). Output shape [16,512,512] fp16. No reductions, dense contiguous access, all dims large. Arithmetic intensity: ~0.25 FLOP/byte => memory-bandwidth bound.\n2) CANONICAL MATH: out[i] = x[i] + y[i] for i in [0, N), N=4,194,304. Fully independent, embarrassingly parallel.\n3) DATA LAYOUT: x, y, out all [16,512,512] fp16 contiguous. Dominant pattern: sequential streaming reads of x and y, sequential write of out. Cache line = 128B = 64 fp16 elements. Prefer vector loads of 8xfp16 (128-bit = tl.load with BLOCK pointers).\n4) BOTTLENECK REGIMES:\n   - Regime A (small N): latency-bound by kernel launch overhead. Use small BLOCK_SIZE.\n   - Regime B (medium N, current): memory-bandwidth bound. Maximize throughput with large BLOCK_SIZE (512-2048), 128-bit vector loads, high occupancy.\n   - Regime C (extreme N): still BW-bound but L2/DRAM boundary matters; streaming prefetch helps.\n5) DESIGN KNOBS: BLOCK_SIZE (256-4096), num_warps (2-16), vector width (64/128 bit loads), grid size (N/BLOCK_SIZE), persistent kernel vs standard launch.\n6) SKELETON: Each program handles BLOCK_SIZE contiguous fp16 elements. Load x block, load y block (both 128-bit aligned), add, store result. No shared memory needed. 1 phase, register-only.\n7) FAMILIES: (A) Large-block vectorized streaming \u2014 BLOCK_SIZE=2048, 128-bit loads, num_warps=8; targets BW peak. (B) Persistent warp-level kernel \u2014 fewer blocks, each loops over chunks; reduces launch overhead. (C) Baseline simple Triton \u2014 BLOCK_SIZE=1024 straightforward implementation.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton elementwise add kernel with BLOCK_SIZE=2048, num_warps=8, using 1D grid over flattened tensor. Use tl.load/tl.store with contiguous pointer arithmetic. Mask boundary. This is the baseline Triton approach without special vectorization tricks \u2014 relies on Triton's auto-vectorization of fp16 loads to emit 128-bit LDG instructions.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "Triton auto-vectorizes contiguous fp16 loads to 128-bit memory transactions. BLOCK_SIZE=2048 gives good occupancy and hides memory latency. This should already beat torch.compile baseline for this simple kernel by reducing framework overhead.",
+          "score_0_to_1": 0.55,
+          "title": "Large-block vectorized streaming kernel"
+        },
+        "choice": "A",
+        "confidence_0_to_1": 0.55,
+        "decision": "primary_kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 SM count ~170. N/BLOCK_SIZE = 4194304/2048 = 2048 blocks. 2048 blocks / 170 SMs \u2248 12 waves. Sufficient to saturate all SMs.",
+            "notes": "Still compute-light elementwise op; vectorization helps BW not compute.",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Vectorized loads (float4) can improve effective BW by reducing transaction overhead and partially hiding latency. However, node_C already achieves 381 GB/s with autotuning, so marginal gains may be limited unless pipelining is added.",
+            "rating_0_to_10": 6.5,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Vectorized loads pack 4 floats per register slot; register pressure may slightly increase but unlikely to be a limiter.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_A",
+        "node_type": "decision",
+        "notes": "CURRENT:\n  does: Planned large-block kernel with vectorized float4 loads \u2014 not yet implemented.\n  bottleneck: anticipated memory latency, same as node_C.\nFOLLOW_THROUGH:\n  aligned_with_intent: n/a (no solution attached yet)\nUPDATE_BELIEF:\n  node_C evidence shows long_scoreboard stalls are the key bottleneck; pure large-block selection without latency hiding is likely insufficient to beat node_C significantly. This approach is now lower priority unless combined with software pipelining.\n  next bet: If pursued, must combine vectorized loads with explicit prefetch to be competitive with node_C children.\nSELF_CHECK: This node represents a static-grid vectorized launch pattern without autotuning. It is mutually exclusive from node_C (autotuned) and node_B (persistent loop) as a root-level family choice.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a persistent Triton kernel where each SM processes multiple chunks in a loop. Launch exactly num_SMs * tiles_per_SM blocks. Each block iterates over its assigned chunks of the tensor using a stride loop. Reduces kernel launch grid size and balances work across SMs for non-power-of-2 tensor sizes.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "For this tensor size (4M fp16 elements = 25MB), a persistent approach ensures no SM sits idle in the last wave. However, the standard approach already gets ~12 full waves so the benefit is marginal. Adds code complexity.",
+          "score_0_to_1": 0.55,
+          "title": "Persistent SM-tile streaming kernel"
+        },
+        "choice": "B",
+        "confidence_0_to_1": 0.55,
+        "decision": "primary_kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 has ~170 SMs. Persistent grid = 170 * tiles_per_SM. Eliminates partial-wave waste. Requires knowing SM count at runtime or compile time.",
+            "notes": "Each block loops: while offset < N: process chunk, offset += grid_stride. Eliminates tail wave latency. More complex to tune tiles_per_SM.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Same memory access pattern as node_A. BW efficiency unchanged. Persistent scheme helps only if last-wave straggler was significant.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Loop counter adds ~2 registers. Still negligible.",
+            "rating_0_to_10": 2.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_B",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This node uses a persistent loop inside each block, fundamentally different launch pattern from node_A (static grid) and node_C (small block). Cannot combine with A or C without restructuring the entire launch logic.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Sweep BLOCK_SIZE values {256, 512, 1024, 2048, 4096} and num_warps {2, 4, 8, 16} using triton.autotune with the actual target tensor. Select the best configuration empirically. This finds the optimal balance between occupancy, L2 reuse, and launch overhead on the specific RTX5090 hardware.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.68,
+          "rationale": "Autotuning eliminates guesswork on BLOCK_SIZE vs occupancy tradeoff. For BW-bound kernels on Blackwell, the optimal BLOCK_SIZE may differ from Ampere/Hopper intuitions. The autotuner overhead is amortized over many benchmark iterations.",
+          "score_0_to_1": 0.72,
+          "title": "Autotuned block-size selection kernel"
+        },
+        "choice": "C",
+        "confidence_0_to_1": 0.85,
+        "decision": "primary_kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090 Blackwell architecture may have different L2 and SM characteristics than prior generations. Autotuning discovers hardware-specific optima without assumptions.",
+            "notes": "Elementwise add is trivially compute-light (3.49% compute throughput). Kernel is purely latency/BW bound. No tensor cores used (expected).",
+            "rating_0_to_10": 3.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 381 GB/s (~42% mem throughput). Long-scoreboard stalls dominate \u2014 memory latency is the primary bottleneck, not peak BW. Two separate loads + one store produce 3 pointer streams with no coalescing improvements.",
+            "rating_0_to_10": 5.5,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "28 registers/thread is moderate. Not a limiter at 82% SM occupancy.",
+            "rating_0_to_10": 6.5,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C",
+        "node_type": "decision",
+        "notes": "CURRENT:\n  does: Autotuned elementwise add sweeping BLOCK_SIZE in {256,512,1024,2048,4096} x num_warps {2,4,8,16}; picks best config empirically.\n  bottleneck: Memory latency \u2014 long_scoreboard stalls dominate; only 42% mem throughput achieved despite 82% SM occupancy.\nFOLLOW_THROUGH:\n  aligned_with_intent: yes\nUPDATE_BELIEF:\n  Autotune delivered 1.66x over compile baseline, confirming the approach is sound. However, ~42% memory throughput with long_scoreboard stalls shows we are not hiding memory latency well \u2014 likely two independent loads are serialized and not software-pipelined.\n  next bet: Add tl.multiple_of hints and explicit software pipelining (async copy / prefetch) to hide memory latency; also try vectorized loads (float4 via tl.load with vec=4) to reduce transaction count and improve BW utilization.\nSELF_CHECK: This node uses autotuned static-grid launch. Siblings node_A (large-block vectorized) and node_B (persistent loop) use fundamentally different launch patterns and are mutually exclusive root-level families.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": 1.6568,
+            "score_name": "speedup_over_compile",
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "856cb9c1661592fed10e76ff6cb634717b161d34"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.68,
+          "rationale": "",
+          "score_0_to_1": 0.62,
+          "title": "Software-pipelined async loads with vectorized float4 access"
+        },
+        "choice": "C1",
+        "confidence_0_to_1": 0.75,
+        "decision": "latency_hiding_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Still BW-bound but pipelining+vectorization targets the specific bottleneck identified in profiler data (long_scoreboard stalls, 42% mem throughput).",
+            "rating_0_to_10": 3.5,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Prefetching next block while computing current block hides long_scoreboard stalls that limited node_C to 42% mem throughput. Float4 vectorization (via reinterpret to tl.float32x4 or int4) reduces load transaction count by 4x.",
+            "rating_0_to_10": 8.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Pipelining doubles live register count for prefetch buffers. May reduce occupancy slightly but should be net positive by hiding latency.",
+            "rating_0_to_10": 5.5,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C1",
+        "node_type": "decision",
+        "notes": "CURRENT:\n  does: Uses autotuned block sizes (1024-8192) with .cg cache modifier and multi-stage software pipelining (num_stages 1/2/4) to hide memory latency for elementwise add.\n  bottleneck: memory bandwidth / long_scoreboard stalls dominate (252.77 cycles); achieved BW ~368 GB/s out of ~1800 GB/s theoretical on RTX5090, so we are far from peak. l1 hit rate 0%, l2 hit rate 0.26% \u2014 pure DRAM streaming.\nFOLLOW_THROUGH:\n  aligned_with_intent: yes \u2014 .cg cache modifier and num_stages autotune are present; .cs was dropped due to Triton incompatibility.\nUPDATE_BELIEF:\n  eval_result shows 1.68x vs compile, essentially flat vs round 1 (1.66x). Adding num_stages and .cg did not materially help; long_scoreboard stalls unchanged. The kernel is bandwidth-bound at ~40% memory throughput, suggesting grid is large enough but per-thread ILP is insufficient.\n  next bet: Increase per-thread work via explicit float4 vectorization (128-bit loads) using tl.load with 4-element stride, reducing instruction count and improving effective bandwidth utilization.\nPERF_GAP:\n  expected 2.10x vs baseline, observed 1.68x. Reason: .cs modifier was unsupported and removed; num_stages autotune alone cannot overcome long_scoreboard stalls without wider vectorization.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "node_C",
+        "solution_ref": {
+          "eval": {
+            "score": 1.6788,
+            "score_name": "speedup_over_compile",
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "df04bb55884db968ffeafe2eb872d7a9fd51d652"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Explicit float4 (128-bit) vectorized loads to reduce long_scoreboard stalls"
+        },
+        "choice": "C1_1",
+        "confidence_0_to_1": 0.65,
+        "decision": "vectorization_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C1_1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This node uses explicit 128-bit vectorized loads (reinterpreting n_elements//4 as float4 chunks) \u2014 fundamentally different from parent node_C1 which uses scalar tl.load with .cg. Siblings node_A and node_B are different kernel families (large static block and persistent loop respectively).\nCURRENT: Not yet implemented \u2014 inheriting parent solution.\nFOLLOW_THROUGH:\n  aligned_with_intent: n/a \u2014 open frontier node.\nUPDATE_BELIEF:\n  Parent node_C1 plateaued at 1.68x due to long_scoreboard stalls. Wider 128-bit loads should reduce the number of load instructions and improve memory-level parallelism, potentially pushing BW utilization from 40% toward 60%+. Risk: mask handling for non-multiple-of-4 sizes adds complexity.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "node_C1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "node_C1_sol",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Float4 vectorized loads via pointer casting + large block autotune to saturate bandwidth"
+        },
+        "choice": "C1_2",
+        "confidence_0_to_1": 0.6,
+        "decision": "vectorization_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Task is memory-bound; compute intensity stays low. Wider loads improve IPC without changing arithmetic intensity.",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "128-bit loads pack 4 floats per instruction, reducing long_scoreboard stall count. Effective BW should increase from ~40% to 60-70% of theoretical.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Float4 requires 4 registers per vector element; with large BLOCK_SIZE this may increase register spill risk. autotune with num_warps can mitigate.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_C1_2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This node is a child refinement of node_C1 (same kernel family, adds vectorization on top). It is NOT a sibling alternative to node_A or node_B.\nCURRENT: Open \u2014 not yet implemented.\nPLAN: Cast x_ptr/y_ptr/out_ptr to float4 pointers, iterate over n_elements//4 chunks with BLOCK_SIZE//4 program blocks, handle remainder with scalar tail. Use autotune configs with BLOCK_SIZE in {1024,2048,4096,8192} and num_warps in {4,8,16}, num_stages in {2,4}. Keep .cg cache modifier.\nFOLLOW_THROUGH:\n  aligned_with_intent: n/a \u2014 open.\nUPDATE_BELIEF:\n  Parent stalled at 1.68x; vectorization is the most direct lever to reduce long_scoreboard stalls identified in profiler.",
+        "overall_rating_0_to_10": 7.2,
+        "parent_id": "node_C1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "df04bb55884db968ffeafe2eb872d7a9fd51d652",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "The elementwise_add_fp16 kernel performs out[i] = x[i] + y[i] over N=4,194,304 fp16 elements (tensors of shape [16,512,512]). It is a pure memory-bandwidth-bound, embarrassingly parallel kernel with arithmetic intensity ~0.25 FLOP/byte, far below RTX5090's compute roofline. No reductions, no shared memory, no tensor cores are needed. The primary optimization levers are: (1) maximizing memory throughput via 128-bit coalesced fp16 vector loads, (2) choosing BLOCK_SIZE and num_warps to achieve full SM occupancy across ~170 SMs, and (3) minimizing kernel launch overhead. The 25.2 MB working set streams through L2/DRAM. The theoretical minimum latency at 1.8 TB/s peak bandwidth is ~14 \u00b5s; practical targets are 20-40 \u00b5s depending on L2 hit rates and occupancy. torch.compile should already produce near-optimal PTX for this operation, making it challenging to beat without careful tuning of the Triton launch configuration.",
+  "open_questions": [
+    "What is the actual measured bandwidth of RTX5090 for streaming fp16 loads \u2014 is the 1.8 TB/s spec achievable for 25MB working sets or is L2 the bottleneck?",
+    "Does torch.compile already emit 128-bit LDG.128 instructions for fp16 elementwise add, and what is its actual benchmark latency on RTX5090?",
+    "What is the optimal BLOCK_SIZE for RTX5090 Blackwell SM architecture \u2014 does the larger L2 cache or different warp scheduler prefer different tile sizes vs Hopper?",
+    "Is there a meaningful benefit to using tl.load with cache_modifier='ca' (L1-bypass) for streaming access patterns on Blackwell to avoid L1 cache pollution?",
+    "Does the Triton autotuner's warmup correctly account for CUDA graph capture or JIT compilation overhead in the benchmarking environment?",
+    "Would using num_warps=4 vs num_warps=8 change occupancy meaningfully given the trivially low register count per thread for this kernel?",
+    "Is there a risk of numerical divergence from fp16 overflow or NaN propagation that needs to be handled, or can we assume well-conditioned inputs as specified?"
+  ]
+}
