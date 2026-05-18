@@ -22,8 +22,6 @@ Key Triton performance principles for Intel XPU:
 - Do NOT use torch.cuda — use torch.xpu for device operations.
 - Triton kernels use the same standard primitives (tl.load, tl.store, tl.dot, tl.program_id, etc.)
   regardless of backend — the Intel XPU Triton backend compiles them automatically.
-- Fusing elementwise ops (bias, activation, pooling) into a matmul epilogue is where
-  custom Triton kernels can beat torch.compile.
 """
 
 # Triton-appropriate subset
