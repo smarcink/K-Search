@@ -65,6 +65,7 @@
                 "conv_pooling_fp16_cuda/opus47_v1",
                 "conv_pooling_fp16_cuda/opus47_v2_ncu",
                 "conv_pooling_fp16_cuda/torch_compile_baseline",
+                "conv_pooling_fp16_cuda/opus47_v4",
                 "--precision", "fp16",
                 "--warmup", "100",
                 "--iters", "1000", 

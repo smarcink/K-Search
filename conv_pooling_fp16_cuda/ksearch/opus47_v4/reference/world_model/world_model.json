@@ -1,0 +1,537 @@
+{
+  "computed_signals": {
+    "round_index": 28,
+    "trace": {
+      "latency_ms": 0.22630399465560913,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 3.476480007171631,
+      "speedup_factor": 15.361991344704986,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1e",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090M Blackwell sm_100, 82 SMs, 128KB smem/SM, FP16 TC 210TF (FP32 accum). Output H'=360,W'=640. 32 out-channels * 16 in-channels * 9 = 4608 FP16 weights = 9KB easily fits in shared/constant.",
+            "notes": "Conv 3x3 with C_in=16, C_out=32 is small GEMM-like; output spatial dominates work. Per-output FLOPs = 2*16*9 = 288 multiply-adds. Total ops ~ 32*720*1280*288 = 8.5 GFLOPs (small), so memory/launch dominate. ReLU+AvgPool fuse trivially.",
+            "rating_0_to_10": 7.0,
+            "risk": "Tensor Core utilization may be hard given small K=144 and tile shapes; epilogue fusion required."
+          },
+          "memory_bandwidth": {
+            "notes": "Input 1*16*720*1280*2B = 29.5MB (fits in L2=64MB). Output (after pool) 1*32*360*640*2B = 14.7MB. Weights 9KB. Memory bound likely; fusing conv+relu+avgpool removes intermediate 1*32*720*1280*2B=59MB traffic.",
+            "rating_0_to_10": 8.0,
+            "risk": "Without fusion, intermediate write/read dominates; with fusion, input reuse across pool 2x2 must be exploited."
+          },
+          "register_pressure": {
+            "notes": "Per-thread storing multiple output pixels and partial sums for 32 channels could push register usage; need tile sizing.",
+            "rating_0_to_10": 6.0,
+            "risk": "Spilling if each thread computes all 32 out-channels for a 2x2 block (32*4 accumulators)."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: fused stencil (3x3 conv) + elementwise (ReLU) + reduction (2x2 avgpool). Dense, no indirection. Fixed small shapes: N=1,Cin=16,Cout=32,H=720,W=1280,K=3,P=1,pool=2. 2) Math: out[c,y,x] = avg over 2x2 of relu(sum_{ic,ky,kx} in[ic,2y+ky-0..,2x+kx-0..]*W[c,ic,ky,kx]+b[c]). Output spatial 360x640. Each output reads a 5x5 input patch per in-channel (16 channels) -> 16*5*5=400 input FP16 reads = 800B. 3) Layout: NCHW FP16 contiguous; weights small (9KB) -> constant/shared; bias 64B. 4) Regimes: (a) memory-bound input read (most likely given small compute), (b) register-bound if accumulating all 32 outc per thread, (c) launch/occupancy bound if too few blocks. 5) Knobs: tile shape (output tile HxW), per-thread output pixels, shared mem for input halo, weights in smem vs constant, FP16 vs FP32 accumulate, vectorized __half2 loads, tensor cores (im2col-like reshape -> GEMM Cout=32 x (Hout*Wout)=460800 x K=144). 6) Skeleton: grid over output tile (e.g., 16x16 output pixels = 32x32 input region per Cin); load input tile to smem cooperatively; each thread computes a small output block over all 32 Cout, applies bias+ReLU; reduce across 2x2 pool inline; write out. 7) Candidates: F1 (TOP) fully-fused direct conv kernel with shared-mem input tile + constant weights + inline ReLU+AvgPool, one kernel call, no intermediate global. F2 implicit-GEMM with tensor cores (Cout=32 fits one m16n8 tile of N=8, but K=144=9*16 well-suited). F3 split kernels (rejected: 59MB intermediate). Working set per block: input tile ~ (Tile_H*2+2)*(Tile_W*2+2)*16*2B; for tile 16x16 -> 34*34*32B = 36KB fits in 128KB smem easily. Full fusion is register-feasible -> F1 is top.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "pending"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single fused CUDA kernel: each block computes a tile of output pixels (e.g., 16x16 = covers 32x32 input region for Cin=16). Cooperatively load input halo (34x34x16 FP16) into shared memory. Store all 32*16*9 = 4608 FP16 weights in __constant__ memory or shared. Each thread computes a small block of output pixels across all 32 output channels using FP16 accumulation in registers (or FP32 for safety). Apply bias + ReLU, then perform 2x2 average inline (each thread group reduces 4 conv outputs into one pooled output). Write final pooled output directly to global memory. Eliminates intermediate Cout*H*W tensor.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.5,
+          "rationale": "Reference likely runs unfused conv->relu->pool with large intermediate. Full fusion removes ~59MB of intermediate traffic and exploits input reuse across the 2x2 pool window.",
+          "score_0_to_1": 0.85,
+          "title": "Fully-fused Conv3x3+ReLU+AvgPool2x2 direct kernel with smem input tile + constant weights"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Cout=32, Cin=16 small; direct conv preferred over TC. 82 SMs * many blocks -> 360x640/(16x16) = 22.5*40 = 900 blocks, good occupancy.",
+            "notes": "Each block fuses 3 ops; arithmetic intensity rises substantially.",
+            "rating_0_to_10": 8.0,
+            "risk": "Per-thread workload tuning critical; too much per thread spills registers."
+          },
+          "memory_bandwidth": {
+            "notes": "Removes intermediate 59MB write+read. Net DRAM traffic ~ input (29.5MB) + output (14.7MB) + weights (9KB) ~= 44MB. At 896GB/s peak -> ~0.05ms theoretical lower bound.",
+            "rating_0_to_10": 9.0,
+            "risk": "If smem bank conflicts or non-coalesced loads occur, BW gain reduced."
+          },
+          "register_pressure": {
+            "notes": "If each thread computes 2x2 pooled output across all 32 Cout -> 32 accumulators (FP16) or 32 FP32 = manageable. With 4 pool outputs collapsed per thread, accumulate then average.",
+            "rating_0_to_10": 6.0,
+            "risk": "FP32 accum * 32 channels = 128B/thread regs; combined with input staging could hit limit at 128 threads/block."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Fused Conv3x3+ReLU+AvgPool2x2 in single kernel; each thread computes 2x2 conv outputs then pools to 1 output pixel; weights/bias in constant mem; input tile staged in shared memory. bottleneck: compute/register pressure -- the inner loop accumulates over COUT*CIN with 4 accumulators per thread and converts FP16->FP32 each time; no tensor cores used. FOLLOW_THROUGH: aligned_with_intent: yes. UPDATE_BELIEF: 7.43x speedup vs reference (0.432ms vs 3.210ms) confirms fusion + smem tiling + constant weights is a strong design. Next bet: refinements as children -- (a) use HMMA tensor cores on the per-output-channel reduction or vectorized half2 FMA to halve math ops, (b) hoist input patch/weights into registers once and reuse across oc loop, (c) reorder loops so smem input is read once per (c, patch) and accumulate into a register array of size COUT. impacts: memory_bandwidth rating 8/10 (intermediate eliminated, input loaded once via smem); register_pressure rating 5/10 (4 accumulators + patch[4][4] + wf[9] per inner iter -- moderate); compute rating 6/10 (scalar FP32 FMA, no tensor cores).",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.43196800351142883,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 3.210239887237549,
+            "speedup_factor": 7.431661283108469,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "d5bebc6772bb147c471153a0d35f3188a4aaaf0d"
+        }
+      },
+      {
+        "action": {
+          "description": "Reformulate conv as implicit GEMM: M=Cout=32, N=Hout*Wout per tile, K=Cin*9=144. Use FP16 tensor cores (m16n8k16) with FP16 accumulation (420 TFLOPS path) or FP32 accum (210 TFLOPS). Fuse ReLU+AvgPool in epilogue: write only after 2x2 reduction. Use ldmatrix + cp.async for input staging. Cout=32 -> 2 warps along M; tile N along output spatial.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 12.0,
+          "rationale": "Tensor cores offer high throughput but problem is memory-bound; gain may be modest. Worth trying if direct kernel is compute-limited at small tile sizes.",
+          "score_0_to_1": 0.4,
+          "title": "Tensor-core GEMM mapping (im2col reshape) full-kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "m16n8k16 fits K=144 as 9 iterations. M=32 = 2 tiles. Need NHWC layout or on-the-fly transpose.",
+            "notes": "TC underutilized given memory-bound nature; FLOPs are tiny (~8.5G).",
+            "rating_0_to_10": 6.0,
+            "risk": "Layout conversion overhead may negate TC speedup."
+          },
+          "memory_bandwidth": {
+            "notes": "Same input traffic as direct conv; epilogue fusion removes intermediate.",
+            "rating_0_to_10": 7.0,
+            "risk": "im2col staging in smem could increase smem traffic vs direct."
+          },
+          "register_pressure": {
+            "notes": "WMMA fragments + accumulators manageable; 2 warps * 16*8 accum = small.",
+            "rating_0_to_10": 7.0,
+            "risk": "Complex epilogue with 2x2 pool inside warp tiles tricky."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: sibling to n1 family; full GEMM/tensor-core reshape. De-prioritized: n1a already achieves 15.15x with direct-loop fusion; a separate GEMM kernel would likely lose fusion benefits with pool/ReLU and pay reshape overhead. Keep open as fallback.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 15.15,
+          "rationale": "",
+          "score_0_to_1": 0.95,
+          "title": "Reorder loops: per-(c, patch) load once, accumulate into COUT register array using half2 FMA"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.92,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "Best leaf so far: 15.15x at 0.212ms. n1c sibling refinement regressed to 13.34x, suggesting vectorized smem loads are not the bottleneck. Promising children: (1) prefetch weights into smem to reduce constant-memory bcast pressure; (2) increase output tile / reduce per-thread COUT_H2=16 register array via warp-level COUT partition; (3) split CIN loop with double-buffered smem.",
+        "overall_rating_0_to_10": 9.2,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.21225599944591522,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 3.214848041534424,
+            "speedup_factor": 15.146087978321653,
+            "status": "passed"
+          },
+          "parent_solution_id": "d5bebc6772bb147c471153a0d35f3188a4aaaf0d",
+          "solution_id": "a1e8fcca4a8f07a4ebd6a0c75d7ca10db3f18887"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 20.0,
+          "rationale": "",
+          "score_0_to_1": 0.1,
+          "title": "Replace inner FMA reduction with tensor-core HMMA (m16n8k16) on im2col-ish reshape"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.3,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b",
+        "node_type": "decision",
+        "notes": "Dominated/superseded by n1e_b (HMMA under better COUT-partitioned baseline). Candidate for deletion if not pursued.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "d5bebc6772bb147c471153a0d35f3188a4aaaf0d",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 13.34,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Vectorize smem loads (half2/float4) + interleave global input load with weight prefetch; reduce shared-mem bank conflicts"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c",
+        "node_type": "decision",
+        "notes": "CURRENT: Fused conv+relu+pool with half2 smem loads and per-row half2 patch gather; loops over CIN with 9 kernel positions, accumulating 16 half2 outputs per pool position. bottleneck: register pressure (4*16 half2 = 64 regs of accumulators + patch + weights), likely spilling. FOLLOW_THROUGH: aligned_with_intent=yes (vectorized smem loads via half2 pairs, padded SMEM_W). UPDATE_BELIEF: result 13.34x is WORSE than n1a parent (15.15x); added half2 patch loads in smem did not help and possibly increased register pressure or instruction count. PERF_GAP: expected 17x, observed 13.34x; likely culprits: alignment branch on odd in_x0 still causes scalar fallback for boundary tiles, and the 4 pool-position accumulator array (64 half2) increases register pressure vs n1a. Next bet: revert to scalar patch loads from smem but keep weight reordering; or try reducing accumulator footprint by computing one pool quadrant at a time.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "score": 13.34,
+            "score_name": "speedup_factor",
+            "status": "passed"
+          },
+          "parent_solution_id": "a1e8fcca4a8f07a4ebd6a0c75d7ca10db3f18887",
+          "solution_id": "1b186eb727cbffbbf8f91d9bee076183c23e59f4"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 15.5,
+          "rationale": "",
+          "score_0_to_1": 0.2,
+          "title": "Increase per-block work: enlarge TILE_OUT (e.g., 16x16 outputs/block) and/or process multiple input batches per block to improve occupancy/reuse"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.35,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1d",
+        "node_type": "decision",
+        "notes": "De-prioritized: n1e and its children dominate; keep as backup.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "a1e8fcca4a8f07a4ebd6a0c75d7ca10db3f18887",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 15.36,
+          "rationale": "",
+          "score_0_to_1": 0.9,
+          "title": "Partition COUT across threads (warp/thread cooperation) to shrink per-thread acc array from 16 half2 to 4-8, freeing registers for more ILP"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "half2 FMA chain, good FP16 throughput on Blackwell",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "smem tile + constant weights amortize bandwidth well",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "acc array shrunk to 4 half2 x 4 spatial = 16 regs; room for more ILP",
+            "rating_0_to_10": 7.0,
+            "risk": "med"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1e",
+        "node_type": "decision",
+        "notes": "CURRENT: does=fused conv3x3+ReLU+avgpool2x2 with smem input tile, constant-mem weights, COUT partitioned across z-threads (each thread holds COUT_PER_THREAD_H2 half2 accumulators across 2x2 pooling patch). bottleneck=likely compute/latency-bound with some smem read pressure from 9 broadcast patches per cin. FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: COUT partitioning achieved 15.36x (slightly above n1a 15.15x) confirming register pressure was a mild limiter; next bet=exploit 2x2 spatial reuse (patch[ky+dy][kx+dx] overlaps) by reordering kx/ky loops to share half2(patch) loads across 4 output positions, OR move to mma.sync HMMA for true tensor-core utilization.",
+        "overall_rating_0_to_10": 8.8,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.22630399465560913,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {},
+            "reference_latency_ms": 3.476480007171631,
+            "speedup_factor": 15.361991344704986,
+            "status": "passed"
+          },
+          "parent_solution_id": "a1e8fcca4a8f07a4ebd6a0c75d7ca10db3f18887",
+          "solution_id": "e93eaccef21b53ade19a2a4192bea93b5197fded"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 16.0,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Stage weights for current channel into shared memory (9*COUT halves) once per block to replace constant-memory broadcast in inner loop"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1f",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n1a; mutually exclusive with n1e because it keeps the same thread->pixel mapping but changes weight delivery. Constant memory broadcasts only one address/cycle; with 128 threads each consuming different per-oc weights, c_weight reads may serialize. Cost: +CIN*9*COUT*2B = 4.5KB smem per block, easily fits.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "a1e8fcca4a8f07a4ebd6a0c75d7ca10db3f18887",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 14,
+        "node_id": "node_reference_r14_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1c",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "1b186eb727cbffbbf8f91d9bee076183c23e59f4",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.85,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "half2 FMA chain, good FP16 throughput on Blackwell",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "smem tile + constant weights amortize bandwidth well",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "acc array shrunk to 4 half2 x 4 spatial = 16 regs; room for more ILP",
+            "rating_0_to_10": 7.0,
+            "risk": "med"
+          }
+        },
+        "last_updated_round": 28,
+        "node_id": "node_reference_r28_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 8.8,
+        "parent_id": "n1e",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "e93eaccef21b53ade19a2a4192bea93b5197fded",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused stencil+elementwise+reduction pipeline: 3x3 Conv2d (Cin=16, Cout=32, pad=1, stride=1) followed by ReLU and 2x2 AvgPool, on a 1x16x720x1280 FP16 NCHW input producing 1x32x360x640 FP16 output. Compute is tiny (~8.5 GFLOPs) so the kernel is memory-bound; weights are only 9KB (fit in constant/shared). The dominant optimization is fusing all three ops into a single kernel to eliminate the 59MB intermediate tensor between Conv+ReLU and AvgPool. Each block should load a halo'd input tile into shared memory once and produce pooled outputs directly. FP16 precision with tolerance rtol=atol=0.01 permits FP16 or FP32 accumulation.",
+  "open_questions": [
+    "What is the reference kernel's measured latency, and is it already fused or a naive 3-pass pipeline?",
+    "What input/output tile shape best balances smem usage (input halo ~ (2T+2)^2 * Cin * 2B) and occupancy on sm_100?",
+    "Is FP16 accumulation accurate enough for Cin*K*K=144 MACs within rtol/atol=0.01, or is FP32 accumulation required?",
+    "Should weights live in __constant__ memory (broadcast-friendly) or shared memory (more bandwidth)?",
+    "Does NCHW direct convolution beat an NHWC tensor-core implicit-GEMM here given the memory-bound regime?",
+    "Can __half2 vectorized loads be used safely given padding boundaries and odd row alignment?",
+    "Is there bias to apply (Conv2d bias=True in reference) - confirm exact epilogue order: bias -> ReLU -> avg of 4?",
+    "Are there any cudaStream / persistent-kernel considerations, or is a single straight launch sufficient?"
+  ]
+}

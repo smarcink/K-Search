@@ -5,8 +5,12 @@ This file contains the prompts for baseline agent generation.
 from __future__ import annotations
 
 # CUDA-specific hints
-# Note: keep these hints generic (avoid naming specific low-level instructions).
-CUDA_OPTIMIZATION_HINTS = "** You MUST use MMA to utilize the tensor cores! ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."
+CUDA_OPTIMIZATION_HINTS = """** You MUST use tensor cores via MMA (wmma or mma.sync PTX) whenever the problem dimensions allow (M,N,K >= 16). **
+If tensor core MMA is not practical (e.g., dimensions too small for m16n8k16 tiles), you MUST still use native FP16 math:
+- Use __hfma2() / __hfma() for fused multiply-add on half/half2 types — these have 2x throughput vs FP32 FFMA on CUDA cores.
+- Keep accumulators in __half2 when possible; only widen to FP32 if numerical precision requires it.
+- Do NOT default to __half2float() → float FMA → __float2half() unless you can justify why FP16 accumulation would cause unacceptable error.
+For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."""
 
 # Intel XPU Triton hints
 XPU_TRITON_OPTIMIZATION_HINTS = """
