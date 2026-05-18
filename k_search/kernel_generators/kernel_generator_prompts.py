@@ -18,40 +18,12 @@ Key Triton performance principles for Intel XPU:
   Sub-group sizes are 16 or 32; choose tile sizes that are multiples of these.
 - Stage data through shared memory (SRAM): load input tiles with tl.load into a block,
   then use tl.dot for the compute. This maximizes data reuse and hides memory latency.
-- The device has 256 Execution Units (EUs), 32 subslices, 32 GB device memory, 192-bit bus.
 - Do NOT reference cuDNN, cuBLAS, CUTLASS, MMA instructions, or any NVIDIA-specific APIs.
 - Do NOT use torch.cuda — use torch.xpu for device operations.
 - Triton kernels use the same standard primitives (tl.load, tl.store, tl.dot, tl.program_id, etc.)
   regardless of backend — the Intel XPU Triton backend compiles them automatically.
 - Fusing elementwise ops (bias, activation, pooling) into a matmul epilogue is where
   custom Triton kernels can beat torch.compile.
-
-CRITICAL Intel XPU Triton backend constraints (violations cause SIGSEGV or compilation failure):
-- tl.arange(start, end): the range (end - start) MUST be a power of 2 (e.g., 16, 32, 64, 128).
-  Non-power-of-2 ranges (e.g., 96, 48, 3) will cause a compilation error or crash.
-  If you need to work with non-power-of-2 dimensions (e.g., dim=96), round UP to the next
-  power of 2 (e.g., 128) and use a mask to guard out-of-bounds elements.
-- BLOCK sizes and tile dimensions used as constexpr MUST be powers of 2.
-- tl.dot(a, b) operands must have inner dimension that is a multiple of 16.
-  Minimum supported shapes: (M, 16) x (16, N). Smaller inner dims will crash.
-- Avoid complex control flow (nested if/else, dynamic loops) inside Triton kernels —
-  the Intel backend has limited support and may produce invalid SPIR-V, causing SIGSEGV.
-- Keep kernels simple and well-structured. If a kernel causes SIGSEGV, simplify it —
-  break fused operations into separate smaller kernels rather than one monolithic kernel.
-- WORKAROUND (triton-xpu bug): Do NOT use tl.constexpr for runtime shape/stride parameters
-  like H, W, nH, nW, stride_*, M, N, K, etc. Only use tl.constexpr for BLOCK/TILE size
-  constants (e.g. BLOCK_M: tl.constexpr, TILE_K: tl.constexpr) that control tl.arange
-  or loop bounds and are powers of 2. Certain pointer-count + constexpr-count combinations
-  cause SIGSEGV in the Intel XPU Triton backend. Safe pattern:
-    def my_kernel(ptr0, ptr1, ptr2, H, W, stride_h,  # regular args
-                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):  # constexpr only for tile sizes
-  Unsafe pattern (WILL SEGFAULT):
-    def my_kernel(ptr0, ptr1, ptr2, ptr3, ptr4, ptr5,
-                  H: tl.constexpr, W: tl.constexpr, NH: tl.constexpr, NW: tl.constexpr):
-- torch.xpu.synchronize() instead of torch.cuda.synchronize().
-- tl.tanh() does NOT exist in triton.language. For GELU activation, use:
-    gelu = 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
-  or the approximate version with tl.sigmoid.
 """
 
 # Triton-appropriate subset
