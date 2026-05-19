@@ -1,0 +1,366 @@
+{
+  "computed_signals": {
+    "round_index": 28,
+    "trace": {
+      "latency_ms": 0.5312960147857666,
+      "mean_vs_baseline_factor": null,
+      "profiler": {
+        "kernels": [
+          {
+            "achieved_bandwidth_gb_s": 33.7,
+            "compute_throughput_pct": 43.44,
+            "duration_us": 1270.656,
+            "kernel_name": "fused_conv_relu_pool_kernel",
+            "l1_hit_rate_pct": 1.35,
+            "l2_hit_rate_pct": 96.2,
+            "memory_throughput_pct": 3.69,
+            "registers_per_thread": 64,
+            "shared_mem_per_block_bytes": 39168,
+            "sm_occupancy_pct": 31.6,
+            "tensor_core_utilization_pct": 0.0,
+            "top_stall_reasons": [
+              [
+                "long_scoreboard",
+                5.09
+              ],
+              [
+                "wait",
+                1.08
+              ],
+              [
+                "not_selected",
+                0.47
+              ]
+            ]
+          }
+        ]
+      },
+      "reference_latency_ms": 3.0074880123138428,
+      "speedup_factor": 5.6606636011123594,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX 5090 Mobile sm_100, 82 SMs, 128KB smem/SM, 896 GB/s. FP16 Tensor Cores 210 TFLOPS (FP32 accum) / 420 TFLOPS (FP16 accum). Conv 3x3 with K=32, C=16 -> small GEMM with K=16*9=144, M=32, N=HW/tile.",
+            "notes": "Compute is fused Conv3x3 (C=16, K=32) + ReLU + 2x2 AvgPool. Per output (after pool) flops ~ 2*16*9*32 / 4 = 2304 FLOP per output pixel; output is 360x640*32 = ~7.37M pixels -> ~17 GFLOP. At 31.8 TFLOPS FP32 / 210 TFLOPS TC that's <<1ms compute-bound; this is memory-bandwidth-bound.",
+            "rating_0_to_10": 7.0,
+            "risk": "Tensor core utilization low if we don't tile properly; tiny K dim (16) constrains TC reduction (k=16 fits m16n8k16 exactly once)."
+          },
+          "memory_bandwidth": {
+            "notes": "Input: 1*16*720*1280*2B = ~29.5 MB. Output: 1*32*360*640*2B = ~14.7 MB. Weights: 32*16*9*2B = ~9KB (fits in registers/smem easily). Total traffic ~44 MB; at 896 GB/s lower bound ~50 us. Reference likely already near this; goal is to approach BW limit with a single fused kernel and avoid intermediate writes.",
+            "rating_0_to_10": 9.0,
+            "risk": "Halo overlap in 3x3 stencil tiling causes redundant reads if tiles too small; output pooled 2x2 means each output covers 2x2 conv outputs => natural 2x2 micro-tile per thread."
+          },
+          "register_pressure": {
+            "notes": "Weights (32 out *16 in*9 = 4608 fp16 = 9KB) fit in shared memory comfortably. Per-thread working set: a 2x2 output tile * 32 channels accumulators (FP16/FP32) is feasible but heavy (128 FP32 = 128 regs). Reduce by splitting K across warps or accumulating in FP16.",
+            "rating_0_to_10": 6.0,
+            "risk": "Spills if each thread holds all 32 K accumulators; consider warp partitioning over K or smaller output tiles per thread."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS: (1) Classification: dense stencil + elementwise + reduction (2x2 avg pool). Fully fusable. Shapes fixed: N=1,C=16,H=720,W=1280,K=32, output 32x360x640 fp16. (2) Canonical: out[k,oy,ox] = avg_{dy,dx in 2x2} ReLU( bias[k] + sum_{c,i,j} W[k,c,i,j] * pad(x)[c, 2oy+dy+i-1, 2ox+dx+j-1] ). Pool window is 2x2 over conv output positions (py=2oy+dy, px=2ox+dx, dy,dx in {0,1}). Per pooled output reads a 4x4 input window per channel (plus halo). (3) Layout: NCHW fp16 contiguous; weights tiny; input read with 3x3 stencil reuse. Pool collapses 2x2->1, good arithmetic per byte. (4) Regimes: (a) BW-bound full-size (current case) - dominated by reading 29.5MB input once; (b) compute-bound if K grew large (not here); (c) latency-bound if launch overhead dominates (kernel <100us). (5) Knobs: tile shape (output tile e.g., 8x16 pooled = 16x32 conv), smem staging of input halo, weights in smem/const, K splitting across warps, vectorized half2 loads, MMA vs FFMA, FP16 accum vs FP32, async copy (cp.async), persistent block. (6) Skeleton: each block computes a tile of pooled output (e.g., 8x32 = 256 outputs, 32 channels K split among warps); cooperatively load input halo (Cx(2*tileH+2)x(2*tileW+2)) into smem with cp.async; load weights into smem once; iterate over c and 3x3, compute 2x2 conv outputs per thread, apply ReLU and 2x2 average inline, write half2 to output. (7) Families: (A) Fused single-kernel SIMT FMA tile (best fit, simple, BW-bound) - TOP candidate; (B) Fused with Tensor Core MMA using im2col-in-smem (gemm K=144, M=32, N=tile_pixels) - may help compute but compute is not the limiter; (C) Two-stage conv then pool - worse, extra traffic, rejected. Working set per block (weights 9KB + input tile ~ 16*(2H+2)*(2W+2)*2B for tileH=8,tileW=32 -> 16*18*66*2 ~ 38KB) fits in 128KB smem -> FULL FUSION feasible. Priority: implement (A) first.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_run"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused CUDA kernel: each block computes a tile of pooled output (e.g., 8 pooled rows x 32 pooled cols x all 32 output channels). Cooperatively load the corresponding input halo region (all 16 input channels, (2*tileH+2) x (2*tileW+2)) into shared memory using vectorized half2 loads. Load all 32*16*9 weights into shared memory once at block start. Each thread computes a 2x2 conv-output micro-tile for a subset of K channels, applies ReLU, averages the 2x2 -> 1 pooled output, and writes fp16 result. Use FP32 accumulators for accuracy.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.2,
+          "rationale": "Problem is BW-bound (~44MB traffic, ~50us at peak BW). Full fusion eliminates intermediate conv output (~58MB) and the pool kernel pass; matches reference's structure but with tuned tile/vectorization. Most likely to approach BW limit.",
+          "score_0_to_1": 0.85,
+          "title": "Fused Conv3x3+ReLU+AvgPool2x2 single SIMT kernel with smem input halo"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Tile 8x32 pooled => 16x64 conv outputs; 256 threads/block computing 2x2 each. 32 K accumulators per thread => use K-partitioning: 4 warps along K (8 K each), each thread holds 8 FP32 accum * 4 (2x2) = 32 regs.",
+            "notes": "Plenty of FMA headroom; FP32 accum sufficient for numerics with fp16 inputs. ReLU+pool fold trivially.",
+            "rating_0_to_10": 8.0,
+            "risk": "Halo redundancy small (~12% overhead at tile 32 wide)."
+          },
+          "memory_bandwidth": {
+            "notes": "Single pass over input + single output write + tiny weight load (cached). Approaches theoretical BW lower bound.",
+            "rating_0_to_10": 9.0,
+            "risk": "If tile too small, halo reads inflate input traffic."
+          },
+          "register_pressure": {
+            "notes": "Split K across warps to keep per-thread accumulators ~8 (2x2 *2 sub-channels). Should stay under 64 regs/thread.",
+            "rating_0_to_10": 7.0,
+            "risk": "If each thread owns full K=32, expect spills."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Single fused kernel; cooperatively loads input halo into smem with vectorized float4 loads, then each thread computes a 2x2 conv block, ReLU, and avg-pool for 2 output channels at a time using HFMA2. bottleneck: latency/compute-bound under low occupancy (sm_occupancy=31.6%, compute_throughput=43.44%, memory_throughput=3.69%, achieved BW=33.7 GB/s << peak). L2 hit=96.2% indicates problem fits in L2 so it is NOT global-BW bound. FOLLOW_THROUGH: aligned_with_intent: yes. UPDATE_BELIEF: 5.66x speedup achieved (0.531ms vs 3.007ms ref); far better than expected 1.2x. Compute throughput is moderate and stalls dominated by long_scoreboard (5.09%) suggesting smem latency on the inner 3x3 reads. next bet: Increase occupancy (reduce regs/thread, reduce smem footprint or split work), and/or move to Tensor Cores (m16n8k16) since C_IN=16,K=32 align well. Also try cp.async double-buffer to overlap halo load with compute.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.5312960147857666,
+            "mean_vs_baseline_factor": null,
+            "metrics": {},
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 33.7,
+                  "compute_throughput_pct": 43.44,
+                  "duration_us": 1270.656,
+                  "kernel_name": "fused_conv_relu_pool_kernel",
+                  "l1_hit_rate_pct": 1.35,
+                  "l2_hit_rate_pct": 96.2,
+                  "memory_throughput_pct": 3.69,
+                  "registers_per_thread": 64,
+                  "shared_mem_per_block_bytes": 39168,
+                  "sm_occupancy_pct": 31.6,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      5.09
+                    ],
+                    [
+                      "wait",
+                      1.08
+                    ],
+                    [
+                      "not_selected",
+                      0.47
+                    ]
+                  ]
+                }
+              ]
+            },
+            "reference_latency_ms": 3.0074880123138428,
+            "speedup_factor": 5.6606636011123594,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "8099ef25c0329fa8323eee91f7f652d21d1b076b"
+        }
+      },
+      {
+        "action": {
+          "description": "Fused kernel using Tensor Core MMA (m16n8k16, FP16 in / FP32 accum). Build an implicit im2col view of the 3x3 input patch in shared memory (K_gemm=C*9=144, padded to 160). For each output tile (M=K_out=32, N=tile_pixels e.g., 64 conv output pixels), perform GEMM via MMA, fuse bias+ReLU, then in-register 2x2 average to produce pooled outputs.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "TC offers >6x compute peak, but kernel is BW-bound so upside is modest; useful if SIMT version stalls on issue or if we want to reduce instruction count.",
+          "score_0_to_1": 0.45,
+          "title": "Fused MMA-based Conv+ReLU+Pool with implicit im2col in smem"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "K_gemm=144 with k=16 step = 9 MMA k-steps. M=32 fits 2 MMA tiles vertically (16+16). N tile multiple of 8.",
+            "notes": "Good TC fit but implicit im2col costs smem bandwidth and complexity.",
+            "rating_0_to_10": 7.0,
+            "risk": "Im2col duplication inflates smem traffic; pool reduction across N awkward in MMA fragment layout."
+          },
+          "memory_bandwidth": {
+            "notes": "Same global BW as SIMT version; smem BW higher.",
+            "rating_0_to_10": 7.0,
+            "risk": "Smem bank conflicts on im2col layout."
+          },
+          "register_pressure": {
+            "notes": "MMA fragments compact; should stay moderate.",
+            "rating_0_to_10": 7.0,
+            "risk": "Need careful frag<->pool mapping."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Distinct from n1 because compute path uses MMA instructions and requires im2col-in-smem layout; not combinable with the SIMT 2x2 micro-tile mapping.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Variant of n1 using cp.async (Ampere+) to overlap global->smem input halo loads with compute on previous K-slab / tile. Double-buffer the smem input region. Keep weights resident in smem. Process channels in chunks of 4 or 8 with pipelined loads.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "BW-bound kernel benefits from hiding memory latency via async copies; particularly effective on Blackwell where L2/HBM latency dominates for streaming.",
+          "score_0_to_1": 0.45,
+          "title": "Add cp.async double-buffered pipeline to fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Pipeline depth 2 over C chunks. Need __pipeline_commit/__pipeline_wait_prior.",
+            "notes": "Overlaps load with FMA reduction.",
+            "rating_0_to_10": 8.0,
+            "risk": "Complexity; small benefit if compute already hides latency."
+          },
+          "memory_bandwidth": {
+            "notes": "Same total traffic; better latency hiding.",
+            "rating_0_to_10": 9.0,
+            "risk": "None."
+          },
+          "register_pressure": {
+            "notes": "Double-buffer increases smem use ~2x for staged regions, not registers.",
+            "rating_0_to_10": 7.0,
+            "risk": "Smem capacity per block."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "Downgraded: profiler shows memory_throughput only 3.69% and L2 hit 96.2%, so global-memory latency hiding via cp.async is unlikely to be the biggest win. Keep open but lower priority vs occupancy/MMA paths.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Boost occupancy: reduce reg/smem footprint (output-channel tiling per block, K_OUT split or fp16 accum) on top of n1"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "CHILD of n1. SELF_CHECK: refinement of n1's SIMT design (not a sibling alternative). Target: lift sm_occupancy from 31.6% by lowering registers/thread (64-><=48) and smem (39KB->lower) so more blocks/SM (currently 4 by launch_bounds but limited). Tactics: split K_OUT across blockIdx.z (two halves of 16 outs), use fp16 (__half2) accumulators only where safe, drop per-thread channel-pair unroll. Excludes n1b because it keeps SIMT path (no MMA) and a different memory-pipeline strategy than n3.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "8099ef25c0329fa8323eee91f7f652d21d1b076b",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.15,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Vectorized half8 (uint4) output write + larger pooled tile (16x32) to amortize halo + fewer atomic-like writes"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b",
+        "node_type": "decision",
+        "notes": "CHILD of n1. SELF_CHECK: refinement of n1 tile sizing/output vectorization; mutually exclusive with n1a because it INCREASES tile (and thus smem/regs) rather than decreasing them. Distinct from n3 (no cp.async) and n2 (no MMA). Expected to reduce halo-overhead ratio and improve compute_throughput by raising arithmetic intensity per loaded byte.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "8099ef25c0329fa8323eee91f7f652d21d1b076b",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused Conv2d(3x3, pad=1, C=16->K=32) + ReLU + AvgPool2d(2x2) on a fixed 1x16x720x1280 fp16 NCHW input producing 1x32x360x640 fp16 output on RTX 5090 Mobile. The arithmetic is light (~17 GFLOP) versus ~44 MB of mandatory global traffic, so the kernel is firmly memory-bandwidth-bound (~50us BW lower bound at 896 GB/s). Weights (9KB) and tiles fit easily in shared memory, enabling full single-kernel fusion that eliminates the intermediate conv output. Key constraints: small C (16) and K (32) mean tensor-core utilization is modest; the 2x2 pool naturally pairs with a 2x2 conv-output micro-tile per thread; halo overhead must be minimized via wide tiles (e.g., 32 pooled columns).",
+  "open_questions": [
+    "What is the reference kernel's measured latency on this GPU (to set the speedup target relative to BW-limit ~50us)?",
+    "Does the reference produce fp16 output with the same NCHW contiguous layout, and what is the exact pool divisor (count_include_pad=true default)?",
+    "Is FP16 accumulation acceptable within rtol/atol=0.01, or do we need FP32 accumulators throughout?",
+    "Optimal tile shape (pooled rows x cols) balancing halo overhead, smem capacity, and occupancy on sm_100?",
+    "Does cp.async on sm_100/Blackwell provide measurable latency hiding for this streaming pattern, or are TMA/cluster features preferable?",
+    "Is N always 1 and shape fixed, allowing aggressive compile-time specialization (unrolling C=16, K=32, 3x3)?",
+    "Are output channels K=32 best partitioned across warps (4 warps x 8 K) or held per-thread with vector regs?",
+    "What is the activation distribution post-ReLU - sparsity could enable skipping but probably not worth branching cost?"
+  ]
+}

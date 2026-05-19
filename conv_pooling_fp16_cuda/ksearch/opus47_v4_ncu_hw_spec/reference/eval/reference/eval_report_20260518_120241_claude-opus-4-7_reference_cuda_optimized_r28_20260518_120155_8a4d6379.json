@@ -1,0 +1,42 @@
+{
+  "claude-opus-4-7_reference_cuda_optimized_r28_20260518_120155_8a4d6379": {
+    "status": "passed",
+    "latency_ms": 0.5329920053482056,
+    "reference_latency_ms": 3.0155200958251953,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 5.6577210644184905,
+    "log_excerpt": "PASSED: latency=0.533ms ref=3.016ms speedup=5.66x",
+    "metrics": {},
+    "profiler_metrics": {
+      "kernels": [
+        {
+          "sm_occupancy_pct": 31.6,
+          "compute_throughput_pct": 43.66,
+          "memory_throughput_pct": 3.93,
+          "l1_hit_rate_pct": 1.35,
+          "l2_hit_rate_pct": 96.04,
+          "achieved_bandwidth_gb_s": 35.93,
+          "tensor_core_utilization_pct": 0.0,
+          "registers_per_thread": 64,
+          "shared_mem_per_block_bytes": 39168,
+          "duration_us": 1264.288,
+          "top_stall_reasons": [
+            [
+              "long_scoreboard",
+              5.08
+            ],
+            [
+              "wait",
+              1.08
+            ],
+            [
+              "not_selected",
+              0.47
+            ]
+          ],
+          "kernel_name": "fused_conv_relu_pool_kernel"
+        }
+      ]
+    }
+  }
+}
