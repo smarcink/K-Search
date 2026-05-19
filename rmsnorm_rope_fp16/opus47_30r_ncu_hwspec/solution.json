@@ -1,0 +1,20 @@
+{
+  "name": "claude-opus-4-7_rmsnorm_rope_fp16_r17_20260519_083824_94696c4d",
+  "definition": "rmsnorm_rope_fp16",
+  "author": "claude-opus-4-7",
+  "description": "CUDA Device Bench rmsnorm_rope_fp16 optimization (generated 20260519_083824 uid=94696c4d)",
+  "spec": {
+    "language": "triton",
+    "target_hardware": [
+      "RTX 5090 Mobile"
+    ],
+    "entry_point": "model_new.py::ModelNew",
+    "dependencies": []
+  },
+  "sources": [
+    {
+      "path": "model_new.py",
+      "content": "import torch\nimport math\nfrom torch import nn, Tensor\nimport triton\nimport triton.language as tl\n\n\ndef get_device():\n    if torch.cuda.is_available():\n        return \"cuda\"\n    return \"cpu\"\n\n\ndef precompute_freqs(head_dim: int, seq_len: int, theta: float = 10000.0):\n    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))\n    t = torch.arange(seq_len, dtype=torch.float32)\n    freqs = torch.outer(t, freqs)\n    cos = freqs.cos()\n    sin = freqs.sin()\n    return cos, sin\n\n\n@triton.jit\ndef fused_rmsnorm_rope_kernel(\n    X_ptr, W_ptr, COS_ptr, SIN_ptr, Y_ptr,\n    stride_xb, stride_xs,\n    stride_yb, stride_ys,\n    stride_cs,\n    B, S, D,\n    eps,\n    HALF_C: tl.constexpr,\n    NUM_HEADS_C: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    b = pid // S\n    s = pid % S\n\n    x_row_ptr = X_ptr + b * stride_xb + s * stride_xs\n    y_row_ptr = Y_ptr + b * stride_yb + s * stride_ys\n\n    head_idx = tl.arange(0, NUM_HEADS_C)[:, None]\n    half_idx = tl.arange(0, HALF_C)[None, :]\n    low_offs = head_idx * (2 * HALF_C) + half_idx\n    high_offs = head_idx * (2 * HALF_C) + HALF_C + half_idx\n\n    x_low = tl.load(x_row_ptr + low_offs)\n    x_high = tl.load(x_row_ptr + high_offs)\n    x_low_f = x_low.to(tl.float32)\n    x_high_f = x_high.to(tl.float32)\n\n    sumsq = tl.sum(x_low_f * x_low_f) + tl.sum(x_high_f * x_high_f)\n    mean = sumsq / D\n    rstd = 1.0 / tl.sqrt(mean + eps)\n\n    w_low = tl.load(W_ptr + low_offs).to(tl.float32)\n    w_high = tl.load(W_ptr + high_offs).to(tl.float32)\n\n    n_low = x_low_f * rstd * w_low\n    n_high = x_high_f * rstd * w_high\n\n    cos = tl.load(COS_ptr + s * stride_cs + tl.arange(0, HALF_C)).to(tl.float32)[None, :]\n    sin = tl.load(SIN_ptr + s * stride_cs + tl.arange(0, HALF_C)).to(tl.float32)[None, :]\n\n    out_low = n_low * cos - n_high * sin\n    out_high = n_low * sin + n_high * cos\n\n    tl.store(y_row_ptr + low_offs, out_low.to(tl.float16))\n    tl.store(y_row_ptr + high_offs, out_high.to(tl.float16))\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim=4096, num_heads=32, seq_len=2048, eps=1e-6):\n        super().__init__()\n        self.dim = dim\n        self.num_heads = num_heads\n        self.head_dim = dim // num_heads\n        self.eps = eps\n\n        self.weight = nn.Parameter(torch.ones(dim))\n\n        cos, sin = precompute_freqs(self.head_dim, seq_len)\n        self.register_buffer(\"rope_cos\", cos)\n        self.register_buffer(\"rope_sin\", sin)\n\n        self.half()\n\n    def forward(self, x: Tensor) -> Tensor:\n        B, S, D = x.shape\n        assert D == self.dim\n        y = torch.empty_like(x)\n\n        cos = self.rope_cos\n        sin = self.rope_sin\n\n        total = B * S\n        grid = (total,)\n        fused_rmsnorm_rope_kernel[grid](\n            x, self.weight, cos, sin, y,\n            x.stride(0), x.stride(1),\n            y.stride(0), y.stride(1),\n            cos.stride(0),\n            B, S, D,\n            self.eps,\n            HALF_C=self.head_dim // 2,\n            NUM_HEADS_C=self.num_heads,\n            num_warps=8,\n            num_stages=2,\n        )\n        return y"
+    }
+  ]
+}

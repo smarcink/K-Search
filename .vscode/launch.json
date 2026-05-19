@@ -93,6 +93,52 @@
                 "--atol", "1e-2",
                 //"--shape", "16", "2048", "2048"
             ]
+        },
+        {
+            "name": "Generate RMSNorm+RoPE fp16 Triton kernel",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/generate_kernels_and_eval.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "justMyCode": true,
+            "envFile": "${workspaceFolder}/.env",
+            "args": [
+                "--task-path", "rmsnorm_rope_fp16/rmsnorm_rope_fp16.py",
+                "--base-url", "https://gnai.intel.com/api/providers/openai/v1",           
+                "--model-name", "claude-opus-4-7",
+                "--language", "triton",
+                "--triton-device", "cuda:0",
+                //"--target-gpu", "RTX 5090 Mobile",
+                "--hw-spec", "k_search/hw_specs/specs/rtx_5090_mobile.json",
+                "--wm-stagnation-window", "5",
+                "--max-opt-rounds", "30",
+                "--world-model",
+                "--enable-profiling", "--verbose",
+                "--save-solutions",
+                "--artifacts-dir", "rmsnorm_rope_fp16/ksearch/opus47_30r_ncu_hwspec"
+            ]
+        },
+        {
+            "name": "Compare RMSNorm+RoPE fp16 implementations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/compare_kernels.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "justMyCode": true,
+            "args": [
+                "rmsnorm_rope_fp16/rmsnorm_rope_fp16.py",
+                "rmsnorm_rope_fp16/opus47_30r",
+                "rmsnorm_rope_fp16/opus47_30r_ncu_hwspec",
+                "--precision", "fp16",
+                "--warmup", "100",
+                "--iters", "1000",
+                "--atol", "1e-2",
+                "--compile-mode", "default"
+            ]
         }
     ]
 }

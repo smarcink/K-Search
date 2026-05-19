@@ -1,0 +1,17 @@
+{
+  "task": "rmsnorm_rope_fp16",
+  "problem": "rmsnorm_rope_fp16",
+  "device": "cuda:0",
+  "precision": "fp16",
+  "solutions": [
+    {
+      "solution": "claude-opus-4-7_rmsnorm_rope_fp16_r17_20260519_083824_94696c4d",
+      "status": "passed",
+      "speedup_over_eager": 15.7974,
+      "speedup_over_compile": 1.2999,
+      "latency_ms": 0.3564,
+      "score_name": "speedup_over_compile",
+      "score": 1.2999
+    }
+  ]
+}

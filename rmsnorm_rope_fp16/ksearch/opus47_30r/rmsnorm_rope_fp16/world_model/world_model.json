@@ -1,0 +1,567 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 0.3471,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 5.6066,
+      "speedup_factor": 1.3409,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n7",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090M Blackwell, 82 SMs, 896GB/s GDDR7. fp16 elementwise + small reduction. Tensor cores not useful here.",
+            "notes": "Memory-bound fused elementwise+reduction; arithmetic is cheap (rsqrt + multiply + two muladds).",
+            "rating_0_to_10": 7.0,
+            "risk": "Low: workload is BW-limited"
+          },
+          "memory_bandwidth": {
+            "notes": "Working set: x (8*2048*4096*2B=128MB) + weight (4096*2B=8KB) + cos/sin (2048*64*4B=512KB). Output 128MB. Total ~256MB DRAM traffic if fully fused. Lower bound latency ~256e6/896e9 \u2248 0.286 ms.",
+            "rating_0_to_10": 9.0,
+            "risk": "Reading x twice (variance pass + apply) doubles read traffic unless we do single-pass with welford or just load-all-into-registers since head_dim*num_heads=4096 fits per row."
+          },
+          "register_pressure": {
+            "notes": "Per (B,S) row we have 4096 fp16 = 8KB activations. BLOCK over D=4096 with one program per (B*S) row, load full row into shared/registers \u2014 feasible at BLOCK_D=4096.",
+            "rating_0_to_10": 6.0,
+            "risk": "Holding 4096 fp16 in registers per program may spill; better to use shared memory or tile but recompute mean."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS:\n1) Classification: fused elementwise + per-row reduction (RMSNorm) + elementwise gather (cos/sin) + pairwise rotation (RoPE). Memory bound.\n2) Math: For each (b,s): var = mean(x^2), inv = rsqrt(var+eps); y = x*inv*w; then for each head h and pair i in [0,half): y1=y[2i], y2=y[half+i] (within head); out[..,i]=y1*cos[s,i]-y2*sin[s,i]; out[..,half+i]=y1*sin[s,i]+y2*cos[s,i]. cos/sin shape (S, head_dim/2) shared across batch & heads.\n3) Layout: x (B,S,D) contiguous, D=4096; reshape to (B,S,H=32,Hd=128). RMSNorm reduces over D=4096. cos/sin (S,64) fp32 (from precompute, .half() doesn't convert buffers registered after? actually .half() converts module incl buffers -> cos/sin become fp16).\n4) Regimes: (a) Large batch (current 8*2048=16384 rows): plenty of parallelism, BW-bound. (b) Small batch: latency-bound, want fewer kernel launches. (c) Very long seq: cos/sin reuse via L2.\n5) Knobs: one program per row vs per (row, head); single-pass (compute sum of squares, then second pass over same row reloaded from regs/SMEM) vs two-pass; block size for D; whether to keep row in SMEM (8KB) or registers; vectorized loads (fp16x8); cos/sin cached in shared.\n6) Skeleton: grid=(B*S,). Each program loads full row D=4096 fp16 into SMEM/registers using a loop with BLOCK=1024 or single BLOCK=4096. Compute sum of squares in fp32, rsqrt. Second loop: multiply by w and inv, then within each head, do RoPE using cos/sin loaded once per program (since same s). Store.\n7) Families: (A) Single fused row-kernel holding row in registers/SMEM \u2014 TOP. (B) Two kernels: RMSNorm then RoPE \u2014 extra DRAM RT. (C) Per-(row,head) kernel with shared mean via atomics or 2-pass \u2014 complex.\nFull-fusion is feasible: 8KB row fits easily in SMEM (128KB/SM). Top candidate is single fused kernel.\nSELF_CHECK n/a (root).",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single Triton kernel with grid=(B*S,). Each program loads the entire D=4096 fp16 row into shared memory, computes sum-of-squares in fp32, rsqrt, then applies weight and RoPE rotation per-head using cos/sin loaded once per row. Store result. Use BLOCK_D=4096 (constexpr) or tiled with two passes if register pressure too high.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.38,
+          "rationale": "Reads x once, writes out once; minimal global traffic ~256MB, near peak BW. Avoids torch.compile's likely 2-kernel split (norm then rope) and extra cat allocation.",
+          "score_0_to_1": 0.85,
+          "title": "Fused RMSNorm+RoPE single-row kernel (full fusion)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Row=8KB fits easily in 128KB SMEM; 16384 programs across 82 SMs \u2248200 programs/SM, plenty.",
+            "notes": "BW-bound; tensor cores unused (elementwise)",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "x is read ~2x due to partner gather; could halve reads",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_D=4096 with num_warps=8 ~128 regs/thread, fits",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: Best so far at 1.3826x (0.354ms). Bottleneck: bandwidth \u2014 each row loads X twice (own+partner) and W twice. Next composable refinement: single-load rotation using split halves + tl.where, no XOR reload.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.354,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.354,
+              "ref_eager_time_ms": 5.6311,
+              "score": 1.3826,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3826,
+              "speedup_over_eager": 15.9065
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 5.6311,
+            "speedup_factor": 1.3826,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "67dbd16375526c5a5c8f1167b3156858fec07f2e"
+        }
+      },
+      {
+        "action": {
+          "description": "On top of fused n1: use vectorized loads/stores (tl.load on 128-bit chunks) and cache cos/sin for the row in shared/registers once (only 64 fp16 each). Choose num_warps=4 or 8 and explore BLOCK_D=2048 with a 2-pass reduction to lower register pressure if needed.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.36,
+          "rationale": "Vectorized memory ops critical to saturate 896GB/s; caching cos/sin avoids redundant loads across 32 heads.",
+          "score_0_to_1": 0.25,
+          "title": "Tune fused kernel: avoid partner reload, vectorize, tune warps"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "num_warps tuning affects occupancy vs registers.",
+            "notes": "bandwidth-bound",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "partner reload doubles X/W reads",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_D=4096 with num_warps=8 is fine",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "CURRENT: Fused RMSNorm+RoPE single-row kernel; current_code matches n1 (partner via XOR reload, no cos/sin caching beyond per-row load). Bottleneck: memory bandwidth (B*S=16384 rows, each loading X 2x and W 2x via XOR partner). FOLLOW_THROUGH: aligned_with_intent=no; n3 intended to vectorize loads and cache cos/sin/W to avoid partner reload, but current_code still reloads partner. UPDATE_BELIEF: n3 attempt regressed to 1.3562x vs n1 1.3826x; partner reload + extra loads didn't help, likely due to L2 already caching. PERF_GAP: predicted 1.7x baseline, observed 1.3562x; over-optimistic on bandwidth headroom. Next bet: avoid partner reload by computing both halves in one pass (load X/W once, do rotation via tl.where on halves).",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.3856,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.3856,
+              "ref_eager_time_ms": 5.9362,
+              "score": 1.3562,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3562,
+              "speedup_over_eager": 15.3951
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 5.9362,
+            "speedup_factor": 1.3562,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "3140b9db21fb5f41a2e75be4b9caa6f9cd86b39f"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.7,
+          "rationale": "",
+          "score_0_to_1": 0.45,
+          "title": "Refine fused: cache cos/sin per row, vectorized 128-bit IO, drop partner W reload"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Memory bound",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Partner reloads waste BW",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "D=4096 already in regs",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n4",
+        "node_type": "decision",
+        "notes": "CURRENT: Fused RMSNorm+RoPE single-row kernel; loads X and W twice (own + partner) and cos/sin via gather. Bottleneck: memory bandwidth + redundant loads.\nFOLLOW_THROUGH: aligned_with_intent: partial. Intent was to cache cos/sin in regs, vectorize 128b IO, and drop partner W reload; actual code still reloads partner X AND partner W and does not vectorize.\nUPDATE_BELIEF: n4 regressed slightly vs n1 (1.356x vs 1.383x). Partner reloads + extra gather indexing added overhead without payoff. Next bet: avoid partner load entirely by using tl.reshape/tl.permute to split row into (H,2,HALF) then apply RoPE pairwise within registers (no second tl.load).\nPERF_GAP: expected 1.7x vs observed 1.356x; reason: partner loads not eliminated and no vectorization gain because Triton already coalesces full-row contiguous loads.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.346,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.346,
+              "ref_eager_time_ms": 5.6092,
+              "score": 1.3563,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3563,
+              "speedup_over_eager": 16.2111
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 5.6092,
+            "speedup_factor": 1.3563,
+            "status": "passed"
+          },
+          "parent_solution_id": "67dbd16375526c5a5c8f1167b3156858fec07f2e",
+          "solution_id": "635c032d9c3d073777e2fa674c8176ac2609a2ac"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.8,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Persistent/grid-strided kernel: one program per (B,S) batch chunk, reuse W and cos/sin in SMEM"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "needs occupancy tuning on sm_100",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "W loaded once per block, reused across rows",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "persistent loop pressures regs",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n5",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n1, alternative to n4 (mutually exclusive tactic: n4 caches per-row in regs; n5 amortizes via persistent block processing multiple rows sharing W and cos/sin in SMEM). Targets L2/SMEM reuse since W (4096 fp16=8KB) and cos/sin per s small. Risk: occupancy reduction with 82 SMs and 16384 rows.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "67dbd16375526c5a5c8f1167b3156858fec07f2e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.6,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Eliminate partner reload via single-load + in-register rotate"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "still bandwidth-bound but closer to peak",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "removes 2nd X/W load (~halves X+W traffic)",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "single BLOCK_D=4096 fp32 vector held",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n6",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n1, distinct from n4 (regs cache cos/sin) and n5 (persistent blocks). Tactic: load X and W ONCE per row (no XOR partner reload), then within each head pair compute normed_first and normed_second together using contiguous BLOCK_D layout and tl.where on parity; halves global memory traffic for X and W (biggest bandwidth term). Also load cos/sin as HALF=64 once per row via small contiguous tl.load.",
+        "overall_rating_0_to_10": 0.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "67dbd16375526c5a5c8f1167b3156858fec07f2e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.55,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Single-load rotation: split halves, no partner reload"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n7",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Fused RMSNorm+RoPE single-row kernel; loads xa/xb (two halves) and per-head weights, computes rstd, applies rotation with cos/sin broadcast across heads. bottleneck: memory bandwidth (small per-row work, 4KB row in fp16) + kernel launch overhead. FOLLOW_THROUGH: aligned_with_intent: yes; loads x once split into halves with no partner reload. UPDATE_BELIEF: Result 1.34x is slightly worse than parent n1 (1.38x), suggesting the split-half indexing did not help and added some address-compute overhead. PERF_GAP: expected 1.55x vs observed 1.34x; likely because parent already loads each element once via XOR partner pattern, so 'single-load' wasn't actually saving bandwidth, and broadcast reshape may add overhead. next bet: try multi-row per program to amortize launch overhead and improve occupancy, or cache cos/sin in shared/registers across heads more efficiently.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.3471,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.3471,
+              "ref_eager_time_ms": 5.6066,
+              "score": 1.3409,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3409,
+              "speedup_over_eager": 16.1513
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 5.6066,
+            "speedup_factor": 1.3409,
+            "status": "passed"
+          },
+          "parent_solution_id": "67dbd16375526c5a5c8f1167b3156858fec07f2e",
+          "solution_id": "331fc0316d26fd7a9bc8abcee44dd5593b12ef08"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.5,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "num_warps tuning affects occupancy vs registers.",
+            "notes": "bandwidth-bound",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "partner reload doubles X/W reads",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_D=4096 with num_warps=8 is fine",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 15,
+        "node_id": "node_rmsnorm_rope_fp16_r15_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "n3",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "3140b9db21fb5f41a2e75be4b9caa6f9cd86b39f",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.6,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Eliminate partner load via in-register pair shuffle (reshape row to (H,2,HALF))"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n4_child_pairwise",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n4 (composable). Tactic: load X and W exactly once, then reshape normed to (H,2,HALF) and apply RoPE as (a,b)->(a*cos-b*sin, a*sin+b*cos) entirely in registers, removing all partner tl.load and gather index math.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n4",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "635c032d9c3d073777e2fa674c8176ac2609a2ac",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.6,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Process multiple rows per program to amortize W and cos/sin loads"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n8_multirow",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: sibling to n4/n5/n6/n7, mutually exclusive tactic \u2014 n8 amortizes W reuse across ROWS_PER_PROG rows per program (W loaded once, cos/sin shared across batch dim), whereas n4 caches per-row, n5 uses persistent blocks, n6 loads X/W once per row. Tradeoff: more regs but fewer global loads of W (4096 fp16 = 8KB per row).",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "67dbd16375526c5a5c8f1167b3156858fec07f2e",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "Process multiple rows per program to amortize launch overhead"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n7_multirow",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child refinement of n7 (composable). Tactic: each program handles ROWS_PER_PROG rows (e.g. 2-4), reusing cos/sin loads for the same seq positions when grouped by s, and reducing the number of programs (B*S/ROWS_PER_PROG). Reduces launch/scheduling overhead and increases per-program arithmetic intensity. Risk: register pressure since each row has 4096 fp16 elements; may need to keep rows small. Expected: small but real gain over 1.34x.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n7",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "331fc0316d26fd7a9bc8abcee44dd5593b12ef08",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused RMSNorm + Rotary Position Embedding on fp16 (B=8,S=2048,D=4096,H=32,Hd=128). Per row (b,s): compute mean(x^2) over D, rsqrt, multiply by learnable weight, reshape to heads, apply rotate_half RoPE using precomputed cos/sin of shape (S, Hd/2). Memory-bound: ~256MB of essential DRAM traffic; lower bound ~0.29ms at 896GB/s. Key constraints: row size 8KB fits easily in SMEM; cos/sin shared across batch and heads (only 64 values per s); want single fused kernel to avoid intermediate writeback that torch.compile likely does.",
+  "open_questions": [
+    "Does .half() convert rope_cos/rope_sin buffers to fp16? (Yes\u2014nn.Module.half() converts buffers too; need to verify and load accordingly.)",
+    "Best BLOCK_D and num_warps for D=4096 fp16 on Blackwell SM_100 to balance occupancy vs spills?",
+    "Single-pass keep-row-in-registers vs two-pass reload (reload from global vs from shared) \u2014 which wins on RTX5090M?",
+    "Is the output layout after reshape((B,S,D)) bit-identical to writing in head-major order? (Yes since head_dim contiguous segments concatenate to D.)",
+    "Does the reference's torch.cat along last dim produce [first half rotated, second half rotated] per head? confirmed \u2014 must store into [..., :half] and [..., half:] of each head's slice.",
+    "Should we use fp32 accumulation for sum-of-squares (yes, matches reference) and what tolerance does the eval use?",
+    "Are cos/sin stored fp16 after .half() \u2014 precision sufficient? Reference also casts via multiplication with fp16 normed.",
+    "Can we further fuse the final reshape (it's a no-op view since head_dim*num_heads==dim with contiguous layout)?"
+  ]
+}

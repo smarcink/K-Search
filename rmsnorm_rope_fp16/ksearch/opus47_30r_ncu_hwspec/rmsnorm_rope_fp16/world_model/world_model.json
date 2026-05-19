@@ -1,0 +1,723 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 0.3555,
+      "mean_vs_baseline_factor": null,
+      "profiler": {
+        "kernels": [
+          {
+            "achieved_bandwidth_gb_s": 481.84,
+            "compute_throughput_pct": 37.6,
+            "duration_us": 516.128,
+            "kernel_name": "fused_rmsnorm_rope_kernel",
+            "l1_hit_rate_pct": 35.12,
+            "l2_hit_rate_pct": 4.76,
+            "memory_throughput_pct": 52.7,
+            "registers_per_thread": 48,
+            "shared_mem_per_block_bytes": 4096,
+            "sm_occupancy_pct": 80.32,
+            "tensor_core_utilization_pct": 0.0,
+            "top_stall_reasons": [
+              [
+                "long_scoreboard",
+                11.88
+              ],
+              [
+                "short_scoreboard",
+                2.35
+              ],
+              [
+                "wait",
+                1.25
+              ]
+            ]
+          }
+        ],
+        "profiler_backend": "ncu"
+      },
+      "reference_latency_ms": 5.6455,
+      "speedup_factor": 1.3309,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "node_rmsnorm_rope_r18_contig_load",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Dim=4096 fits one block row (8KB fp16); head_dim=128, half=64. RoPE tables (S,half)=(2048,64) fp32=512KB total; loaded per-block from L2.",
+            "notes": "Memory-bound op. Total bytes ~ 2*B*S*D*2 = 2*8*2048*4096*2 = 256MB read+write. At 896GB/s peak -> ~0.29ms lower bound.",
+            "rating_0_to_10": 7.0,
+            "risk": "Reaching peak BW requires fully coalesced fp16 loads/stores and minimal extra traffic."
+          },
+          "memory_bandwidth": {
+            "notes": "Dominant cost is reading x (128MB) + writing y (128MB) + small weight/cos/sin reuse. Must avoid intermediate global tensors.",
+            "rating_0_to_10": 8.0,
+            "risk": "torch.compile likely fuses similarly; need single-kernel fusion to beat it."
+          },
+          "register_pressure": {
+            "notes": "Per row (B*S row of D=4096 fp16): 4096 fp16 = 8KB in registers if fully kept. With block_size=D treating 1 row per block, doable.",
+            "rating_0_to_10": 6.0,
+            "risk": "Holding entire row in registers needs careful tile sizing; otherwise stage in shared mem."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: elementwise+reduction fusion (RMSNorm reduction over D=4096 + elementwise multiply with weight + RoPE rotation over head_dim pairs). Output (B,S,D) fp16. 2) Math: per (b,s) row, var=mean(x^2), inv=rsqrt(var+eps); n_i=x_i*inv*w_i (fp16). Then for each head h, pairs (i,i+half) with half=64: y[..,i]=n_i*cos[s,i]-n_{i+half}*sin[s,i]; y[..,i+half]=n_i*sin[s,i]+n_{i+half}*cos[s,i]. cos/sin shared across heads. 3) Layout: x contiguous (B,S,D); per row of D=4096 contains 32 heads of 128. RoPE cos/sin (S,64) fp32 broadcast. weight (D,) fp16. 4) Regimes: small-batch latency-bound; this case B*S=16384 rows, D=4096 -> 16384 blocks, plenty of parallelism, BW-bound. 5) Knobs: one program per (b,s) row, BLOCK_D covers full 4096 in one pass; load x row once, compute sum-of-squares in fp32, then second pass to write normed*rope. Alternatively single-pass keep x in regs. Cast cos/sin to fp16 once or on the fly. 6) Skeleton: pid=row_id; offs=arange(D); x=load; xf=x.to(fp32); ss=sum(xf*xf); inv=rsqrt(ss/D+eps); n=(xf*inv)*w; reshape implicit: split D into (32 heads,128); for each pair index i in [0,half), load cos[s,i], sin[s,i]; compute. Use index tricks: half-mask. 7) Families: (a) Single-kernel full fusion 1 row/program (TOP - working set ~8KB fits in regs); (b) Two-pass kernel (rmsnorm then rope) - extra global RT, worse; (c) Tile over D with shared-mem reduction - unnecessary since row fits.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single Triton kernel: one program per (B*S) row. Load the full D=4096 fp16 row into registers, compute sum-of-squares in fp32, rsqrt, multiply by weight, then apply RoPE by loading cos/sin (head_dim/2=64) once and broadcasting across 32 heads. Write output. BLOCK_D=4096 or split into 2 chunks if needed. Use num_warps=8 and num_stages=1-2.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "Eliminates intermediate global tensors and matches BW roofline. Single pass over x.",
+          "score_0_to_1": 0.8,
+          "title": "Fused RMSNorm+RoPE single-row kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "16384 rows -> >>82 SMs, plenty of parallelism. BLOCK_D=4096 with 8 warps gives 16 elements/thread.",
+            "notes": "No tensor core use needed; element-wise + reduction fits SIMT.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 477 GB/s of 896; strided low/high access pattern limits coalescing.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "40 regs/thread, fits easily.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single Triton kernel, one program per (B*S) row; loads full 4096-D row, computes RMSNorm in fp32, applies RoPE with cos/sin broadcast across 32 heads, writes fp16. bottleneck=memory bandwidth (achieved 477/896 GB/s = 53%, compute 24%, TC 0%, top stall=long scoreboard).\nFOLLOW_THROUGH: aligned_with_intent=yes; implementation matches single-row fused intent.\nUPDATE_BELIEF: Eval shows 1.36x over compile, 16.4x over eager at 0.344ms. Occupancy is high (95%) but BW only 53%; loads are stalling on long scoreboard, suggesting vectorization/coalescing or async copy could lift BW closer to roofline. Next bet: improve memory throughput via wider vector loads (interleaved [low,high] contiguous layout), reduce strided gather of low/high pairs, and tune num_warps.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.3436,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.3436,
+              "ref_eager_time_ms": 5.6272,
+              "score": 1.3556,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3556,
+              "speedup_over_eager": 16.3791
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 476.75,
+                  "compute_throughput_pct": 23.86,
+                  "duration_us": 499.872,
+                  "kernel_name": "fused_rmsnorm_rope_kernel",
+                  "l1_hit_rate_pct": 37.35,
+                  "l2_hit_rate_pct": 1.48,
+                  "memory_throughput_pct": 52.15,
+                  "registers_per_thread": 40,
+                  "shared_mem_per_block_bytes": 32,
+                  "sm_occupancy_pct": 95.18,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      27.31
+                    ],
+                    [
+                      "short_scoreboard",
+                      3.31
+                    ],
+                    [
+                      "wait",
+                      1.32
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 5.6272,
+            "speedup_factor": 1.3556,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "3a222d92c1fef319d8a1f28e74dd5b26399e7271"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.7,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Vectorized contiguous load + autotune num_warps/stages"
+        },
+        "choice": "vectorized+autotune",
+        "confidence_0_to_1": 0.7,
+        "decision": "applied",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "No tensor cores; elementwise; can fuse more rows",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "500GB/s achieved; reloading W each row wastes BW",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "30 regs/thread, headroom available",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_child1",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Single-program-per-row fused RMSNorm+RoPE with 2D (heads, half) tiling, autotuned num_warps/num_stages. bottleneck: memory bandwidth (500GB/s of 896GB/s, 54% mem throughput, long_scoreboard stalls dominate). FOLLOW_THROUGH: aligned_with_intent: yes. UPDATE_BELIEF: Autotune+vectorization gave only 1.33x (vs 1.36x previous baseline) \u2014 slight regression. Compute throughput rose (23->47%) but mem throughput barely moved; we're saturating something other than raw BW. Next bet: process multiple rows per program to reuse W/cos/sin in registers and amortize loads, raising arithmetic intensity. PERF_GAP: expected 1.70x vs observed 1.33x; reason: per-row kernel still bound by long_scoreboard global load latency; W and cos/sin reload every row.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.3478,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.3478,
+              "ref_eager_time_ms": 5.6267,
+              "score": 1.3332,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3332,
+              "speedup_over_eager": 16.1766
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 500.76,
+                  "compute_throughput_pct": 47.27,
+                  "duration_us": 499.52,
+                  "kernel_name": "fused_rmsnorm_rope_kernel",
+                  "l1_hit_rate_pct": 41.84,
+                  "l2_hit_rate_pct": 1.47,
+                  "memory_throughput_pct": 54.78,
+                  "registers_per_thread": 30,
+                  "shared_mem_per_block_bytes": 64,
+                  "sm_occupancy_pct": 94.23,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      9.75
+                    ],
+                    [
+                      "short_scoreboard",
+                      3.59
+                    ],
+                    [
+                      "not_selected",
+                      1.96
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 5.6267,
+            "speedup_factor": 1.3332,
+            "status": "passed"
+          },
+          "parent_solution_id": "3a222d92c1fef319d8a1f28e74dd5b26399e7271",
+          "solution_id": "384ca38e08b2f981c98a66584afc3ae6ca72fa76"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.94,
+          "rationale": "",
+          "score_0_to_1": 0.85,
+          "title": "Fused RMSNorm+RoPE single-row kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "no tensor cores used; elementwise",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "reusing W and cos/sin across rows should cut loads",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "multi-row increases live regs; current 40 regs/thread leaves headroom",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_child2",
+        "node_type": "decision",
+        "notes": "CURRENT: does=fused RMSNorm+RoPE per (B,S) row in one kernel with 2D tile over heads x half_dim; bottleneck=memory bandwidth (490 GB/s of 896, 53.7% mem throughput, 22.5% compute). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 1.94x speedup achieved; long_scoreboard (25%) suggests load latency dominates. Next bet: vectorize loads (tl.load with larger contiguous chunks), reduce redundant cos/sin loads, or try processing multiple rows per program to amortize.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.356,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.356,
+              "ref_eager_time_ms": 5.7844,
+              "score": 1.9436,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.9436,
+              "speedup_over_eager": 16.2496
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 490.79,
+                  "compute_throughput_pct": 22.56,
+                  "duration_us": 536.288,
+                  "kernel_name": "fused_rmsnorm_rope_kernel",
+                  "l1_hit_rate_pct": 37.35,
+                  "l2_hit_rate_pct": 1.0,
+                  "memory_throughput_pct": 53.68,
+                  "registers_per_thread": 40,
+                  "shared_mem_per_block_bytes": 32,
+                  "sm_occupancy_pct": 95.09,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      25.42
+                    ],
+                    [
+                      "short_scoreboard",
+                      3.3
+                    ],
+                    [
+                      "wait",
+                      1.29
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 5.7844,
+            "speedup_factor": 1.9436,
+            "status": "passed"
+          },
+          "parent_solution_id": "3a222d92c1fef319d8a1f28e74dd5b26399e7271",
+          "solution_id": "e43d074bf4d0fdde76105c4dea7f6a66111ec5b8"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.7,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "No tensor cores; elementwise; can fuse more rows",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "500GB/s achieved; reloading W each row wastes BW",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "30 regs/thread, headroom available",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 12,
+        "node_id": "node_rmsnorm_rope_fp16_r12_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1_child1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "384ca38e08b2f981c98a66584afc3ae6ca72fa76",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.37,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.78,
+          "title": "Fused fp16 cos|sin combined table"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.8,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "no tensor cores used; elementwise",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "reusing W and cos/sin across rows should cut loads",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "multi-row increases live regs; current 40 regs/thread leaves headroom",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 17,
+        "node_id": "node_rmsnorm_rope_fp16_r17_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Fused RMSNorm+RoPE single-row kernel with fp16 combined cos|sin table; one program per (B,S) row, loads X/W as (NUM_HEADS, HALF) tiles. bottleneck=memory bandwidth (51.94% mem throughput, 23.55% compute, occupancy 95%, long_scoreboard 26.59%). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: combined cs table reduced loads; speedup 1.37x at 0.358ms, 475 GB/s of 896 GB/s peak (~53%). next bet: reduce address arithmetic and improve coalescing by loading X[row,:] and W[:] as flat contiguous 1D vectors via tl.arange(0,D), then split halves in registers \u2014 fewer pointer offsets, better vectorized 128-bit loads.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n1_child2",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.3581,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.3581,
+              "ref_eager_time_ms": 5.6526,
+              "score": 1.3654,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3654,
+              "speedup_over_eager": 15.7865
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 474.86,
+                  "compute_throughput_pct": 23.55,
+                  "duration_us": 510.688,
+                  "kernel_name": "fused_rmsnorm_rope_kernel",
+                  "l1_hit_rate_pct": 37.34,
+                  "l2_hit_rate_pct": 1.51,
+                  "memory_throughput_pct": 51.94,
+                  "registers_per_thread": 40,
+                  "shared_mem_per_block_bytes": 32,
+                  "sm_occupancy_pct": 95.3,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      26.59
+                    ],
+                    [
+                      "short_scoreboard",
+                      3.42
+                    ],
+                    [
+                      "wait",
+                      1.3
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 5.6526,
+            "speedup_factor": 1.3654,
+            "status": "passed"
+          },
+          "parent_solution_id": "e43d074bf4d0fdde76105c4dea7f6a66111ec5b8",
+          "solution_id": "c8f2e2f10118ef6090ef6b9e618441fa896cd6a0"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Load X/W as contiguous 1D vectors, split halves in registers"
+        },
+        "choice": "Contiguous 1D load + register reshape",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "No tensor cores; 37% compute throughput; reduction-style splitting via mask is wasteful.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 481 GB/s of 896 GB/s peak; still memory-bound.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "48 regs/thread; reshape+masked sums add register usage.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_rmsnorm_rope_r18_contig_load",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Loads whole row contiguously, computes RMSNorm, reshapes to (H,2,HALF) and uses masked sums to split low/high halves before RoPE rotation. bottleneck: memory bandwidth (52% mem, 482 GB/s) with extra compute from mask-based split. FOLLOW_THROUGH: aligned_with_intent: yes. UPDATE_BELIEF: speedup 1.33x vs compile, slightly worse than parent (1.37x) \u2014 the mask-based reshape split adds overhead vs strided loads. next bet: try loading low/high halves directly with strided index patterns (no reshape+mask), or process multiple rows per program to amortize cos/sin loads.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "node_rmsnorm_rope_fp16_r17_cont_1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.3555,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.3555,
+              "ref_eager_time_ms": 5.6455,
+              "score": 1.3309,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 1.3309,
+              "speedup_over_eager": 15.8822
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 481.84,
+                  "compute_throughput_pct": 37.6,
+                  "duration_us": 516.128,
+                  "kernel_name": "fused_rmsnorm_rope_kernel",
+                  "l1_hit_rate_pct": 35.12,
+                  "l2_hit_rate_pct": 4.76,
+                  "memory_throughput_pct": 52.7,
+                  "registers_per_thread": 48,
+                  "shared_mem_per_block_bytes": 4096,
+                  "sm_occupancy_pct": 80.32,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      11.88
+                    ],
+                    [
+                      "short_scoreboard",
+                      2.35
+                    ],
+                    [
+                      "wait",
+                      1.25
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 5.6455,
+            "speedup_factor": 1.3309,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "c29cbb3a0b5ee2ad52fe38894c6a906b53bde01b"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.55,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Tile ROWS_PER_PROG=2-4 rows per program to amortize cos/sin loads and improve ILP"
+        },
+        "choice": "Process multiple rows per program",
+        "confidence_0_to_1": 0.5,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_rmsnorm_rope_r25_multirow",
+        "node_type": "decision",
+        "notes": "PLAN: each program handles ROWS_PER_PROG rows from the same batch; reuse cos/sin loads across rows (broadcast). Reduces grid size, improves ILP, may raise compute_throughput from 23%. SELF_CHECK: alternative to r18 (contig load) \u2014 explores cross-row reuse rather than per-row layout; mutually exclusive design choice for next experiment slot.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "node_rmsnorm_rope_fp16_r17_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "c8f2e2f10118ef6090ef6b9e618441fa896cd6a0",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck indicated by the latest eval on the best solution, without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The best solution should always have a continuation path for further improvement.",
+          "score_0_to_1": 0.6,
+          "title": "Refine best solution: target the top bottleneck"
+        },
+        "choice": "Next-step refinement of best solution",
+        "confidence_0_to_1": 0.9,
+        "decision": "Continue from best",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "no tensor cores used; elementwise",
+            "rating_0_to_10": 5.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "reusing W and cos/sin across rows should cut loads",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "multi-row increases live regs; current 40 regs/thread leaves headroom",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 29,
+        "node_id": "node_best_cont_r29_1",
+        "node_type": "decision",
+        "notes": "AUTO_BEST_CONTINUATION: the best-performing node had no open children. Inserting a continuation action to keep exploring from the best solution.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "n1_child2",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "e43d074bf4d0fdde76105c4dea7f6a66111ec5b8",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "No tensor cores; 37% compute throughput; reduction-style splitting via mask is wasteful.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 481 GB/s of 896 GB/s peak; still memory-bound.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "48 regs/thread; reshape+masked sums add register usage.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 30,
+        "node_id": "node_rmsnorm_rope_fp16_r30_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "node_rmsnorm_rope_r18_contig_load",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "c29cbb3a0b5ee2ad52fe38894c6a906b53bde01b",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused RMSNorm + rotate_half RoPE on fp16 (B=8,S=2048,D=4096,heads=32,head_dim=128). Per (b,s) row: reduce sum(x^2) over D (fp32 accum), scale by rsqrt and weight, then for each of 32 heads apply 2D rotation between halves using shared cos/sin tables of size (S,64). Memory-bound: ~256MB DRAM traffic, BW roofline ~0.29ms on 896GB/s. Key constraints: row size 8KB fp16 fits in registers/shared per block; cos/sin (fp32) tables need cast-to-fp16 or fp32 multiply with fp16; output dtype fp16. Goal: single fused Triton kernel, one program per row, to beat torch.compile by avoiding intermediate (B,S,D) tensors and minimizing global round-trips.",
+  "open_questions": [
+    "Does keeping a full D=4096 fp32 row in registers cause spills with 8 warps, or should we keep x in fp16 and convert lanes on the fly?",
+    "Should cos/sin be precomputed/cast to fp16 (saving BW + register) given the multiply happens after fp16 cast of normed values?",
+    "Best BLOCK_D / num_warps combo on Blackwell sm_100: BLOCK_D=4096 num_warps=8 vs BLOCK_D=2048 num_warps=4?",
+    "Is L2 sufficient to cache x rows for a two-pass design (8KB/row * concurrent rows) avoiding doubled DRAM traffic?",
+    "How to index the RoPE pair (i, i+half) within a single BLOCK_D load \u2014 using mask/where on offs, or splitting loads into two halves of size 2048?",
+    "Does the eps placement (inside rsqrt) and fp32 accumulation order match HF/PyTorch closely enough for atol\u22481e-3 fp16 tolerance?",
+    "Will the kernel autotune over num_warps={4,8} and num_stages provide consistent wins, or fixed config sufficient?",
+    "Are there gains from precomputing cos/sin as a fused (S,head_dim) fp16 tensor to allow a single contiguous load per head instead of two half-loads?"
+  ]
+}
