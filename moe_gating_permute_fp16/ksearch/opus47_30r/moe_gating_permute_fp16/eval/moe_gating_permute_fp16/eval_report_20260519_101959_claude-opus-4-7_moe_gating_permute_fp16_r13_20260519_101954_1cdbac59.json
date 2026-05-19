@@ -1,0 +1,17 @@
+{
+  "task": "moe_gating_permute_fp16",
+  "problem": "moe_gating_permute_fp16",
+  "device": "cuda:0",
+  "precision": "fp16",
+  "solutions": [
+    {
+      "solution": "claude-opus-4-7_moe_gating_permute_fp16_r13_20260519_101954_1cdbac59",
+      "status": "passed",
+      "speedup_over_eager": 2.6588,
+      "speedup_over_compile": 2.6796,
+      "latency_ms": 0.9757,
+      "score_name": "speedup_over_compile",
+      "score": 2.6796
+    }
+  ]
+}

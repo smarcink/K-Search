@@ -1,0 +1,617 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 1.0307,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 2.6587,
+      "speedup_factor": 2.5255,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.4,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Per-expert GEMMs are MxK=1024, NxK with intermediate=2816. With N=1024 tokens, top_k=2 => 2048 routed slots, ~256 per expert avg. M is small-ish; tensor cores want M>=16. FP16 with FP32 accum -> 210 TFLOPS peak.",
+            "notes": "Bulk of FLOPs are in three GEMMs per expert: gate(MxKxN), up(MxKxN), down(MxNxK). Total ~ 2 * 1024 * 2 * (1024*2816*2 + 2816*1024) FLOPs ~ a few GFLOPs; bandwidth-bound likely due to small M.",
+            "rating_0_to_10": 7.0,
+            "risk": "Tensor-core utilization low if M per expert is small or uneven."
+          },
+          "memory_bandwidth": {
+            "notes": "Expert weights total ~ 8 * (2816*1024*2 + 1024*2816) * 2B = ~135 MB. Larger than L2 (64MB). Each expert's weights ~17 MB \u2014 fit partially in L2. Reading weights once per token group is key.",
+            "rating_0_to_10": 6.0,
+            "risk": "Weight reload per expert dominates if M is small."
+          },
+          "register_pressure": {
+            "notes": "Standard GEMM tiles (e.g., BM=64, BN=128, BK=32) within bounds.",
+            "rating_0_to_10": 7.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: Mixtral-style MoE forward. Components: (1) gate linear (1024->8) + softmax + topk(2) + normalize, (2) permute by expert via argsort, (3) per-expert SwiGLU FFN (gate_proj 1024->2816, up_proj 1024->2816, silu*mul, down_proj 2816->1024), (4) scatter-add weighted outputs.\nINPUT: (2,512,1024) fp16 => N=1024 tokens, 2048 routed slots, ~256/expert avg.\nLAYOUT: w1,w3: (E,I,D) row-major; w2: (E,D,I). All fp16.\nBOTTLENECKS: Per-expert GEMMs dominate; small M per expert -> low TC utilization; many kernel launches in eager loop hurts.\nREGIMES: (a) balanced routing M~256/expert => GEMM bandwidth-bound on weights; (b) imbalanced => some experts large -> compute, others tiny -> launch overhead; (c) gating itself is tiny (1024x1024x8) negligible.\nKNOBS: grouped GEMM kernel (single kernel over all experts using offsets), fused gate+up+silu in one kernel writing intermediate (M,I), then down_proj kernel that fuses scatter-add with weighting. Use tl.dot with FP32 accum.\nFUSION: gate_proj + up_proj + silu*mul can fuse (share input load of x). down_proj can fuse with weight multiplication and scatter_add (atomic add to original token slots, multiplied by topk weight) \u2014 eliminates expert_outputs buffer.\nSKELETON: kernel1: gating+softmax+topk+normalize+build permutation via sort on CPU/GPU (use torch.argsort). kernel2: fused gate+up+silu producing intermediate[2048, 2816]. kernel3: down_proj + weight + atomic scatter_add into output[1024,1024].\nALT: gather input via permuted indices inside kernel2 (avoid materializing permuted_tokens).\nOPEN ACTIONS: (A) grouped-GEMM fused gate/up/silu reading x via gather, (B) down_proj fused with weighted scatter_add, (C) fused gating+topk+norm kernel.",
+        "overall_rating_0_to_10": 0.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton grouped-GEMM kernel that, for each expert, computes intermediate = SiLU(x @ W1^T) * (x @ W3^T) over the tokens assigned to that expert. Use expert offsets (cumulative counts) so a single launch handles all experts. Gather x rows via sorted_token_ids inside the kernel (no permuted_tokens materialization). Tile (BM, BN, BK) sized for tensor cores; accumulate in FP32.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.3,
+          "rationale": "Eliminates 7 separate kernel launches per expert (the Python loop) and removes a separate up_proj pass + intermediate materialization of permuted_tokens. Reads x once per output tile.",
+          "score_0_to_1": 0.92,
+          "title": "Fused grouped GEMM: gate_proj + up_proj + SiLU*mul"
+        },
+        "choice": "fused_gate_up_silu",
+        "confidence_0_to_1": 0.9,
+        "decision": "branch",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "BM=32 or 64, BN=128, BK=32 typical. m16n8k16 TC ops; FP16 inputs, FP32 accum.",
+            "notes": "Doubles arithmetic intensity by sharing x loads between W1 and W3.",
+            "rating_0_to_10": 8.0,
+            "risk": "Small M per expert may waste TC slots; pad with mask."
+          },
+          "memory_bandwidth": {
+            "notes": "Halves loads of x; weights still read fully but once per expert tile.",
+            "rating_0_to_10": 8.0,
+            "risk": "Weights larger than L2 \u2014 must stream."
+          },
+          "register_pressure": {
+            "notes": "Two accumulators (gate, up) of shape BM x BN \u2014 2x register usage vs single GEMM. Manageable with BM=32, BN=64-128.",
+            "rating_0_to_10": 6.0,
+            "risk": "Spill risk if tile too large."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "Best path so far at 3.33x. Persistent-tiles child (n1b) underperformed (2.53x); prefer layout/tuning refinements (n1a, n1d) as composable children.",
+        "overall_rating_0_to_10": 9.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.9751,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.9751,
+              "ref_eager_time_ms": 3.3832,
+              "score": 3.3298,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 3.3298,
+              "speedup_over_eager": 3.4697
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 3.3832,
+            "speedup_factor": 3.3298,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "239e9bfa9878c4452020734cfa78d36e0448c086"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a Triton kernel for down_proj that multiplies intermediate (2048, 2816) by W2[expert] (D, I) per expert group, scales by topk weight, and atomically scatter-adds into output[N, D] at the original token id. Avoids materializing expert_outputs and weighted_outputs, and fuses the final scatter_add.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.6,
+          "rationale": "Removes two large intermediate tensors and replaces scatter_add launch with in-kernel atomics. Each routed slot writes once per (BM, D-tile) into the original token row.",
+          "score_0_to_1": 0.7,
+          "title": "Fused down_proj + weighted scatter_add"
+        },
+        "choice": "fused_down_scatter",
+        "confidence_0_to_1": 0.6,
+        "decision": "branch",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "GEMM tile across I=2816 reduction dimension. m16n8k16 FP16xFP16 -> FP32 accum.",
+            "notes": "Same TC opportunities as standard GEMM.",
+            "rating_0_to_10": 7.0,
+            "risk": "Atomic FP16 add contention if two top-k experts of same token finish concurrently (only 2 writers per row, low contention)."
+          },
+          "memory_bandwidth": {
+            "notes": "Eliminates two N*D fp16 round-trips.",
+            "rating_0_to_10": 8.0,
+            "risk": "Atomic on fp16 needs atomic_add support; may need fp32 output buffer then cast."
+          },
+          "register_pressure": {
+            "notes": "Single accumulator BM x BN.",
+            "rating_0_to_10": 8.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Distinct kernel stage from n1. Already implemented in current_code as fused_down_scatter_kernel; remaining work is tuning (block sizes, avoid trans(w), maybe FP16 atomic alt via per-expert partial then reduce).",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.34,
+          "rationale": "",
+          "score_0_to_1": 0.45,
+          "title": "Tune block sizes, num_warps/stages; pre-transpose W1/W3 to avoid tl.trans"
+        },
+        "choice": "tune_blocks_and_layout",
+        "confidence_0_to_1": 0.5,
+        "decision": "branch",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "tensor core utilization limited by tl.trans + BLOCK_K=32",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Tuning helps but tl.trans inside loop still costs; pre-transpose W not yet applied.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_M=64,BLOCK_N=128,BLOCK_K=32 with num_warps=4 fits but may not be optimal.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Fused gate+up+silu kernel followed by fused down+scatter; tuned block sizes. bottleneck=compute/tensor-core util (tl.trans + small BLOCK_K). FOLLOW_THROUGH: aligned_with_intent=partial; tuned blocks/warps but did NOT pre-transpose W1/W3 (still tl.trans inside loop). UPDATE_BELIEF: Eval regressed to 2.90x vs parent 3.33x, so this tuning alone is worse than parent. next bet: pre-transpose weights at init to eliminate tl.trans and enable larger BLOCK_K for better tensor core throughput. PERF_GAP: expected 0.34x baseline, observed ~0.34x (lat 1.11ms vs ref 3.18ms); but regressed vs n1 parent.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.1112,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 1.1112,
+              "ref_eager_time_ms": 3.1821,
+              "score": 2.9035,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 2.9035,
+              "speedup_over_eager": 2.8638
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 3.1821,
+            "speedup_factor": 2.9035,
+            "status": "passed"
+          },
+          "parent_solution_id": "239e9bfa9878c4452020734cfa78d36e0448c086",
+          "solution_id": "424cbb7754258026a808700522c655ee12de5437"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.4,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Persistent expert tiles: per-expert grid via cumulative offsets to avoid wasted blocks"
+        },
+        "choice": "persistent_expert_tiles",
+        "confidence_0_to_1": 0.55,
+        "decision": "branch",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b",
+        "node_type": "decision",
+        "notes": "CURRENT: TileMap-based per-expert tiles eliminate wasted blocks; uses BLOCK_M=64,BLOCK_N=128,BLOCK_K=32 with tl.trans on weights. bottleneck: compute/tensor-core utilization (tl.trans on inner W tiles + suboptimal BLOCK_K for sm_100). FOLLOW_THROUGH: yes - implemented exactly as intended via TileMap_ptr cumulative offsets. UPDATE_BELIEF: persistent tiles gave 2.53x vs parent's 3.33x; the tile-map indirection and small BLOCK_K hurt vs the simpler n1 path. The win from removing wasted blocks is overshadowed by extra loads and small inner-K. Next bet: revert to n1 baseline and pursue n1a (preloaded weight layout to drop tl.trans) and/or larger BLOCK_K + num_stages tuning under n1.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 1.0307,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 1.0307,
+              "ref_eager_time_ms": 2.6587,
+              "score": 2.5255,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 2.5255,
+              "speedup_over_eager": 2.5795
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 2.6587,
+            "speedup_factor": 2.5255,
+            "status": "passed"
+          },
+          "parent_solution_id": "239e9bfa9878c4452020734cfa78d36e0448c086",
+          "solution_id": "cda1de611ff9be930286e783ac74fd9ed9c04929"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.32,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Pre-transpose W1/W3/W2 to (E, D, I) at init to eliminate tl.trans in inner GEMM loop"
+        },
+        "choice": "pretranspose_w_layout",
+        "confidence_0_to_1": 0.7,
+        "decision": "branch",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Avoids tl.trans; tl.dot still issued. Marginal speedup vs sibling baseline (2.86x vs 3.33x parent best).",
+            "rating_0_to_10": 6.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "Pre-transposed weights enable coalesced loads of B-matrix; one-time transpose cost amortized.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "No change vs prior; same accumulators.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Pre-transposes w1/w3 to (E,D,I) and w2 to (E,I,D), caches them, then fused GEMM loads w with rows=K,cols=N directly via tl.dot without tl.trans. bottleneck: compute/Tensor-Core utilization with secondary bandwidth. FOLLOW_THROUGH: aligned_with_intent: yes. UPDATE_BELIEF: Pre-transpose alone gives 2.86x (regress vs n1 3.33x); likely strided W loads now hit non-contiguous K-stride causing worse coalescing/L2 reuse than original layout where K was inner. Next bet: revert to n1 layout for further work OR keep pre-transpose but tune block shape (BLOCK_K=64, BLOCK_M=128) and num_stages=4 to recover. impacts.memory_bandwidth.rating_0_to_10=5 (slightly worse coalescing). impacts.register_pressure.rating_0_to_10=6. impacts.compute_intensity_and_hw_fit.rating_0_to_10=6.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.9617,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.9617,
+              "ref_eager_time_ms": 2.588,
+              "score": 2.8646,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 2.8646,
+              "speedup_over_eager": 2.691
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 2.588,
+            "speedup_factor": 2.8646,
+            "status": "passed"
+          },
+          "parent_solution_id": "239e9bfa9878c4452020734cfa78d36e0448c086",
+          "solution_id": "c6f8ca27bc8151e08bed7bd992e28c7dd4093623"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.28,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Pre-transpose W1/W3/W2 at init to eliminate tl.trans and raise BLOCK_K"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Direct tl.dot(x, w) maps cleanly to Blackwell tensor cores.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Contiguous K-dim loads for W reduce bank conflicts and enable vectorized loads.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Removing tl.trans frees regs; allows larger BLOCK_K=64/128.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Composable refinement of n1a; chains on top of tuned blocks. Not an alternative to n1a, but a follow-up to eliminate tl.trans overhead identified as bottleneck.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "424cbb7754258026a808700522c655ee12de5437",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.32,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Autotune BLOCK_M/N/K, num_warps, num_stages with triton.autotune over expert load distribution"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.45,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Broad search increases compile time but finds local optimum.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Finds best tile for given D=1024,I=2816.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Some configs may spill on RTX5090.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Mutually exclusive with n1a1 only as a first action; could be re-applied after n1a1. Distinct: this is hyperparameter search, n1a1 is data-layout change.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "424cbb7754258026a808700522c655ee12de5437",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.27,
+          "rationale": "",
+          "score_0_to_1": 0.7,
+          "title": "Increase BLOCK_K to 64/128 in gate_up kernel and tune num_stages for better tensor-core utilization"
+        },
+        "choice": "split_k_or_larger_blocks_inner_dim",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Larger K aligns better with m16n8k16 tensor core tiling on Blackwell",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Larger K reduces loop iters, more reuse of x in registers",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "BLOCK_K=128 with BLOCK_M=64,BLOCK_N=128 may exceed reg budget; need to test",
+            "rating_0_to_10": 6.0,
+            "risk": "med"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1d",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Tuning sibling to n1c (layout) and n1b (persistent tiles); mutually exclusive at impl level since changes BLOCK_K/num_stages on n1's kernel directly. Cheap to try.",
+        "overall_rating_0_to_10": 6.8,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "239e9bfa9878c4452020734cfa78d36e0448c086",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.28,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Tune BLOCK_M/N/K and num_stages for pre-transposed (E,D,I) layout to recover and surpass n1"
+        },
+        "choice": "tune_blocks_for_pretransposed_layout",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n1c (pre-transposed layout); refines via autotune over BLOCK_M in {64,128}, BLOCK_N in {64,128,256}, BLOCK_K in {32,64}, num_stages in {3,4,5}, num_warps in {4,8}. Composes with n1c; mutually exclusive with reverting layout. Goal: regain 3.3x and aim for >3.5x by improving MMA utilization and L2 reuse on contiguous I-dim writes.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1c",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "c6f8ca27bc8151e08bed7bd992e28c7dd4093623",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.27,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Vectorize W/X loads (multiple_of/max_contiguous hints) and increase K-packing for pre-transposed layout"
+        },
+        "choice": "vectorize_loads_and_kpack",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1c2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of n1c; orthogonal to n1c1 (block tuning) in that it changes load semantics via tl.multiple_of/tl.max_contiguous on offs_n and k_offs to enable wider vector loads on the I/D inner dims. Mutually exclusive with n1c1 only if both touch same parameters; intended to be applied after n1c1 if both promising.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n1c",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": "c6f8ca27bc8151e08bed7bd992e28c7dd4093623",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.33,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Combine persistent tile map with pre-transposed W layout (drop tl.trans) and tune BLOCK_K=64, num_stages=4"
+        },
+        "choice": "tilemap_plus_preloaded_wlayout",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: Composable refinement of n1b (not a sibling alternative). Removes tl.trans overhead and increases inner-K reuse, addressing the suspected reason n1b lost vs n1. If still <n1, prune n1b subtree.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1b",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "cda1de611ff9be930286e783ac74fd9ed9c04929",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Mixtral-style MoE forward: gate linear + softmax + top-k(2) + normalize, sort tokens by expert, per-expert SwiGLU FFN (gate_proj 1024->2816, up_proj, SiLU*mul, down_proj 2816->1024), weighted scatter-add. With (B,S,D)=(2,512,1024), top_k=2, E=8: 2048 routed slots, ~256 tokens/expert. Bulk of work is three GEMMs per expert; small M makes tensor-core utilization sensitive to tiling; the Python per-expert loop adds 7\u00d73 = ~24 small kernel launches. Strategy: (1) fused gating kernel; (2) grouped fused gate+up+SiLU kernel using cumulative expert offsets and in-kernel gather of x; (3) fused down_proj + topk weighting + atomic scatter-add into output. FP16 inputs with FP32 accumulators for tensor cores (m16n8k16). Weights (~135 MB) exceed L2 (64 MB) \u2014 stream weights once per expert tile and reuse via shared memory tiles.",
+  "open_questions": [
+    "Does Triton on Blackwell sm_100 support atomic_add on fp16? If not, use fp32 output buffer and cast at the end.",
+    "What is the actual routing distribution at runtime (balanced vs skewed)? Affects whether per-expert tile counts vary wildly.",
+    "Optimal tile shape (BM, BN, BK) for M~32-64 per expert tile and N=2816 on RTX 5090 (Blackwell)?",
+    "Is materializing permuted_tokens cheaper than gathering x rows inside the GEMM kernel (cache reuse vs extra pass)?",
+    "Stable argsort: can we replace with a bucket-count + prefix-sum kernel cheaper than torch.argsort for E=8?",
+    "Does torch.compile already fuse the per-expert loop? If so the bar is higher; need to compare against compiled baseline.",
+    "Can we avoid sorting entirely by using an unsorted scatter with masks per expert (8 small GEMMs in parallel via grouped GEMM with offsets)?",
+    "What's the kernel-launch overhead share vs compute for the chosen tiling \u2014 measure to decide fusion priority."
+  ]
+}
