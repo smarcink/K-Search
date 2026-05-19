@@ -1,0 +1,17 @@
+{
+  "task": "fused_moe_small_fp16",
+  "problem": "fused_moe_small_fp16",
+  "device": "cuda:0",
+  "precision": "fp16",
+  "solutions": [
+    {
+      "solution": "claude-opus-4-7_fused_moe_small_fp16_r23_20260519_105602_f712f687",
+      "status": "passed",
+      "speedup_over_eager": 85.1879,
+      "speedup_over_compile": 64.818,
+      "latency_ms": 0.0331,
+      "score_name": "speedup_over_compile",
+      "score": 64.818
+    }
+  ]
+}

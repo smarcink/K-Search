@@ -1,0 +1,681 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 0.0266,
+      "mean_vs_baseline_factor": null,
+      "profiler": {
+        "kernels": [
+          {
+            "achieved_bandwidth_gb_s": 8.89,
+            "compute_throughput_pct": 0.36,
+            "duration_us": 7.168,
+            "kernel_name": "fused_moe_kernel_pack",
+            "l1_hit_rate_pct": 0.0,
+            "l2_hit_rate_pct": 62.23,
+            "memory_throughput_pct": 0.98,
+            "registers_per_thread": 70,
+            "shared_mem_per_block_bytes": 128,
+            "sm_occupancy_pct": 2.08,
+            "tensor_core_utilization_pct": 0.0,
+            "top_stall_reasons": [
+              [
+                "long_scoreboard",
+                3.29
+              ],
+              [
+                "short_scoreboard",
+                1.56
+              ],
+              [
+                "wait",
+                1.01
+              ]
+            ]
+          }
+        ],
+        "profiler_backend": "ncu"
+      },
+      "reference_latency_ms": 1.9525,
+      "speedup_factor": 76.0341,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "node_fused_moe_small_fp16_r23_cont_1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.3,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX 5090 Mobile sm_100, 82 SMs. Problem is tiny (N=16, D=32, I=32, E=8) \u2014 far below saturating GPU; latency-bound by kernel launches.",
+            "notes": "All weights for all experts fit in shared mem easily: 8*(32*32 + 32*32 + 32*32)*2B = 49152B = 48KB. Activations trivially fit.",
+            "rating_0_to_10": 6.0,
+            "risk": "Tensor cores require min m=16,n=8,k=16 \u2014 tile shape may be ill-fit for tl.dot; may need manual mul-add since N=16, D=32 is borderline."
+          },
+          "memory_bandwidth": {
+            "notes": "Inputs are tiny; bandwidth not the bottleneck. Kernel launch overhead dominates.",
+            "rating_0_to_10": 7.0,
+            "risk": "Many small kernel launches in reference (per-expert loop) \u2014 clear win by fusing."
+          },
+          "register_pressure": {
+            "notes": "Tiny tiles, low register pressure expected.",
+            "rating_0_to_10": 9.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: MoE with B=1,S=16,D=32,I=32,E=8,top_k=1. Tiny dims, very few tokens. (1) Classification: mixed (gate matmul + softmax + topk + permutation + per-expert SwiGLU MLP + scatter). (2) Canonical math: y[n] = w[n]*(SiLU(x[n]@W1[e[n]].T) * (x[n]@W3[e[n]].T)) @ W2[e[n]].T, where e[n]=argmax(softmax(gate(x[n]))), w[n]=max prob. With top_k=1, no scatter conflicts. (3) Layout: x:(16,32) fp16 contig; W1,W2,W3:(8,32,32) fp16 contig; gate.weight:(8,32). All weights total ~50KB \u2014 fits easily in shared/L1. (4) Regimes: a) tiny N (here) \u2014 latency bound by launches; b) larger N \u2014 compute bound on per-expert matmul; c) very large N \u2014 bandwidth bound on weight loads. (5) Knobs: full fusion vs split; block-per-token vs block-per-expert; precompute expert assignment; skip the sort entirely since top_k=1 (just gather per token). (6) Skeleton: Phase1 compute gate scores + softmax + argmax per token in one kernel; Phase2 fused SwiGLU MLP per token using its assigned expert weights. (7) Family A: FULL FUSION single kernel \u2014 one program per token, load token, compute gate scores, softmax, argmax, then run full MLP using that expert's weights \u2014 eliminates all intermediate global writes and the sort. Best for tiny N. Family B: Two-kernel (gate kernel + MoE MLP kernel) \u2014 simpler. Family C: Per-expert kernel like reference but fused per expert \u2014 worst (many launches). NOTE: with top_k=1 sort is unnecessary \u2014 each token writes to its own output row, no scatter conflict.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Single Triton kernel: one program per token. Each program loads its token (D=32), computes gate logits against all 8 experts, applies softmax+argmax to get expert id and weight, then performs SwiGLU MLP (W1, W3, W2 matmuls with SiLU) using only that expert's weights, multiplies by the top-1 weight, and writes the output row directly. Skip the sort/scatter entirely since top_k=1 means each token has a unique output row.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 5.0,
+          "rationale": "Tiny problem dominated by launch overhead. Full fusion to a single kernel eliminates ~10+ launches and all intermediate allocations. Per-token program keeps register/shared usage minimal.",
+          "score_0_to_1": 0.95,
+          "title": "Full-fusion single-kernel MoE (one program per token)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "BLOCK_N=1 per program; with 16 tokens, 16 programs \u2014 under-utilizes 82 SMs but problem is too small to saturate anyway. Use tl.dot with padded tiles or manual fma \u2014 D=32, I=32 are small.",
+            "notes": "Use tl.dot for matmuls \u2014 shapes (1,32)x(32,32) and (1,32)x(32,32). May pad M to 16 in tl.dot.",
+            "rating_0_to_10": 7.0,
+            "risk": "tl.dot minimum M is 16; for single-token matmul may need to broadcast or use elementwise mul-reduce instead."
+          },
+          "memory_bandwidth": {
+            "notes": "Each program loads ~D + 3*I*D fp16 per expert = ~6KB. Fits in registers/L1. No intermediate writes to global.",
+            "rating_0_to_10": 9.0,
+            "risk": "Low."
+          },
+          "register_pressure": {
+            "notes": "Per-token compute uses tiny vectors. Low pressure.",
+            "rating_0_to_10": 9.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single Triton kernel, one program per token; computes gate logits, softmax+argmax, then SwiGLU MLP using only the selected expert's W1/W2/W3 weights. bottleneck=launch/latency dominated (7.6us, occupancy 2%, BW 5%). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: Achieved 79.3x speedup over compile vs predicted 5x \u2014 far exceeded expectations; problem is tiny (N tokens small, D=I=32) so kernel-launch elimination + single fused pass dominates. Next bet: reduce per-program overhead further by packing multiple tokens per program (more work per launch, amortize launch cost) or use fp16 math/tl.dot for the small matmuls.",
+        "overall_rating_0_to_10": 9.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0272,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0272,
+              "ref_eager_time_ms": 2.0491,
+              "score": 79.3362,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 79.3362,
+              "speedup_over_eager": 75.4444
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 45.59,
+                  "compute_throughput_pct": 0.33,
+                  "duration_us": 7.648,
+                  "kernel_name": "fused_moe_kernel",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 54.02,
+                  "memory_throughput_pct": 5.05,
+                  "registers_per_thread": 70,
+                  "shared_mem_per_block_bytes": 128,
+                  "sm_occupancy_pct": 2.08,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      3.75
+                    ],
+                    [
+                      "short_scoreboard",
+                      1.63
+                    ],
+                    [
+                      "wait",
+                      1.06
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 2.0491,
+            "speedup_factor": 79.3362,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "014a5d342625728307bd8b3acd1a425beacc7b1d"
+        }
+      },
+      {
+        "action": {
+          "description": "Two-kernel design: Kernel A computes gate logits + softmax + top-1 expert id + weight per token (output: ids[N], weights[N]). Kernel B is one program per token that loads weights for assigned expert and runs SwiGLU MLP, writing scaled output. Skip sort/permutation.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.5,
+          "rationale": "Simpler than full fusion; still removes the per-expert Python loop, the sort, gather, and scatter. Good fallback if full fusion has tl.dot shape issues.",
+          "score_0_to_1": 0.1,
+          "title": "Split into two kernels (deprioritized)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Two launches instead of ~15+ in reference.",
+            "notes": "Each kernel small; uses tl.dot where possible.",
+            "rating_0_to_10": 6.0,
+            "risk": "Extra launch vs full fusion."
+          },
+          "memory_bandwidth": {
+            "notes": "Writes ids/weights to global (tiny). One extra round-trip.",
+            "rating_0_to_10": 7.0,
+            "risk": "Low."
+          },
+          "register_pressure": {
+            "notes": "Low.",
+            "rating_0_to_10": 9.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "DEPRIORITIZED: n1 fusion gives 80x; splitting reintroduces launch overhead. Keep as reference only.",
+        "overall_rating_0_to_10": 2.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Pack K tokens per program to amortize launch & raise occupancy"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n4",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single-program-per-2-tokens fused MoE; loads gate once, then per-token computes softmax, picks top-1 expert, runs w1/w3 GEMV+SiLU*up, then w2 GEMV, scales by gate prob. bottleneck=latency/launch + long_scoreboard global loads (weights). FOLLOW_THROUGH: aligned_with_intent=yes; packed 2 tokens/program via TOKENS_PER_PROG=2. UPDATE_BELIEF: Packing increased duration 7.6us->11.0us and dropped speedup 79.3x->78.0x; amortization didn't help because grid was already small and per-program work doubled register pressure (70->80) without raising occupancy (still 2.08%). PERF_GAP: expected 1.30x, observed ~0.98x; reason: kernel is launch+latency bound at tiny N, packing serializes work per SM rather than spreading. next bet: revert packing (TOKENS_PER_PROG=1) and instead try (a) loading gate via constexpr cached path / fp16 math to cut regs, or (b) precompute expert routing in a tiny prelude to skip dead branches.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0266,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0266,
+              "ref_eager_time_ms": 1.9743,
+              "score": 78.0446,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 78.0446,
+              "speedup_over_eager": 74.1831
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 5.63,
+                  "compute_throughput_pct": 0.23,
+                  "duration_us": 11.04,
+                  "kernel_name": "fused_moe_kernel_pack",
+                  "l1_hit_rate_pct": 0.49,
+                  "l2_hit_rate_pct": 58.93,
+                  "memory_throughput_pct": 0.62,
+                  "registers_per_thread": 80,
+                  "shared_mem_per_block_bytes": 128,
+                  "sm_occupancy_pct": 2.08,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      2.86
+                    ],
+                    [
+                      "short_scoreboard",
+                      1.45
+                    ],
+                    [
+                      "wait",
+                      1.09
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 1.9743,
+            "speedup_factor": 78.0446,
+            "status": "passed"
+          },
+          "parent_solution_id": "014a5d342625728307bd8b3acd1a425beacc7b1d",
+          "solution_id": "d2df4417290e573fa8b47290d7e935b995aae0d8"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "",
+          "score_0_to_1": 0.9,
+          "title": "Reduce register pressure: keep fp16 loads, avoid fp32 upcast on weights"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.9,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "No tensor cores; D=I=32 too small for MMA tiles.",
+            "rating_0_to_10": 4.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 7.07 GB/s; tiny problem, latency-bound.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Regs dropped 80->70.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n5",
+        "node_type": "decision",
+        "notes": "Best so far: 80.4x speedup, 0.0244ms. Single-token-per-program fused MoE with fp16 weights kept in registers.",
+        "overall_rating_0_to_10": 9.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0244,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0244,
+              "ref_eager_time_ms": 1.9881,
+              "score": 80.3879,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 80.3879,
+              "speedup_over_eager": 81.3709
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 7.07,
+                  "compute_throughput_pct": 0.33,
+                  "duration_us": 7.68,
+                  "kernel_name": "fused_moe_kernel",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 80.94,
+                  "memory_throughput_pct": 0.78,
+                  "registers_per_thread": 70,
+                  "shared_mem_per_block_bytes": 128,
+                  "sm_occupancy_pct": 2.08,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      3.85
+                    ],
+                    [
+                      "short_scoreboard",
+                      1.64
+                    ],
+                    [
+                      "wait",
+                      1.06
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 1.9881,
+            "speedup_factor": 80.3879,
+            "status": "passed"
+          },
+          "parent_solution_id": "014a5d342625728307bd8b3acd1a425beacc7b1d",
+          "solution_id": "1b64d56a5e43af1746a082d406d5aeecd83c039b"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.03,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.6,
+          "title": "Drop fp32 upcast on w1/w3/w2; try num_stages=1"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.7,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 20,
+        "node_id": "node_fused_moe_small_fp16_r20_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=single-program-per-token MoE that loads gate/w1/w3/w2 for the chosen expert and does all matmuls inline; bottleneck=launch/occupancy (only 2% SM occupancy, 7us). FOLLOW_THROUGH: aligned_with_intent=partial; num_stages=1 applied but w1/w3/w2 are still .to(fp32) before sum. UPDATE_BELIEF: eval 76x (slightly below the 80x best at n5), so the partial change regressed marginally; next bet=process multiple tokens per program sharing expert weight loads (n6_persistent_block) to raise occupancy.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n4",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.0266,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "kernel_time_ms": 0.0266,
+              "ref_eager_time_ms": 1.9525,
+              "score": 76.0341,
+              "score_name": "speedup_over_compile",
+              "speedup_over_compile": 76.0341,
+              "speedup_over_eager": 73.2704
+            },
+            "profiler_metrics": {
+              "kernels": [
+                {
+                  "achieved_bandwidth_gb_s": 8.89,
+                  "compute_throughput_pct": 0.36,
+                  "duration_us": 7.168,
+                  "kernel_name": "fused_moe_kernel_pack",
+                  "l1_hit_rate_pct": 0.0,
+                  "l2_hit_rate_pct": 62.23,
+                  "memory_throughput_pct": 0.98,
+                  "registers_per_thread": 70,
+                  "shared_mem_per_block_bytes": 128,
+                  "sm_occupancy_pct": 2.08,
+                  "tensor_core_utilization_pct": 0.0,
+                  "top_stall_reasons": [
+                    [
+                      "long_scoreboard",
+                      3.29
+                    ],
+                    [
+                      "short_scoreboard",
+                      1.56
+                    ],
+                    [
+                      "wait",
+                      1.01
+                    ]
+                  ]
+                }
+              ],
+              "profiler_backend": "ncu"
+            },
+            "reference_latency_ms": 1.9525,
+            "speedup_factor": 76.0341,
+            "status": "passed"
+          },
+          "parent_solution_id": "d2df4417290e573fa8b47290d7e935b995aae0d8",
+          "solution_id": "7e33ca3556bd0f1b3fa91b7f0263272e5723c743"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Multiple tokens per program (token tile) to amortize launch and raise occupancy"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n6_persistent_block",
+        "node_type": "decision",
+        "notes": "Process BLOCK_N tokens per program sharing the same expert weights once loaded; raises occupancy beyond 2%. SELF_CHECK: only OPEN child; composable refinement after fp16-accum cleanup.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "node_fused_moe_small_fp16_r20_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.85,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "No tensor cores; D=I=32 too small for MMA tiles.",
+            "rating_0_to_10": 4.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "Achieved 7.07 GB/s; tiny problem, latency-bound.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Regs dropped 80->70.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 23,
+        "node_id": "node_fused_moe_small_fp16_r23_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "n5",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "1b64d56a5e43af1746a082d406d5aeecd83c039b",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.03,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Eliminate fp32 upcasts; do all matmuls in fp16 with fp16 accum"
+        },
+        "choice": "Reduce register pressure and arithmetic by keeping x and weights in fp16 throughout (small D=I=32 so fp16 accum precision is acceptable). May reduce 70 regs/thread and improve occupancy.",
+        "confidence_0_to_1": 0.5,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_fused_moe_small_fp16_r30_1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: distinct from sibling n6_persistent_block (which changes work-per-program); this only changes dtype of compute. Mutually exclusive in implementation order but composable later.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "node_fused_moe_small_fp16_r23_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.02,
+          "rationale": "",
+          "score_0_to_1": 0.4,
+          "title": "Precompute argmax expert on host or via separate small kernel, pass expert_id per token"
+        },
+        "choice": "Skip gate matmul + softmax inside the heavy kernel; pre-stage expert_id so the main kernel only does w1/w3/w2.",
+        "confidence_0_to_1": 0.4,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_fused_moe_small_fp16_r30_2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: distinct from fp16-accum sibling and from persistent-block sibling; this restructures work between kernels. Risk: adds a small launch back.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "node_fused_moe_small_fp16_r23_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused MoE forward with tiny shapes (B=1,S=16,D=32,I=32,E=8,top_k=1) in fp16: gate linear -> softmax -> top-1 expert -> SwiGLU MLP (W1,W3,W2) per token weighted by gate prob. Reference does per-expert Python loop + sort + scatter; the problem is dominated by kernel-launch and intermediate-allocation overhead, not compute or bandwidth. All weights (~50KB) fit in shared memory and the whole problem fits in a single CTA, so the dominant optimization is aggressive fusion into 1 (or 2) Triton kernel(s) that bypass the sort/scatter (unnecessary at top_k=1) and run gate+MLP end-to-end. Key constraints: tl.dot tile minimum (m=16), small-D matmul shapes, fp16 inputs with fp32 accumulation for softmax stability.",
+  "open_questions": [
+    "Does the actual benchmark use defaults (dim=32,intermediate=32,E=8) as the docstring claims, or the values in __init__ signature defaults (also 32/32/8) \u2014 confirm shapes.",
+    "Will tl.dot accept (1,32)x(32,32) for the per-token program, or must we pad/broadcast to M=16?",
+    "Is fp32 accumulation needed in matmuls for tolerance, or is fp16 accum sufficient (faster on Blackwell at 420 TFLOPS)?",
+    "What output zeroing semantics matter \u2014 does the test allow a non-zero initialized output buffer (we can write all rows since top_k=1)?",
+    "Does the benchmark warmup amortize launch overhead enough that compute matters, or is steady-state still launch-dominated?",
+    "Is the gate bias absent (Linear(bias=False)) \u2014 confirmed, so we just need a single matmul for gate.",
+    "Will softmax be needed at all if we only need argmax + max-prob? (argmax of softmax == argmax of logits; weight requires actual softmax probability of the top class \u2014 yes needed.)",
+    "Numerical tolerance: does the eval use atol/rtol loose enough to allow fp16 softmax, or must we keep fp32 in the gate path?"
+  ]
+}
