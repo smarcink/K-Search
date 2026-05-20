@@ -153,6 +153,7 @@ struct GpuBuffer {
     ComPtr<ID3D12Resource> resource;
     ComPtr<ID3D12Resource> upload;
     ComPtr<ID3D12Resource> readback;
+    HlslProbeBufferDesc desc = {};
     uint64_t requested_size = 0;
     uint64_t resource_size = 0;
 };
@@ -163,6 +164,62 @@ struct AdapterInfo {
     uint32_t device_id = 0;
     uint64_t dedicated_video_memory = 0;
 };
+
+const char* view_kind_name(uint32_t view_kind) {
+    switch (view_kind) {
+    case HLSL_PROBE_BUFFER_VIEW_RAW: return "raw";
+    case HLSL_PROBE_BUFFER_VIEW_TYPED: return "typed";
+    default: return "unknown";
+    }
+}
+
+const char* buffer_format_name(uint32_t format) {
+    switch (format) {
+    case HLSL_PROBE_BUFFER_FORMAT_RAW_U32: return "raw_u32";
+    case HLSL_PROBE_BUFFER_FORMAT_F16: return "float16";
+    case HLSL_PROBE_BUFFER_FORMAT_F32: return "float32";
+    case HLSL_PROBE_BUFFER_FORMAT_I8: return "int8";
+    case HLSL_PROBE_BUFFER_FORMAT_U8: return "uint8";
+    case HLSL_PROBE_BUFFER_FORMAT_I32: return "int32";
+    case HLSL_PROBE_BUFFER_FORMAT_U32: return "uint32";
+    default: return "unknown";
+    }
+}
+
+uint64_t bytes_per_element(uint32_t format) {
+    switch (format) {
+    case HLSL_PROBE_BUFFER_FORMAT_RAW_U32: return 4;
+    case HLSL_PROBE_BUFFER_FORMAT_F16: return 2;
+    case HLSL_PROBE_BUFFER_FORMAT_F32: return 4;
+    case HLSL_PROBE_BUFFER_FORMAT_I8: return 1;
+    case HLSL_PROBE_BUFFER_FORMAT_U8: return 1;
+    case HLSL_PROBE_BUFFER_FORMAT_I32: return 4;
+    case HLSL_PROBE_BUFFER_FORMAT_U32: return 4;
+    default: return 0;
+    }
+}
+
+DXGI_FORMAT dxgi_format_for(uint32_t format) {
+    switch (format) {
+    case HLSL_PROBE_BUFFER_FORMAT_RAW_U32: return DXGI_FORMAT_R32_TYPELESS;
+    case HLSL_PROBE_BUFFER_FORMAT_F16: return DXGI_FORMAT_R16_FLOAT;
+    case HLSL_PROBE_BUFFER_FORMAT_F32: return DXGI_FORMAT_R32_FLOAT;
+    case HLSL_PROBE_BUFFER_FORMAT_I8: return DXGI_FORMAT_R8_SINT;
+    case HLSL_PROBE_BUFFER_FORMAT_U8: return DXGI_FORMAT_R8_UINT;
+    case HLSL_PROBE_BUFFER_FORMAT_I32: return DXGI_FORMAT_R32_SINT;
+    case HLSL_PROBE_BUFFER_FORMAT_U32: return DXGI_FORMAT_R32_UINT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+std::string buffer_desc_json(const HlslProbeBufferDesc& desc) {
+    std::ostringstream oss;
+    oss << "{\"view_kind\":\"" << view_kind_name(desc.view_kind)
+        << "\",\"format\":\"" << buffer_format_name(desc.format)
+        << "\",\"element_count\":" << desc.element_count
+        << ",\"size_bytes\":" << desc.size_bytes << "}";
+    return oss.str();
+}
 
 } // namespace
 
@@ -329,6 +386,114 @@ struct HlslProbeContext {
         command_list->ResourceBarrier(1, &barrier);
     }
 
+    void validate_format_support(const HlslProbeBufferDesc& desc, bool output, const std::string& label) {
+        const DXGI_FORMAT dxgi_format = dxgi_format_for(desc.format);
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+        support.Format = dxgi_format;
+        HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
+        if (FAILED(hr)) {
+            std::ostringstream oss;
+            oss << label << " CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT) failed for "
+                << buffer_format_name(desc.format) << " with HRESULT " << hresult_hex(hr);
+            throw std::runtime_error(oss.str());
+        }
+
+        if ((support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) == 0) {
+            std::ostringstream oss;
+            oss << label << " format " << buffer_format_name(desc.format) << " is not supported as a buffer view";
+            throw std::runtime_error(oss.str());
+        }
+
+        if (!output && (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD) == 0) {
+            std::ostringstream oss;
+            oss << label << " format " << buffer_format_name(desc.format) << " is not supported for shader loads";
+            throw std::runtime_error(oss.str());
+        }
+
+        if (output) {
+            const bool has_uav_view = (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0;
+            const bool has_uav_store = (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+            if (!has_uav_view || !has_uav_store) {
+                std::ostringstream oss;
+                oss << label << " format " << buffer_format_name(desc.format)
+                    << " is not supported for typed UAV stores"
+                    << " (Support1=0x" << std::hex << support.Support1
+                    << ", Support2=0x" << support.Support2 << ")";
+                throw std::runtime_error(oss.str());
+            }
+        }
+    }
+
+    void validate_buffer_desc(const HlslProbeBufferDesc& desc, bool output, uint32_t index) {
+        std::ostringstream label_oss;
+        label_oss << (output ? "output" : "input") << "[" << index << "]";
+        const std::string label = label_oss.str();
+
+        if (desc.struct_size != sizeof(HlslProbeBufferDesc)) {
+            std::ostringstream oss;
+            oss << label << " has invalid HlslProbeBufferDesc.struct_size " << desc.struct_size
+                << "; expected " << sizeof(HlslProbeBufferDesc);
+            throw std::runtime_error(oss.str());
+        }
+        if (desc.element_count > static_cast<uint64_t>(std::numeric_limits<UINT>::max())) {
+            std::ostringstream oss;
+            oss << label << " element_count exceeds D3D12 descriptor UINT range: " << desc.element_count;
+            throw std::runtime_error(oss.str());
+        }
+
+        if (desc.view_kind == HLSL_PROBE_BUFFER_VIEW_RAW) {
+            if (desc.format != HLSL_PROBE_BUFFER_FORMAT_RAW_U32) {
+                std::ostringstream oss;
+                oss << label << " raw view requires raw_u32 format, got " << buffer_format_name(desc.format);
+                throw std::runtime_error(oss.str());
+            }
+            if (desc.size_bytes % 4 != 0) {
+                std::ostringstream oss;
+                oss << label << " raw view size_bytes must be 4-byte aligned, got " << desc.size_bytes;
+                throw std::runtime_error(oss.str());
+            }
+            if (desc.element_count != desc.size_bytes / 4) {
+                std::ostringstream oss;
+                oss << label << " raw view element_count must equal size_bytes / 4; got element_count="
+                    << desc.element_count << ", size_bytes=" << desc.size_bytes;
+                throw std::runtime_error(oss.str());
+            }
+            return;
+        }
+
+        if (desc.view_kind != HLSL_PROBE_BUFFER_VIEW_TYPED) {
+            std::ostringstream oss;
+            oss << label << " has unknown view_kind " << desc.view_kind;
+            throw std::runtime_error(oss.str());
+        }
+        if (desc.format == HLSL_PROBE_BUFFER_FORMAT_RAW_U32) {
+            std::ostringstream oss;
+            oss << label << " typed view cannot use raw_u32 format";
+            throw std::runtime_error(oss.str());
+        }
+        const uint64_t bytes = bytes_per_element(desc.format);
+        if (bytes == 0 || dxgi_format_for(desc.format) == DXGI_FORMAT_UNKNOWN) {
+            std::ostringstream oss;
+            oss << label << " has unknown buffer format " << desc.format;
+            throw std::runtime_error(oss.str());
+        }
+        if (desc.element_count > std::numeric_limits<uint64_t>::max() / bytes) {
+            std::ostringstream oss;
+            oss << label << " size calculation overflow for format " << buffer_format_name(desc.format);
+            throw std::runtime_error(oss.str());
+        }
+        const uint64_t expected_size = desc.element_count * bytes;
+        if (desc.size_bytes != expected_size) {
+            std::ostringstream oss;
+            oss << label << " typed " << buffer_format_name(desc.format)
+                << " size_bytes must equal element_count * bytes_per_element; got size_bytes="
+                << desc.size_bytes << ", element_count=" << desc.element_count
+                << ", expected_size=" << expected_size;
+            throw std::runtime_error(oss.str());
+        }
+        validate_format_support(desc, output, label);
+    }
+
     std::string caps_json() {
         D3D12_FEATURE_DATA_SHADER_MODEL shader_model = { D3D_SHADER_MODEL_6_10 };
         HRESULT sm_hr = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model));
@@ -391,21 +556,23 @@ struct HlslProbeContext {
 
         for (uint32_t i = 0; i < config.input_count; ++i) {
             const auto& src = config.inputs[i];
-            if (!src.data && src.size_bytes > 0) {
+            validate_buffer_desc(src.desc, false, i);
+            if (!src.data && src.desc.size_bytes > 0) {
                 throw std::runtime_error("input buffer data is null");
             }
             auto& dst = inputs[i];
-            dst.requested_size = src.size_bytes;
-            dst.resource_size = align_up(std::max<uint64_t>(src.size_bytes, 4), 4);
+            dst.desc = src.desc;
+            dst.requested_size = src.desc.size_bytes;
+            dst.resource_size = align_up(std::max<uint64_t>(src.desc.size_bytes, 4), 4);
             dst.resource = create_buffer(dst.resource_size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
             dst.upload = create_buffer(dst.resource_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
             void* mapped = nullptr;
             throw_if_failed(dst.upload->Map(0, nullptr, &mapped), "Map(input upload)");
-            if (src.size_bytes > 0) {
-                std::memcpy(mapped, src.data, static_cast<size_t>(src.size_bytes));
+            if (src.desc.size_bytes > 0) {
+                std::memcpy(mapped, src.data, static_cast<size_t>(src.desc.size_bytes));
             }
-            if (dst.resource_size > src.size_bytes) {
-                std::memset(static_cast<uint8_t*>(mapped) + src.size_bytes, 0, static_cast<size_t>(dst.resource_size - src.size_bytes));
+            if (dst.resource_size > src.desc.size_bytes) {
+                std::memset(static_cast<uint8_t*>(mapped) + src.desc.size_bytes, 0, static_cast<size_t>(dst.resource_size - src.desc.size_bytes));
             }
             dst.upload->Unmap(0, nullptr);
             command_list->CopyBufferRegion(dst.resource.Get(), 0, dst.upload.Get(), 0, dst.resource_size);
@@ -414,12 +581,14 @@ struct HlslProbeContext {
 
         for (uint32_t i = 0; i < config.output_count; ++i) {
             const auto& out = config.outputs[i];
-            if (!out.data && out.size_bytes > 0) {
+            validate_buffer_desc(out.desc, true, i);
+            if (!out.data && out.desc.size_bytes > 0) {
                 throw std::runtime_error("output buffer data is null");
             }
             auto& dst = outputs[i];
-            dst.requested_size = out.size_bytes;
-            dst.resource_size = align_up(std::max<uint64_t>(out.size_bytes, 4), 4);
+            dst.desc = out.desc;
+            dst.requested_size = out.desc.size_bytes;
+            dst.resource_size = align_up(std::max<uint64_t>(out.desc.size_bytes, 4), 4);
             dst.resource = create_buffer(dst.resource_size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
             dst.readback = create_buffer(dst.resource_size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         }
@@ -499,22 +668,24 @@ struct HlslProbeContext {
             D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptor_heap->GetCPUDescriptorHandleForHeapStart();
 
             for (uint32_t i = 0; i < config.input_count; ++i) {
+                const auto& desc = inputs[i].desc;
                 D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-                srv_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                srv_desc.Format = dxgi_format_for(desc.format);
                 srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
                 srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                srv_desc.Buffer.NumElements = static_cast<UINT>(inputs[i].resource_size / 4);
-                srv_desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+                srv_desc.Buffer.NumElements = static_cast<UINT>(desc.element_count);
+                srv_desc.Buffer.Flags = desc.view_kind == HLSL_PROBE_BUFFER_VIEW_RAW ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
                 device->CreateShaderResourceView(inputs[i].resource.Get(), &srv_desc, cpu);
                 cpu.ptr += descriptor_size;
             }
 
             for (uint32_t i = 0; i < config.output_count; ++i) {
+                const auto& desc = outputs[i].desc;
                 D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
-                uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                uav_desc.Format = dxgi_format_for(desc.format);
                 uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                uav_desc.Buffer.NumElements = static_cast<UINT>(outputs[i].resource_size / 4);
-                uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                uav_desc.Buffer.NumElements = static_cast<UINT>(desc.element_count);
+                uav_desc.Buffer.Flags = desc.view_kind == HLSL_PROBE_BUFFER_VIEW_RAW ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE;
                 device->CreateUnorderedAccessView(outputs[i].resource.Get(), nullptr, &uav_desc, cpu);
                 cpu.ptr += descriptor_size;
             }
@@ -606,6 +777,17 @@ struct HlslProbeContext {
         for (uint32_t i = 0; i < config.output_count; ++i) {
             if (i) oss << ",";
             oss << outputs[i].requested_size;
+        }
+        oss << "],";
+        oss << "\"inputs\":[";
+        for (uint32_t i = 0; i < config.input_count; ++i) {
+            if (i) oss << ",";
+            oss << buffer_desc_json(inputs[i].desc);
+        }
+        oss << "],\"outputs\":[";
+        for (uint32_t i = 0; i < config.output_count; ++i) {
+            if (i) oss << ",";
+            oss << buffer_desc_json(outputs[i].desc);
         }
         oss << "]}";
         return oss.str();

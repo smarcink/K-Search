@@ -237,6 +237,16 @@ HlslProbeHandle create_probe_or_throw() {
     return handle;
 }
 
+HlslProbeBufferDesc raw_u32_desc(uint64_t size_bytes) {
+    HlslProbeBufferDesc desc = {};
+    desc.struct_size = sizeof(HlslProbeBufferDesc);
+    desc.view_kind = HLSL_PROBE_BUFFER_VIEW_RAW;
+    desc.format = HLSL_PROBE_BUFFER_FORMAT_RAW_U32;
+    desc.element_count = size_bytes / 4;
+    desc.size_bytes = size_bytes;
+    return desc;
+}
+
 void print_and_free(char* text) {
     if (text) {
         std::cout << text << std::endl;
@@ -270,7 +280,7 @@ void main() {
     auto dxil = compile_hlsl(shader);
     HlslProbeHandle handle = create_probe_or_throw();
     uint32_t value = 0;
-    HlslProbeOutputBuffer output = { &value, sizeof(value) };
+    HlslProbeOutputBuffer output = { &value, raw_u32_desc(sizeof(value)) };
     HlslProbeRunConfig config = {};
     config.dispatch_x = 1;
     config.dispatch_y = 1;
@@ -329,8 +339,8 @@ void main() {
 
     uint32_t matrix_data[4] = { 1u, 2u, 3u, 4u };
     uint32_t output_values[2] = { 0u, 0u };
-    HlslProbeInputBuffer input = { matrix_data, sizeof(matrix_data) };
-    HlslProbeOutputBuffer output = { output_values, sizeof(output_values) };
+    HlslProbeInputBuffer input = { matrix_data, raw_u32_desc(sizeof(matrix_data)) };
+    HlslProbeOutputBuffer output = { output_values, raw_u32_desc(sizeof(output_values)) };
     HlslProbeRunConfig config = {};
     config.dispatch_x = 1;
     config.dispatch_y = 1;

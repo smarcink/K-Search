@@ -33,6 +33,54 @@ python -m hlsl_probe --linalg-test
 
 The Python wrapper uses `ctypes` over `hlsl_probe_native.dll`. It stages buffers through CPU memory for the first POC; direct PyTorch GPU interop is intentionally deferred.
 
+## Buffer Metadata
+
+The probe API uses explicit buffer metadata instead of guessing tensor formats from raw byte counts. Each input and output buffer declares:
+
+- `view`: `raw` or `typed`
+- `dtype`: `raw_u32`, `float16`, `float32`, `int8`, `uint8`, `int32`, or `uint32`
+- `element_count`
+- `size_bytes`
+
+Raw buffers map to `ByteAddressBuffer` / `RWByteAddressBuffer` with `DXGI_FORMAT_R32_TYPELESS` and raw descriptor flags. Typed buffers map to typed DXGI views such as `DXGI_FORMAT_R16_FLOAT`, `DXGI_FORMAT_R8_SINT`, and `DXGI_FORMAT_R32_FLOAT` for `Buffer<T>` / `RWBuffer<T>` style HLSL.
+
+Example raw call shape:
+
+```python
+from hlsl_probe import BufferArg, BufferSpec, run_dxil
+
+metadata, outputs = run_dxil(
+	dxil,
+	inputs=[BufferArg.raw_u32(input_bytes)],
+	outputs=[BufferSpec.raw_u32(16)],
+	dispatch=(1, 1, 1),
+)
+```
+
+Example typed call shape:
+
+```python
+from hlsl_probe import BufferArg, BufferSpec, run_dxil
+
+metadata, outputs = run_dxil(
+	dxil,
+	inputs=[BufferArg.from_tensor(torch_tensor)],
+	outputs=[BufferSpec.from_tensor(expected_tensor)],
+	dispatch=(1, 1, 1),
+)
+```
+
+## Tests
+
+The probe has Python API tests under `hlsl_probe/tests/`. They exercise the native C ABI through the `ctypes` wrapper.
+
+```powershell
+$env:PYTHONPATH = "$PWD\hlsl_probe\python"
+python -m unittest discover hlsl_probe/tests
+```
+
+The typed FP16 and int8 tests may report an explicit capability skip/failure if the current runtime does not expose the needed typed SRV/UAV format support.
+
 ## Preview SDK Notes
 
 The current configuration uses the preview DXC and Agility SDK packages in `thirdparty/dxc_preview_2026_04_22` and `thirdparty/microsoft.direct3d.d3d12.1.720.0-preview`. Windows Developer Mode must be enabled for `D3D12ExperimentalShaderModels`; without it, preview Agility device creation can fail before any shader is tested.

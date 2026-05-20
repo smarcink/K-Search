@@ -19,14 +19,40 @@ extern "C" {
 typedef struct HlslProbeContext HlslProbeContext;
 typedef HlslProbeContext* HlslProbeHandle;
 
+typedef enum HlslProbeBufferViewKind {
+    HLSL_PROBE_BUFFER_VIEW_RAW = 0,
+    HLSL_PROBE_BUFFER_VIEW_TYPED = 1,
+} HlslProbeBufferViewKind;
+
+typedef enum HlslProbeBufferFormat {
+    HLSL_PROBE_BUFFER_FORMAT_RAW_U32 = 0,
+    HLSL_PROBE_BUFFER_FORMAT_F16 = 1,
+    HLSL_PROBE_BUFFER_FORMAT_F32 = 2,
+    HLSL_PROBE_BUFFER_FORMAT_I8 = 3,
+    HLSL_PROBE_BUFFER_FORMAT_U8 = 4,
+    HLSL_PROBE_BUFFER_FORMAT_I32 = 5,
+    HLSL_PROBE_BUFFER_FORMAT_U32 = 6,
+} HlslProbeBufferFormat;
+
+typedef struct HlslProbeBufferDesc {
+    uint32_t struct_size;
+    uint32_t view_kind;
+    uint32_t format;
+    uint32_t reserved0;
+    uint64_t element_count;
+    uint64_t size_bytes;
+    uint64_t reserved1;
+    uint64_t reserved2;
+} HlslProbeBufferDesc;
+
 typedef struct HlslProbeInputBuffer {
     const void* data;
-    uint64_t size_bytes;
+    HlslProbeBufferDesc desc;
 } HlslProbeInputBuffer;
 
 typedef struct HlslProbeOutputBuffer {
     void* data;
-    uint64_t size_bytes;
+    HlslProbeBufferDesc desc;
 } HlslProbeOutputBuffer;
 
 typedef struct HlslProbeRunConfig {
