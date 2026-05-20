@@ -9,8 +9,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 get_filename_component(REPO_ROOT "${REPO_ROOT}" ABSOLUTE)
 
-set(DXC_ROOT "${REPO_ROOT}/thirdparty/dxc_2026_02_20" CACHE PATH "DirectX Shader Compiler package root")
-set(AGILITY_ROOT "${REPO_ROOT}/thirdparty/microsoft.direct3d.d3d12.1.619.3" CACHE PATH "DirectX 12 Agility SDK package root")
+set(DXC_ROOT "${REPO_ROOT}/thirdparty/dxc_preview_2026_04_22" CACHE PATH "DirectX Shader Compiler package root")
+set(AGILITY_ROOT "${REPO_ROOT}/thirdparty/microsoft.direct3d.d3d12.1.720.0-preview" CACHE PATH "DirectX 12 Agility SDK package root")
+set(AGILITY_SDK_VERSION "720" CACHE STRING "DirectX 12 Agility SDK version passed to D3D12SDKVersion/CreateDeviceFactory")
 
 set(DXC_EXE "${DXC_ROOT}/bin/x64/dxc.exe")
 set(DXC_HLSL_INCLUDE "${DXC_ROOT}/inc/hlsl")

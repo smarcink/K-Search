@@ -134,6 +134,7 @@ const char* wave_mma_tier_name(D3D12_WAVE_MMA_TIER tier) {
 
 const char* shader_model_name(D3D_SHADER_MODEL shader_model) {
     switch (shader_model) {
+    case D3D_SHADER_MODEL_6_10: return "6.10";
     case D3D_SHADER_MODEL_6_9: return "6.9";
     case D3D_SHADER_MODEL_6_8: return "6.8";
     case D3D_SHADER_MODEL_6_7: return "6.7";
@@ -168,6 +169,9 @@ struct AdapterInfo {
 struct HlslProbeContext {
     std::string last_error;
     std::string sdk_path;
+    uint32_t sdk_version_used = 0;
+    HRESULT global_experimental_shader_models_hr = E_NOTIMPL;
+    HRESULT factory_experimental_shader_models_hr = E_NOTIMPL;
     AdapterInfo adapter_info;
     ComPtr<IDXGIFactory6> dxgi_factory;
     ComPtr<IDXGIAdapter1> adapter;
@@ -236,9 +240,41 @@ struct HlslProbeContext {
             throw std::runtime_error("No hardware DXGI adapter found");
         }
 
+        const IID experimental_features[] = { D3D12ExperimentalShaderModels };
+        global_experimental_shader_models_hr = D3D12EnableExperimentalFeatures(1, experimental_features, nullptr, nullptr);
+
         ComPtr<ID3D12SDKConfiguration1> sdk_config;
         throw_if_failed(D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdk_config)), "D3D12GetInterface(CLSID_D3D12SDKConfiguration)");
-        throw_if_failed(sdk_config->CreateDeviceFactory(HLSL_PROBE_AGILITY_SDK_VERSION, sdk_path.c_str(), IID_PPV_ARGS(&device_factory)), "ID3D12SDKConfiguration1::CreateDeviceFactory");
+
+        HRESULT factory_hr = sdk_config->CreateDeviceFactory(HLSL_PROBE_AGILITY_SDK_VERSION, sdk_path.c_str(), IID_PPV_ARGS(&device_factory));
+        sdk_version_used = HLSL_PROBE_AGILITY_SDK_VERSION;
+
+#if defined(D3D12_SDK_VERSION)
+        HRESULT fallback_factory_hr = S_OK;
+    const bool has_distinct_fallback_sdk = HLSL_PROBE_AGILITY_SDK_VERSION != D3D12_SDK_VERSION;
+    if (FAILED(factory_hr) && has_distinct_fallback_sdk) {
+            fallback_factory_hr = sdk_config->CreateDeviceFactory(D3D12_SDK_VERSION, sdk_path.c_str(), IID_PPV_ARGS(&device_factory));
+            if (SUCCEEDED(fallback_factory_hr)) {
+                factory_hr = fallback_factory_hr;
+                sdk_version_used = D3D12_SDK_VERSION;
+            }
+        }
+#endif
+
+        if (FAILED(factory_hr)) {
+            std::ostringstream oss;
+            oss << "ID3D12SDKConfiguration1::CreateDeviceFactory failed with HRESULT " << hresult_hex(factory_hr)
+                << " for SDK version " << HLSL_PROBE_AGILITY_SDK_VERSION
+                << "; D3D12EnableExperimentalFeatures(D3D12ExperimentalShaderModels) returned " << hresult_hex(global_experimental_shader_models_hr);
+#if defined(D3D12_SDK_VERSION)
+            if (has_distinct_fallback_sdk) {
+                oss << "; fallback SDK version " << D3D12_SDK_VERSION << " returned " << hresult_hex(fallback_factory_hr);
+            }
+#endif
+            throw std::runtime_error(oss.str());
+        }
+
+        factory_experimental_shader_models_hr = device_factory->EnableExperimentalFeatures(1, experimental_features, nullptr, nullptr);
         throw_if_failed(device_factory->CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)), "ID3D12DeviceFactory::CreateDevice");
 
         D3D12_COMMAND_QUEUE_DESC queue_desc = {};
@@ -294,7 +330,7 @@ struct HlslProbeContext {
     }
 
     std::string caps_json() {
-        D3D12_FEATURE_DATA_SHADER_MODEL shader_model = { D3D_SHADER_MODEL_6_9 };
+        D3D12_FEATURE_DATA_SHADER_MODEL shader_model = { D3D_SHADER_MODEL_6_10 };
         HRESULT sm_hr = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model));
         const bool shader_model_query_ok = SUCCEEDED(sm_hr);
 
@@ -311,11 +347,17 @@ struct HlslProbeContext {
         oss << "\"vendor_id\":" << adapter_info.vendor_id << ",";
         oss << "\"device_id\":" << adapter_info.device_id << ",";
         oss << "\"dedicated_video_memory\":" << adapter_info.dedicated_video_memory << ",";
-        oss << "\"agility_sdk_version\":" << HLSL_PROBE_AGILITY_SDK_VERSION << ",";
+        oss << "\"agility_sdk_version\":" << sdk_version_used << ",";
+        oss << "\"agility_sdk_version_requested\":" << HLSL_PROBE_AGILITY_SDK_VERSION << ",";
         oss << "\"agility_sdk_path\":\"" << json_escape(sdk_path) << "\",";
+        oss << "\"experimental_shader_models_global_ok\":" << (SUCCEEDED(global_experimental_shader_models_hr) ? "true" : "false") << ",";
+        oss << "\"experimental_shader_models_global_hresult\":\"" << hresult_hex(global_experimental_shader_models_hr) << "\",";
+        oss << "\"experimental_shader_models_factory_ok\":" << (SUCCEEDED(factory_experimental_shader_models_hr) ? "true" : "false") << ",";
+        oss << "\"experimental_shader_models_factory_hresult\":\"" << hresult_hex(factory_experimental_shader_models_hr) << "\",";
         oss << "\"shader_model_query_ok\":" << (shader_model_query_ok ? "true" : "false") << ",";
         oss << "\"shader_model_query_hresult\":\"" << hresult_hex(sm_hr) << "\",";
         oss << "\"highest_shader_model\":\"" << shader_model_name(shader_model.HighestShaderModel) << "\",";
+        oss << "\"supports_sm_6_10\":" << (shader_model_query_ok && shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_10 ? "true" : "false") << ",";
         oss << "\"supports_sm_6_9\":" << (shader_model_query_ok && shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_9 ? "true" : "false") << ",";
         oss << "\"options9_query_ok\":" << (SUCCEEDED(opt9_hr) ? "true" : "false") << ",";
         oss << "\"options9_query_hresult\":\"" << hresult_hex(opt9_hr) << "\",";

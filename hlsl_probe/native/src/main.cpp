@@ -59,6 +59,54 @@ std::string windows_error_message(DWORD error) {
     return output;
 }
 
+std::string json_escape(const std::string& value) {
+    std::string output;
+    output.reserve(value.size() + 16);
+    for (char ch : value) {
+        switch (ch) {
+        case '"': output += "\\\""; break;
+        case '\\': output += "\\\\"; break;
+        case '\b': output += "\\b"; break;
+        case '\f': output += "\\f"; break;
+        case '\n': output += "\\n"; break;
+        case '\r': output += "\\r"; break;
+        case '\t': output += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(ch) < 0x20) {
+                const char* digits = "0123456789abcdef";
+                output += "\\u00";
+                output += digits[(static_cast<unsigned char>(ch) >> 4) & 0xf];
+                output += digits[static_cast<unsigned char>(ch) & 0xf];
+            } else {
+                output += ch;
+            }
+            break;
+        }
+    }
+    return output;
+}
+
+std::string classify_run_error(const std::string& error) {
+    if (error.find("CreateComputePipelineState") != std::string::npos) {
+        return "pso";
+    }
+    if (error.find("Dispatch") != std::string::npos || error.find("ExecuteCommandLists") != std::string::npos || error.find("Signal") != std::string::npos) {
+        return "dispatch";
+    }
+    if (error.find("readback") != std::string::npos || error.find("Map(output") != std::string::npos) {
+        return "readback";
+    }
+    return "run";
+}
+
+std::string error_json(const std::string& stage, const std::string& target, const std::string& error) {
+    std::ostringstream oss;
+    oss << "{\"status\":\"failed\",\"stage\":\"" << json_escape(stage)
+        << "\",\"target\":\"" << json_escape(target)
+        << "\",\"error\":\"" << json_escape(error) << "\"}";
+    return oss.str();
+}
+
 std::filesystem::path temp_file_path(const wchar_t* prefix, const wchar_t* extension) {
     std::wstring temp_dir(MAX_PATH, L'\0');
     DWORD dir_len = GetTempPathW(static_cast<DWORD>(temp_dir.size()), temp_dir.data());
@@ -246,6 +294,76 @@ void main() {
     return value == 123 ? 0 : 2;
 }
 
+int command_linalg_test(const std::string& target) {
+    static const char* shader = R"HLSL(
+#include <dx/linalg.h>
+
+ByteAddressBuffer MatrixData : register(t0);
+RWByteAddressBuffer Output : register(u0);
+
+[numthreads(1, 1, 1)]
+void main() {
+    dx::linalg::Matrix<dx::linalg::ComponentType::U32, 2, 2, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread> matrix = dx::linalg::Matrix<dx::linalg::ComponentType::U32, 2, 2, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread>::Load<dx::linalg::MatrixLayout::RowMajor>(MatrixData, 0, 8);
+    vector<uint32_t, 2> input = { 5u, 6u };
+    vector<uint32_t, 2> result = dx::linalg::Multiply<uint32_t>(matrix, input);
+    Output.Store(0, result.x);
+    Output.Store(4, result.y);
+}
+)HLSL";
+
+    std::vector<uint8_t> dxil;
+    try {
+        dxil = compile_hlsl(shader, target);
+    } catch (const std::exception& ex) {
+        std::cout << error_json("compile", target, ex.what()) << std::endl;
+        return 1;
+    }
+
+    HlslProbeHandle handle = nullptr;
+    try {
+        handle = create_probe_or_throw();
+    } catch (const std::exception& ex) {
+        std::cout << error_json("device", target, ex.what()) << std::endl;
+        return 1;
+    }
+
+    uint32_t matrix_data[4] = { 1u, 2u, 3u, 4u };
+    uint32_t output_values[2] = { 0u, 0u };
+    HlslProbeInputBuffer input = { matrix_data, sizeof(matrix_data) };
+    HlslProbeOutputBuffer output = { output_values, sizeof(output_values) };
+    HlslProbeRunConfig config = {};
+    config.dispatch_x = 1;
+    config.dispatch_y = 1;
+    config.dispatch_z = 1;
+    config.inputs = &input;
+    config.input_count = 1;
+    config.outputs = &output;
+    config.output_count = 1;
+
+    char* run_json = nullptr;
+    int ok = hlsl_probe_run_dxil(handle, dxil.data(), dxil.size(), &config, &run_json);
+    if (!ok) {
+        std::string error = hlsl_probe_get_last_error(handle);
+        hlsl_probe_destroy(handle);
+        std::cout << error_json(classify_run_error(error), target, error) << std::endl;
+        return 1;
+    }
+
+    constexpr uint32_t expected0 = 17u;
+    constexpr uint32_t expected1 = 39u;
+    const bool passed = output_values[0] == expected0 && output_values[1] == expected1;
+    std::cout << "{\"status\":\"" << (passed ? "passed" : "failed")
+              << "\",\"stage\":\"" << (passed ? "dispatch" : "verify")
+              << "\",\"target\":\"" << json_escape(target)
+              << "\",\"dxil_size\":" << dxil.size()
+              << ",\"expected_values\":[" << expected0 << "," << expected1 << "]"
+              << ",\"output_values\":[" << output_values[0] << "," << output_values[1] << "]"
+              << ",\"run\":" << (run_json ? run_json : "null") << "}" << std::endl;
+    hlsl_probe_free_string(run_json);
+    hlsl_probe_destroy(handle);
+    return passed ? 0 : 2;
+}
+
 int command_compile_only(const std::string& shader_path, const std::string& out_path) {
     std::ifstream in(shader_path, std::ios::binary);
     if (!in) {
@@ -265,6 +383,7 @@ void usage() {
     std::cerr << "Usage:\n"
               << "  hlsl_probe --probe\n"
               << "  hlsl_probe --self-test\n"
+              << "  hlsl_probe --linalg-test [--target cs_6_10]\n"
               << "  hlsl_probe --compile-only shader.hlsl [--out shader.dxil]\n";
 }
 
@@ -282,6 +401,16 @@ int main(int argc, char** argv) {
         }
         if (command == "--self-test") {
             return command_self_test();
+        }
+        if (command == "--linalg-test") {
+            std::string target = "cs_6_10";
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--target" && i + 1 < argc) {
+                    target = argv[++i];
+                }
+            }
+            return command_linalg_test(target);
         }
         if (command == "--compile-only") {
             if (argc < 3) {

@@ -9,6 +9,9 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $SourceDir = Join-Path $RepoRoot "hlsl_probe"
 $BuildDir = Join-Path $SourceDir "build"
+$DxcRoot = Join-Path $RepoRoot "thirdparty\dxc_preview_2026_04_22"
+$AgilityRoot = Join-Path $RepoRoot "thirdparty\microsoft.direct3d.d3d12.1.720.0-preview"
+$AgilitySdkVersion = 720
 
 if ($Clean -and (Test-Path $BuildDir)) {
     Remove-Item -Recurse -Force $BuildDir
@@ -34,7 +37,7 @@ $CmdFile = Join-Path ([System.IO.Path]::GetTempPath()) "build_hlsl_probe_$PID.cm
 @echo off
 call "$VsDevCmd" -arch=x64 -host_arch=x64
 if errorlevel 1 exit /b %errorlevel%
-cmake -S "$SourceDir" -B "$BuildDir" -G "Visual Studio 17 2022" -A x64
+cmake -S "$SourceDir" -B "$BuildDir" -G "Visual Studio 17 2022" -A x64 -DDXC_ROOT="$DxcRoot" -DAGILITY_ROOT="$AgilityRoot" -DAGILITY_SDK_VERSION=$AgilitySdkVersion
 if errorlevel 1 exit /b %errorlevel%
 cmake --build "$BuildDir" --config $Config --parallel
 if errorlevel 1 exit /b %errorlevel%

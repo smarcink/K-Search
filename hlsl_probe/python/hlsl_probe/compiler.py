@@ -6,8 +6,8 @@ from pathlib import Path
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DXC = _REPO_ROOT / "thirdparty" / "dxc_2026_02_20" / "bin" / "x64" / "dxc.exe"
-_HLSL_INCLUDE = _REPO_ROOT / "thirdparty" / "dxc_2026_02_20" / "inc" / "hlsl"
+_DXC = _REPO_ROOT / "thirdparty" / "dxc_preview_2026_04_22" / "bin" / "x64" / "dxc.exe"
+_HLSL_INCLUDE = _REPO_ROOT / "thirdparty" / "dxc_preview_2026_04_22" / "inc" / "hlsl"
 
 
 def compile_hlsl_source(

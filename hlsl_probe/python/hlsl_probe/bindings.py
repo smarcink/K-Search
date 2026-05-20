@@ -215,3 +215,54 @@ void main() { Output.Store(0, 123u); }
     result["output_value"] = value
     result["status"] = "passed" if value == 123 else "failed"
     return result
+
+
+def _classify_run_error(error: str) -> str:
+    if "CreateComputePipelineState" in error:
+        return "pso"
+    if "Dispatch" in error or "ExecuteCommandLists" in error or "Signal" in error:
+        return "dispatch"
+    if "readback" in error or "Map(output" in error:
+        return "readback"
+    return "run"
+
+
+def linalg_test(target: str = "cs_6_10") -> dict:
+    from .compiler import compile_hlsl_source
+
+    shader = """
+#include <dx/linalg.h>
+
+ByteAddressBuffer MatrixData : register(t0);
+RWByteAddressBuffer Output : register(u0);
+
+[numthreads(1, 1, 1)]
+void main() {
+    dx::linalg::Matrix<dx::linalg::ComponentType::U32, 2, 2, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread> matrix = dx::linalg::Matrix<dx::linalg::ComponentType::U32, 2, 2, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread>::Load<dx::linalg::MatrixLayout::RowMajor>(MatrixData, 0, 8);
+    vector<uint32_t, 2> input = { 5u, 6u };
+    vector<uint32_t, 2> result = dx::linalg::Multiply<uint32_t>(matrix, input);
+    Output.Store(0, result.x);
+    Output.Store(4, result.y);
+}
+"""
+    try:
+        dxil = compile_hlsl_source(shader, target=target)
+    except Exception as exc:
+        return {"status": "failed", "stage": "compile", "target": target, "error": str(exc)}
+
+    matrix = b"".join(value.to_bytes(4, "little") for value in [1, 2, 3, 4])
+    try:
+        result, outputs = run_dxil(dxil, inputs=[matrix], output_sizes=[8])
+    except HlslProbeError as exc:
+        error = str(exc)
+        return {"status": "failed", "stage": _classify_run_error(error), "target": target, "error": error}
+
+    values = [int.from_bytes(outputs[0][0:4], "little"), int.from_bytes(outputs[0][4:8], "little")]
+    expected = [17, 39]
+    result["target"] = target
+    result["dxil_size"] = len(dxil)
+    result["expected_values"] = expected
+    result["output_values"] = values
+    result["stage"] = "dispatch" if values == expected else "verify"
+    result["status"] = "passed" if values == expected else "failed"
+    return result
