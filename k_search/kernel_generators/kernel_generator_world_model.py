@@ -101,17 +101,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
         self._artifacts_dir = artifacts_dir
 
         def _llm_call(prompt: str) -> str:
-            if self.model_name.startswith("gpt-5") or self.model_name.startswith("o3"):
-                response = self.client.responses.create(
-                    model=self.model_name,
-                    input=prompt,
-                    reasoning={"effort": self.reasoning_effort},
-                )
-                return (response.output_text or "").strip()
-            response = self.client.chat.completions.create(
-                model=self.model_name, messages=[{"role": "user", "content": prompt}]
-            )
-            return (response.choices[0].message.content or "").strip()
+            return self._llm_complete(prompt)
 
         selection_policy = WorldModelSelectionPolicy()
         if wm_max_difficulty is not None:
@@ -121,6 +111,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
             llm_call=_llm_call,
             target_gpu=self.target_gpu,
             language=self.language,
+            hw_spec_text=self._hw_spec_text,
             config=WorldModelConfig(
                 enabled=bool(enable_world_model),
                 max_chars_per_block=self._world_model_max_chars,
@@ -561,6 +552,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                             action_text=chosen_action_text,
                             code_format=_code_format_text(),
                             target_gpu=self.target_gpu,
+                            hw_spec=self._hw_spec_text,
                         )
                     else:
                         prompt = get_generate_code_from_spec_with_action_prompt_from_text(
@@ -569,6 +561,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                             action_text=chosen_action_text,
                             code_format=_code_format_text(),
                             target_gpu=self.target_gpu,
+                            hw_spec=self._hw_spec_text,
                         )
                 else:
                     if parent_is_root or not base_raw_code:
@@ -612,6 +605,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
                                 base_code=base_for_debug,
+                                hw_spec=self._hw_spec_text,
                             )
                         else:
                             prompt = get_improve_from_spec_prompt_from_text(
@@ -625,6 +619,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
                                 base_code=base_for_debug,
+                                hw_spec=self._hw_spec_text,
                             )
                     else:
                         has_passed_in_cycle = cycle_best_solution is not None
@@ -663,6 +658,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 max_rounds=max_dai,
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
+                                hw_spec=self._hw_spec_text,
                             )
                         else:
                             prompt = get_improve_generated_code_prompt_from_text(
@@ -676,6 +672,7 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
                                 max_rounds=max_dai,
                                 target_gpu=self.target_gpu,
                                 perf_summary=perf_summary,
+                                hw_spec=self._hw_spec_text,
                             )
 
                 prompt = prompt + "\n\n" + render_world_model_section(self._wm.get(task.name), max_chars=self._world_model_max_chars)
@@ -711,6 +708,23 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
 
                 all_passed = bool(getattr(round_eval, "is_passed", lambda: False)())
                 round_score = float(getattr(round_eval, "score", lambda: -1.0)())
+
+                # Log evaluation result
+                _status_str = "PASSED" if all_passed else "FAILED"
+                _eval_lines = [f"[Eval] round={round_num} status={_status_str} score={round_score:.4f}"]
+                if all_passed:
+                    if isinstance(getattr(round_eval, "latency_ms", None), (int, float)):
+                        _eval_lines.append(f"  latency={round_eval.latency_ms:.3f}ms")
+                    if isinstance(getattr(round_eval, "speedup_factor", None), (int, float)):
+                        _eval_lines.append(f"  speedup={round_eval.speedup_factor:.2f}x")
+                    if isinstance(getattr(round_eval, "mean_vs_baseline_factor", None), (int, float)):
+                        _eval_lines.append(f"  vs_baseline={round_eval.mean_vs_baseline_factor:.3f}x")
+                else:
+                    _log_exc = str(getattr(round_eval, "log_excerpt", "") or "")
+                    if _log_exc:
+                        # Show first 300 chars of failure reason
+                        _eval_lines.append(f"  reason: {_log_exc[:300]}")
+                _emit(" ".join(_eval_lines))
 
                 # Save as "last attempt" for the next debug prompt
                 last_eval = round_eval
@@ -842,6 +856,11 @@ class WorldModelKernelGeneratorWithBaseline(KernelGenerator):
 
                 rounds_consumed += 1
                 if no_improve_streak >= stagnation_window or no_improve_over_base_streak >= stagnation_window:
+                    _emit(
+                        f"[STAGNATION] Ending cycle: no_improve={no_improve_streak}/{stagnation_window} "
+                        f"no_beat_base={no_improve_over_base_streak}/{stagnation_window} "
+                        f"cycle_best_score={cycle_best_score:.4f}"
+                    )
                     break
 
             if cycle_best_solution is not None and cycle_best_eval is not None:

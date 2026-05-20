@@ -29,33 +29,14 @@ def _persist_ksearch_solution(
         out_dir = root / "solutions" / str(definition_name or "__unknown__")
         out_dir.mkdir(parents=True, exist_ok=True)
         name = str(getattr(solution, "name", "") or "solution")
-        # Sanitize the filename so model names like "org/model" don't become directories.
-        safe_name = "".join([c if (c.isalnum() or c in ("-", "_", ".")) else "_" for c in name]).strip("_")
-        if not safe_name:
-            safe_name = "solution"
+        # Sanitize filename to prevent path traversal (e.g. "org/model" → "org_model")
+        safe_name = "".join(c if (c.isalnum() or c in ("-", "_", ".")) else "_" for c in name).strip("_") or "solution"
         dest = out_dir / f"{safe_name}.json"
         if KSearchSolution is not None and isinstance(solution, KSearchSolution):
             obj = solution.to_dict()
         else:
             obj = solution.__dict__ if hasattr(solution, "__dict__") else {"solution": str(solution)}
-
-        payload = json.dumps(obj, ensure_ascii=False, indent=2)
-        dest.write_text(payload, encoding="utf-8")
-
-        # Backward-compatibility: also persist under the original unsanitized
-        # solution name so loaders that resolve by "<solution_ref>.json" keep
-        # working for names that contain characters sanitized above.
-        if name != safe_name:
-            legacy_dest = (out_dir / f"{name}.json")
-            legacy_dest_resolved = legacy_dest.resolve()
-            try:
-                legacy_dest_resolved.relative_to(out_dir.resolve())
-            except ValueError:
-                legacy_dest_resolved = None
-
-            if legacy_dest_resolved is not None and legacy_dest_resolved != dest.resolve():
-                legacy_dest_resolved.parent.mkdir(parents=True, exist_ok=True)
-                legacy_dest_resolved.write_text(payload, encoding="utf-8")
+        dest.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
         return dest
     except Exception as e:
         print(f"Error saving k-search solution: {e}")
@@ -120,6 +101,7 @@ def generate_and_evaluate(
     wm_stagnation_window: int = 5,
     wm_max_difficulty: Optional[int] = None,
     artifacts_dir: Optional[str] = None,
+    hw_spec_path: Optional[str] = None,
 ) -> None:
     """
     Generate exactly one solution for the task, then run final evaluation.
@@ -195,6 +177,7 @@ def generate_and_evaluate(
             base_url=base_url,
             artifacts_dir=artifacts_dir,
             wm_max_difficulty=wm_max_difficulty,
+            hw_spec_path=hw_spec_path,
         )
     else:
         # Non-world-model mode: baseline-style generator (task-driven).
@@ -206,6 +189,7 @@ def generate_and_evaluate(
             target_gpu=target_gpu,
             api_key=api_key,
             base_url=base_url,
+            hw_spec_path=hw_spec_path,
         )
 
     # Generate exactly one solution.
@@ -261,49 +245,23 @@ def generate_and_evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate kernels with GPT/Gemini (OpenAI-compatible) and evaluate via task backends.")
-    parser.add_argument("--local", required=False, default=None, help="Path to flashinfer-trace dataset root (flashinfer only)")
-    parser.add_argument(
-        "--task-source",
-        choices=["flashinfer", "gpumode", "kernelbench", "mlx"],
-        default="flashinfer",
-        help="Task backend to use.",
-    )
     parser.add_argument(
         "--task-path",
         default=None,
-        help="Task source path/identifier. For --task-source=flashinfer, this is the dataset root path (defaults to --local).",
+        help="Path to reference .py file with Model class to optimize.",
     )
     parser.add_argument("--definition", default=None, help="Single definition name to target (required)")
-    parser.add_argument("--model-name", required=True, help="LLM model name (e.g., gpt-4.1, gpt-5, gemini-2.5-pro via compatible endpoint)")
-    parser.add_argument("--base-url", default=None, help="OpenAI-compatible base URL for non-OpenAI providers (e.g. Gemini proxy)")
+    parser.add_argument("--model-name", required=True, help="LLM model name (e.g., gpt-4.1, gpt-5, gemini-2.5-pro via OpenAI-compatible endpoint, or claude-opus-4-6/claude-4-6-opus via Anthropic-compatible endpoint)")
+    parser.add_argument("--base-url", default=None, help="Provider base URL (OpenAI-compatible). For Claude/Anthropic models, a /providers/openai URL is auto-rewritten to /providers/anthropic.")
     parser.add_argument("--api-key", default=None, help="API key; if omitted, uses LLM_API_KEY env var")
-    parser.add_argument(
-        "--language",
-        default="triton",
-        choices=["triton", "python", "cuda", "mlx"],
-        help="Target language for generated kernel",
-    )
-    parser.add_argument("--target-gpu", default="H100", help="Target GPU architecture hint for prompts")
+    parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel. 'cuda' uses the CUDA kernel task; 'triton'/'python' uses the Triton kernel task.")
+    parser.add_argument("--target-gpu", default=None, help="Target GPU architecture hint (e.g. 'H100', 'RTX 5090'). Mutually exclusive with --hw-spec.")
+    parser.add_argument("--hw-spec", default=None, help="Path to a HW spec JSON file. Mutually exclusive with --target-gpu.")
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
 
     # Benchmark configuration
-    parser.add_argument("--warmup-runs", type=int, default=10)
-    parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--num-trials", type=int, default=1)
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--atol", type=float, default=1e-2)
-    parser.add_argument("--use-isolated-runner", action="store_true")
-    parser.add_argument(
-        "--parallel-workloads",
-        action="store_true",
-        help="Enable workload-parallel scheduling in Benchmark (useful when evaluating only a small number of solutions).",
-    )
-    parser.add_argument(
-        "--max-parallel-workloads",
-        type=int,
-        default=0,
-        help="Max concurrent workloads when --parallel-workloads is enabled (0 = auto based on visible CUDA devices).",
-    )
     parser.add_argument("--no-save-results", action="store_true", help="Do not write traces to dataset")
     parser.add_argument(
         "--save-solutions",
@@ -315,10 +273,10 @@ def main():
         default=".ksearch",
         help="Base directory for k-search artifacts (solutions, world model snapshots, eval reports).",
     )
-    parser.add_argument("--baseline-solution", default=None, help="Optional baseline solution name to compare against; if absent, 'vs_base' is omitted")
     parser.add_argument("--num-eval-workload", type=int, default=None, help="If set, evaluate only this many workloads per definition; default uses all workloads")
     # Continue optimization options
-    parser.add_argument("--continue-from-solution", default=None, help="Resume optimization from an existing solution name in the dataset")
+    parser.add_argument("--continue-from-solution", default=None,
+                        help="Resume optimization from an existing solution (name, .json path, or directory with kernel sources)")
     parser.add_argument(
         "--continue-from-world-model",
         default=None,
@@ -327,9 +285,7 @@ def main():
             "Use 'auto' to load <artifacts>/<task>/world_model/world_model.json if present."
         ),
     )
-    parser.add_argument("--feedback-workloads", nargs="+", default=None, help="Explicit workload UUIDs to use for optimization feedback rounds")
-    # Nsight Compute
-    parser.add_argument("--feedback-trace-policy", default="first", choices=["first", "random"], help="Policy for selecting feedback traces")
+
     parser.add_argument(
         "--world-model",
         action="store_true",
@@ -352,123 +308,115 @@ def main():
     parser.add_argument("--wandb-project", default=os.getenv("WANDB_PROJECT"), help="W&B project")
     parser.add_argument("--run-name", default=os.getenv("RUN_NAME"), help="W&B run name")
 
-    # GPUMode options
-    parser.add_argument("--gpumode-mode", default="benchmark", help="GPUMode eval mode (e.g., benchmark/test/leaderboard/profile)")
-    parser.add_argument("--gpumode-keep-tmp", action="store_true", help="Keep GPUMode temp working dir for debugging")
-    parser.add_argument("--gpumode-task-dir", default=None, help="Override GPUMode task dir (defaults to vendored trimul task)")
+    # CUDA Kernel options
+    parser.add_argument("--cuda-kernel-num-correct-trials", type=int, default=5, help="Number of correctness trials (cuda_kernel task)")
+    parser.add_argument("--cuda-kernel-num-perf-trials", type=int, default=100, help="Number of performance trials (cuda_kernel task)")
+    parser.add_argument(
+        "--cuda-kernel-precision",
+        default="fp16",
+        choices=["fp32", "fp16", "bf16"],
+        help="dtype for cuda_kernel eval",
+    )
+    parser.add_argument(
+        "--enable-profiling",
+        action="store_true",
+        help="Run hardware profiler on passed kernels to collect metrics for the LLM "
+             "(NCU on CUDA; planned VTune for XPU). No-op on backends without a wired-up profiler.",
+    )
+    parser.add_argument(
+        "--profile-warmup",
+        type=int,
+        default=2,
+        help="Number of unprofiled warmup runs before profiler capture when --enable-profiling is set.",
+    )
+    parser.add_argument(
+        "--profile-repeats",
+        type=int,
+        default=1,
+        help="Number of profiled candidate runs captured by the profiler when --enable-profiling is set.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output: print kernel source and profiler report after each evaluation.",
+    )
 
-    # KernelBench options
-    parser.add_argument("--kernelbench-level", type=int, default=1, help="KernelBench level (1, 2, or 3)")
-    parser.add_argument("--kernelbench-problem-id", type=int, default=1, help="Problem ID within the level")
-    parser.add_argument("--kernelbench-eval-mode", default="local", choices=["local", "modal"], help="Evaluation mode")
-    parser.add_argument("--kernelbench-num-correct-trials", type=int, default=5, help="Number of correctness trials")
-    parser.add_argument("--kernelbench-num-perf-trials", type=int, default=100, help="Number of performance trials")
+    # Triton Kernel options (unified for CUDA / XPU / any accelerator)
+    parser.add_argument("--triton-device", default=None,
+                        help="Device string for Triton kernel task (e.g. cuda:0, xpu:0). Required for --language=triton.")
+    parser.add_argument(
+        "--triton-precision",
+        default="fp16",
+        choices=["fp32", "fp16", "bf16"],
+        help="dtype for Triton kernel eval",
+    )
+    parser.add_argument("--triton-num-correct-trials", type=int, default=5, help="Number of correctness trials (triton kernel task)")
+    parser.add_argument("--triton-num-perf-trials", type=int, default=100, help="Number of performance trials (triton kernel task)")
 
     args = parser.parse_args()
 
-    # MLX runs on Apple Silicon; the CUDA-style --target-gpu hint is not meaningful.
-    # If Metal is available, replace it with an auto-detected device name
-    if str(getattr(args, "task_source", "")).strip().lower() == "mlx":
-        try:
-            from k_search.utils.metal_gpu_info import get_metal_device_name
+    if args.hw_spec and args.target_gpu:
+        parser.error("--hw-spec and --target-gpu are mutually exclusive; provide one or the other, not both.")
+    if not args.target_gpu and not args.hw_spec:
+        parser.error("Either --target-gpu or --hw-spec must be provided.")
 
-            detected = get_metal_device_name().strip()
-            if detected:
-                args.target_gpu = detected
-            else:
-                args.target_gpu = "AppleSilicon"
-        except Exception:
-            args.target_gpu = "AppleSilicon"
+    # When --hw-spec is provided, extract target_gpu from the spec's "name" field.
+    if args.hw_spec and not args.target_gpu:
+        from k_search.hw_specs import HWSpec
+        args.target_gpu = HWSpec.from_file(args.hw_spec).name
+
+    if not args.target_gpu:
+        parser.error("Could not determine target GPU. Provide --target-gpu or a valid --hw-spec with a 'name' field.")
 
     api_key = args.api_key or os.getenv("LLM_API_KEY")
     if not api_key:
         raise ValueError("API key is required (pass --api-key or set LLM_API_KEY)")
 
-    task_source = str(args.task_source or "flashinfer")
-    task_path = str(args.task_path or (args.local or ""))
-    if task_source == "flashinfer":
-        from k_search.tasks.flashinfer_bench_task import FlashInferBenchTask
+    task_path = str(args.task_path or "")
+    language = args.language
 
-        if str(args.language).strip().lower() == "mlx":
-            raise ValueError("--language mlx is only supported with --task-source=mlx")
+    if language == "cuda":
+        from k_search.tasks.cuda_kernel_task import CudaKernelTask
 
         if not task_path:
-            raise ValueError("--local or --task-path is required for --task-source=flashinfer")
-        if not args.definition:
-            raise ValueError("--definition is required")
-        def_name = str(args.definition)
-
-        task = FlashInferBenchTask.from_cli_args(
-            task_path=task_path,
-            definition_name=str(def_name),
-            warmup_runs=args.warmup_runs,
-            iterations=args.iterations,
-            num_trials=args.num_trials,
+            raise ValueError("--task-path is required for --language=cuda (path to reference .py file)")
+        task = CudaKernelTask(
+            ref_path=task_path,
+            gpu=args.target_gpu,
+            num_correct_trials=args.cuda_kernel_num_correct_trials,
+            num_perf_trials=args.cuda_kernel_num_perf_trials,
+            precision=args.cuda_kernel_precision,
             rtol=args.rtol,
             atol=args.atol,
-            use_isolated_runner=args.use_isolated_runner,
-            parallel_workloads=args.parallel_workloads,
-            max_parallel_workloads=args.max_parallel_workloads,
-            baseline_solution=args.baseline_solution,
-            feedback_workloads=args.feedback_workloads,
-            feedback_trace_policy=args.feedback_trace_policy,
-            num_feedback_workloads=5,
+            profile_warmup=args.profile_warmup,
+            profile_repeats=args.profile_repeats,
             artifacts_dir=args.artifacts_dir,
+            enable_ncu_profiling=args.enable_profiling,
+            verbose=args.verbose,
         )
-    elif task_source == "gpumode":
-        from k_search.tasks.gpu_mode_task import GpuModeTriMulTask
+    elif language in ("triton", "python"):
+        from k_search.tasks.triton_kernel_task import TritonKernelTask
 
-        if str(args.language).strip().lower() == "mlx":
-            raise ValueError("--language mlx is only supported with --task-source=mlx")
+        if not task_path:
+            raise ValueError("--task-path is required for --language=triton (path to reference .py file with Model class)")
 
-        task = GpuModeTriMulTask(
-            mode=str(args.gpumode_mode or "benchmark"),
-            keep_tmp=bool(args.gpumode_keep_tmp),
-            task_dir=(str(args.gpumode_task_dir) if args.gpumode_task_dir else None),
+        if not args.triton_device:
+            raise ValueError("--triton-device is required for --language=triton (e.g. cuda:0, xpu:0)")
+
+        task = TritonKernelTask(
+            ref_path=task_path,
+            device=args.triton_device,
+            precision=args.triton_precision,
+            num_correct_trials=args.triton_num_correct_trials,
+            num_perf_trials=args.triton_num_perf_trials,
+            profile_warmup=args.profile_warmup,
+            profile_repeats=args.profile_repeats,
             artifacts_dir=args.artifacts_dir,
+            enable_profiling=args.enable_profiling,
+            verbose=args.verbose,
         )
-    elif task_source == "kernelbench":
-        from k_search.tasks.kernelbench_task import KernelBenchTask
-
-        if str(args.language).strip().lower() == "mlx":
-            raise ValueError("--language mlx is only supported with --task-source=mlx")
-
-        task = KernelBenchTask(
-            level=args.kernelbench_level,
-            problem_id=args.kernelbench_problem_id,
-            eval_mode=args.kernelbench_eval_mode,
-            gpu=args.target_gpu,
-            num_correct_trials=args.kernelbench_num_correct_trials,
-            num_perf_trials=args.kernelbench_num_perf_trials,
-            artifacts_dir=args.artifacts_dir,
-            backend=args.language,  # Pass language as KernelBench evaluation backend
-        )
-    elif task_source == "mlx":
-        # MLX task selector.
-        def_name = str(args.definition or "mlx_mamba_selective_scan_fwd").strip()
-        if def_name in (
-            "mlx_mamba",
-            "mlx_mamba_selective_scan_fwd",
-        ):
-            from k_search.tasks.mlx_mamba_task import MlxMambaSelectiveScanFwdTask
-
-            task = MlxMambaSelectiveScanFwdTask(
-                warmup_runs=args.warmup_runs,
-                iterations=args.iterations,
-                rtol=args.rtol,
-                atol=args.atol,
-                timeout_seconds=300,
-                artifacts_dir=args.artifacts_dir,
-                name="mlx_mamba_selective_scan_fwd",
-            )
-        else:
-            raise ValueError(
-                "Unknown MLX definition. Use --definition one of: "
-                "mlx_mamba_selective_scan_fwd. "
-                f"Got {def_name!r}."
-            )
     else:
-        raise ValueError(f"Unsupported task_source: {task_source}")
+        raise ValueError(f"Unsupported language: {language}")
 
     generate_and_evaluate(
         task=task,
@@ -487,6 +435,7 @@ def main():
         wm_stagnation_window=args.wm_stagnation_window,
         wm_max_difficulty=args.wm_max_difficulty,
         artifacts_dir=args.artifacts_dir,
+        hw_spec_path=args.hw_spec,
         enable_wandb=args.wandb,
         wandb_project=args.wandb_project,
         run_name=args.run_name,

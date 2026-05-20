@@ -5,18 +5,54 @@ This file contains the prompts for baseline agent generation.
 from __future__ import annotations
 
 # CUDA-specific hints
-# Note: keep these hints generic (avoid naming specific low-level instructions).
-CUDA_OPTIMIZATION_HINTS = "** You MUST use MMA to utilize the tensor cores on H100! ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."
+CUDA_OPTIMIZATION_HINTS = """** You MUST use tensor cores via MMA (wmma or mma.sync PTX) whenever the problem dimensions allow (M,N,K >= 16). **
+If tensor core MMA is not practical (e.g., dimensions too small for m16n8k16 tiles), you MUST still use native FP16 math:
+- Use __hfma2() / __hfma() for fused multiply-add on half/half2 types — these have 2x throughput vs FP32 FFMA on CUDA cores.
+- Keep accumulators in __half2 when possible; only widen to FP32 if numerical precision requires it.
+- Do NOT default to __half2float() → float FMA → __float2half() unless you can justify why FP16 accumulation would cause unacceptable error.
+For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step."""
+
+# Intel XPU Triton hints
+XPU_TRITON_OPTIMIZATION_HINTS = """
+** You MUST use MMA to utilize the matrix extensions on the target GPU! For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
+
+Key Triton performance principles for Intel XPU:
+- This kernel targets an Intel GPU — NOT an NVIDIA GPU.
+- Use tl.dot() for matrix operations to leverage matrix extensions.
+  Sub-group sizes are 16 or 32; choose tile sizes that are multiples of these.
+- Stage data through shared memory (SRAM): load input tiles with tl.load into a block,
+  then use tl.dot for the compute. This maximizes data reuse and hides memory latency.
+- Do NOT reference cuDNN, cuBLAS, CUTLASS, MMA instructions, or any NVIDIA-specific APIs.
+- Do NOT use torch.cuda — use torch.xpu for device operations.
+- Triton kernels use the same standard primitives (tl.load, tl.store, tl.dot, tl.program_id, etc.)
+  regardless of backend — the Intel XPU Triton backend compiles them automatically.
+"""
 
 # Triton-appropriate subset
 TRITON_OPTIMIZATION_HINTS = """
 ** For each round, you can see your current best solution and the previous round's summary, therefore you can implement the kernel step by step.
+
+Key Triton performance principles:
+- Use tl.dot() for any reduction/inner-product dimension >= 16 to leverage GPU tensor cores.
+  Scalar FMA loops (wv * xv in tl.static_range) use only CUDA cores and are much slower.
+- For convolutions, consider the implicit-GEMM approach: reshape the convolution as a
+  matrix multiplication (im2col-style or direct) and use tl.dot() on [K, N] x [N, M] tiles.
+- Stage data through shared memory (SRAM): load input tiles with tl.load into a block,
+  then use tl.dot for the compute. This maximizes data reuse and hides memory latency.
+- If your custom kernel cannot beat torch.compile, you likely need a fundamentally
+  different algorithm (not just tile-size tuning). torch.compile uses cuDNN/tensor-cores
+  internally for standard ops like conv2d.
+- Fusing elementwise ops (bias, activation, pooling) into the matmul epilogue is where
+  custom Triton kernels can beat torch.compile — but only if the matmul itself uses
+  tensor cores via tl.dot.
 """
 
 
 TRITON_PROMPT = """Generate a Triton kernel optimized for {target_gpu} GPU for
 
 {definition}
+
+{hw_spec}
 
 Triton Version: 3.3.1
 
@@ -30,6 +66,8 @@ TRITON_OPTIMIZATION_PROMPT = """You are optimizing a Triton kernel for {target_g
 
 Original Specification:
 {definition}
+
+{hw_spec}
 
 Current Implementation Status:
 {trace_logs}
@@ -51,6 +89,8 @@ CUDA_PROMPT = """You are a code generator. Generate a CUDA kernel implementation
 Specification:
 {definition}
 
+{hw_spec}
+
 {per_task_requirement}
 
 {hints}
@@ -61,6 +101,8 @@ CUDA_OPTIMIZATION_PROMPT = """You are optimizing a CUDA kernel for {target_gpu} 
 
 Original Specification:
 {definition}
+
+{hw_spec}
 
 Current Implementation Status:
 {trace_logs}
@@ -77,12 +119,26 @@ Current Implementation:
 Generate the corrected and optimized implementation:"""
 
 
+def _is_intel_gpu(target_gpu: str) -> bool:
+    """Check if the target GPU string refers to an Intel device."""
+    tg = (target_gpu or "").lower()
+    return any(kw in tg for kw in ("intel", "arc", "xpu", "xe", "battlemage", "ponte vecchio", "bmg"))
+
+
+def _select_triton_hints(target_gpu: str) -> str:
+    """Return the appropriate Triton optimization hints for the target GPU."""
+    if _is_intel_gpu(target_gpu):
+        return XPU_TRITON_OPTIMIZATION_HINTS
+    return TRITON_OPTIMIZATION_HINTS
+
+
 def get_prompt_from_definition_text(
     language: str,
     definition_text: str,
     target_gpu: str = "H100",
     *,
     per_task_requirement: str = "",
+    hw_spec: str = "",
 ) -> str:
     """
     Task-agnostic prompt builder: takes a fully-rendered definition text.
@@ -93,12 +149,16 @@ def get_prompt_from_definition_text(
         raise ValueError(f"Unsupported language: {language}")
 
     # Only Triton/CUDA prompts include advanced hints
+    hw_spec_text = str(hw_spec or "").strip()
+
     if language == "triton":
+        hints = _select_triton_hints(target_gpu)
         return prompts[language].format(
             definition=str(definition_text or "").strip(),
             target_gpu=target_gpu,
             per_task_requirement=str(per_task_requirement or "").strip(),
-            hints=TRITON_OPTIMIZATION_HINTS,
+            hints=hints,
+            hw_spec=hw_spec_text,
         )
     if language == "cuda":
         return prompts[language].format(
@@ -106,8 +166,9 @@ def get_prompt_from_definition_text(
             target_gpu=target_gpu,
             per_task_requirement=str(per_task_requirement or "").strip(),
             hints=CUDA_OPTIMIZATION_HINTS,
+            hw_spec=hw_spec_text,
         )
-    return prompts[language].format(definition=str(definition_text or "").strip(), target_gpu=target_gpu)
+    return prompts[language].format(definition=str(definition_text or "").strip(), target_gpu=target_gpu, hw_spec=hw_spec_text)
 
 
 def get_optimization_prompt_from_definition_text(
@@ -120,6 +181,7 @@ def get_optimization_prompt_from_definition_text(
     current_best: str | None = None,
     previous_round_summary: str | None = None,
     per_task_requirement: str = "",
+    hw_spec: str = "",
 ) -> str:
     """
     Task-agnostic optimization prompt builder: takes rendered definition + rendered trace logs.
@@ -133,16 +195,19 @@ def get_optimization_prompt_from_definition_text(
         current_best=current_best,
         previous_round_summary=previous_round_summary,
     )
+    hw_spec_text = str(hw_spec or "").strip()
 
     if language == "triton":
+        hints = _select_triton_hints(target_gpu)
         return optimization_prompts[language].format(
             definition=str(definition_text or "").strip(),
             trace_logs=str(trace_logs or "").strip(),
             current_code=current_code,
             target_gpu=target_gpu,
             per_task_requirement=str(per_task_requirement or "").strip(),
-            hints=TRITON_OPTIMIZATION_HINTS,
+            hints=hints,
             extra_context=extra_context,
+            hw_spec=hw_spec_text,
         )
     if language == "cuda":
         return optimization_prompts[language].format(
@@ -153,6 +218,7 @@ def get_optimization_prompt_from_definition_text(
             per_task_requirement=str(per_task_requirement or "").strip(),
             hints=CUDA_OPTIMIZATION_HINTS,
             extra_context=extra_context,
+            hw_spec=hw_spec_text,
         )
     # Python doesn't use this path
     raise ValueError(f"No optimization prompt available for language: {language}")

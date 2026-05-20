@@ -23,6 +23,24 @@ BASE_DIMENSIONS: tuple[str, ...] = (
     "communication",
 )
 
+XPU_DIMENSIONS: tuple[str, ...] = (
+    "tiling_policy",
+    "subgroup_scheduling",
+    "eu_utilization",
+    "xmx_usage",
+    "memory_bandwidth",
+    "register_pressure",
+    "subgroup_efficiency",
+)
+
+
+def get_dimensions_for_target(target_gpu: str = "H100") -> tuple[str, ...]:
+    """Return the appropriate dimension set for the target GPU."""
+    from k_search.kernel_generators.kernel_generator_prompts import _is_intel_gpu
+    if _is_intel_gpu(target_gpu):
+        return XPU_DIMENSIONS
+    return BASE_DIMENSIONS
+
 DIMENSION_ENTRY_DEFAULT: dict[str, Any] = {
     "hypothesis": "",
     "confidence": 0.0,
@@ -845,16 +863,22 @@ def build_world_model_prompts(
     chosen_action_text: Optional[str],
     prediction: Optional[Prediction],
     max_chars_per_block: int = 6000,
+    hw_spec_text: str = "",
 ) -> WorldModelPrompts:
     """Construct prompts to init/refine the world model as strict JSON."""
     schema = json.dumps(WORLD_MODEL_JSON_SCHEMA_GUIDE, indent=2, sort_keys=True)
     prev = (previous_world_model_json or "").strip()
 
+    hw_block = ""
+    if hw_spec_text and hw_spec_text.strip():
+        hw_block = f"\n{hw_spec_text.strip()}\n\n"
+
     init_prompt = (
         "You are a GPU kernel performance engineer.\n"
         "Create an initial WORLD MODEL for the kernel problem below.\n\n"
         f"Target GPU: {target_gpu}\n"
-        f"Language: {language}\n\n"
+        f"Language: {language}\n"
+        f"{hw_block}"
         "Kernel Specification:\n"
         f"{_truncate(definition_text, max_chars_per_block)}\n\n"
         "Return ONLY a single valid JSON object matching this schema guide (keys must exist; fill strings/lists as needed):\n"
@@ -886,7 +910,11 @@ def build_world_model_prompts(
         "6) High-level kernel skeleton (no code)\n"
         "- Describe phases, what lives in registers vs shared, and where sync is needed.\n\n"
         "7) Candidate kernel families (pruned)\n"
-        "- Propose 2-3 families; for each: intended regime, tiling philosophy, memory strategy, strengths/weaknesses, primary limiter.\n\n"
+        "- Propose 2-3 families; for each: intended regime, tiling philosophy, memory strategy, strengths/weaknesses, primary limiter.\n"
+        "- FULL FUSION PRIORITY: Estimate the total working set per independent parallel unit (all weights, activations, intermediates).\n"
+        "  If it fits in registers + shared memory, propose a maximally-fused single-kernel approach as the TOP candidate.\n"
+        "  Do NOT split into incremental partial fusions when full fusion is register-feasible — partial fusion leaves global memory\n"
+        "  round-trips between sub-kernels that dominate latency. Small dimensions make cross-operation fusion straightforward, not hard.\n\n"
         "- FORBIDDEN: implementation tactics as families (CRITICAL):\n"
         "  - Level-1 Family nodes MUST NOT be named after implementation techniques or optimizations techniques.\n"
         "  - Low-level tactics (e.g., specific instruction names, \"vectorized loads\", \"buffering\", \"pipeline\", \"work stealing\") may appear ONLY as knob choices\n"
@@ -939,6 +967,7 @@ def build_decision_tree_edit_prompt(
     prediction: Optional[Prediction],
     eval_result: Optional[EvalResult],
     max_chars: int = 6000,
+    hw_spec_text: str = "",
 ) -> str:
     """
     Ask the model for a small edit script (ops) to update/insert/split decision tree nodes.
@@ -1009,7 +1038,8 @@ def build_decision_tree_edit_prompt(
     return (
         "You are the WORLD MODEL module.\n"
         "Output ONLY a JSON edit script (no markdown, no extra text).\n\n"
-        f"Target GPU: {target_gpu}\nLanguage: {language}\n\n"
+        f"Target GPU: {target_gpu}\nLanguage: {language}\n"
+        f"{('\n' + str(hw_spec_text or '').strip() + '\n\n') if str(hw_spec_text or '').strip() else '\n'}"
         "Kernel specification (reference):\n"
         f"{def_s}\n\n"
         "Current world model (compact):\n"
@@ -1469,6 +1499,11 @@ def merge_computed_signals(
         if eval_result.speedup_factor is not None:
             try:
                 t["speedup_factor"] = float(eval_result.speedup_factor)
+            except Exception:
+                pass
+        if eval_result.profiler_metrics:
+            try:
+                t["profiler"] = dict(eval_result.profiler_metrics)
             except Exception:
                 pass
 

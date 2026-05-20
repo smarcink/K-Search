@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import os
 
+import httpx
 import openai
 from .kernel_generator_prompts import (
     get_optimization_prompt_from_definition_text,
@@ -33,6 +34,7 @@ class KernelGenerator:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: str = "medium",  # only used for openai reasoning models
+        hw_spec_path: Optional[str] = None,
     ):
         """
         Args:
@@ -42,11 +44,20 @@ class KernelGenerator:
             api_key: API key (if None, uses LLM_API_KEY environment variable)
             base_url: Base URL for the API (need to provide for non-openai api models)
             reasoning_effort: Reasoning effort for OpenAI reasoning models ("low", "medium", "high", default: "medium")
+            hw_spec_path: Optional path to a JSON HW spec file; if None, resolved from target_gpu via registry
         """
         self.model_name = model_name
         self.language = language
-        self.target_gpu = target_gpu
+        self.target_gpu = target_gpu or ""
         self.reasoning_effort = reasoning_effort
+
+        # Resolve hardware spec
+        from k_search.hw_specs import get_hw_spec
+        hw = get_hw_spec(target_gpu or "", spec_path=hw_spec_path)
+        self._hw_spec_text: str = hw.render_for_prompt() if hw else ""
+        # If a spec was resolved, use its canonical name as the target_gpu label in prompts.
+        if hw:
+            self.target_gpu = hw.name
 
         if api_key is None:
             api_key = os.getenv("LLM_API_KEY")
@@ -55,18 +66,54 @@ class KernelGenerator:
                     "API key must be provided or set in LLM_API_KEY environment variable"
                 )
 
-        client_kwargs = {"api_key": api_key}
-        if base_url is not None:
-            client_kwargs["base_url"] = base_url
+        # Decide which provider backend to use based on the model name.
+        # Anthropic (Claude) models are routed through the Anthropic Messages API.
+        self._is_anthropic = self.model_name.lower().startswith("claude")
 
-        self.client = openai.OpenAI(**client_kwargs)
+        ssl_bundle = os.getenv("SSL_CERT_FILE") or os.getenv("REQUESTS_CA_BUNDLE")
+        if ssl_bundle:
+            http_client = httpx.Client(verify=ssl_bundle)
+        elif os.getenv("KSEARCH_SSL_NOVERIFY", ""):
+            http_client = httpx.Client(verify=False)
+        else:
+            http_client = None
+
+        self.client = None
+        self.anthropic_client = None
+
+        if self._is_anthropic:
+            try:
+                import anthropic  # type: ignore
+            except ImportError as e:  # pragma: no cover
+                raise ImportError(
+                    "Using a Claude/Anthropic model requires the 'anthropic' Python SDK. "
+                    "Install it with: pip install anthropic"
+                ) from e
+
+            anth_base_url = base_url
+            # If the user passed an OpenAI-compatible gateway URL with /providers/openai,
+            # transparently switch to the Anthropic-compatible path.
+            if anth_base_url and "/providers/openai" in anth_base_url:
+                anth_base_url = anth_base_url.split("/providers/openai", 1)[0] + "/providers/anthropic"
+            anth_kwargs: Dict[str, Any] = {"auth_token": api_key}
+            if anth_base_url is not None:
+                anth_kwargs["base_url"] = anth_base_url
+            if http_client is not None:
+                anth_kwargs["http_client"] = http_client
+            self.anthropic_client = anthropic.Anthropic(**anth_kwargs)
+        else:
+            client_kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url is not None:
+                client_kwargs["base_url"] = base_url
+            if http_client is not None:
+                client_kwargs["http_client"] = http_client
+            self.client = openai.OpenAI(**client_kwargs)
 
     def _get_supported_language(self) -> SupportedLanguages:
         language_map = {
             "python": SupportedLanguages.PYTHON,
             "triton": SupportedLanguages.TRITON,
             "cuda": SupportedLanguages.CUDA,
-            "mlx": SupportedLanguages.MLX,
         }
         if self.language.lower() in language_map:
             return language_map[self.language.lower()]
@@ -144,6 +191,37 @@ class KernelGenerator:
 
         return code
 
+    def _llm_complete(self, prompt: str) -> str:
+        """Run a single-turn completion against the configured backend and return text."""
+        if self._is_anthropic:
+            # Anthropic Messages API requires `max_tokens`. Pick a generous value so
+            # large generated kernel files are not truncated.
+            response = self.anthropic_client.messages.create(
+                model=self.model_name,
+                max_tokens=16000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            parts = []
+            for block in (response.content or []):
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(text)
+            return ("".join(parts)).strip()
+
+        if self.model_name.startswith("gpt-5") or self.model_name.startswith("o3"):
+            response = self.client.responses.create(
+                model=self.model_name,
+                input=prompt,
+                reasoning={"effort": self.reasoning_effort},
+            )
+            return (response.output_text or "").strip()
+
+        # Default: OpenAI SDK compatible chat.completions
+        response = self.client.chat.completions.create(
+            model=self.model_name, messages=[{"role": "user", "content": prompt}]
+        )
+        return (response.choices[0].message.content or "").strip()
+
     def _generate_code_from_prompt(self, prompt: str):
         # If we fail to parse CUDA XML (missing kernel.h/kernel.cu/main.cpp), retry generation.
         max_parse_retries = 5
@@ -154,16 +232,7 @@ class KernelGenerator:
             try:
                 effective_prompt = prompt
 
-                if self.model_name.startswith("gpt-5") or self.model_name.startswith("o3"):
-                    response = self.client.responses.create(
-                        model=self.model_name, input=effective_prompt, reasoning={"effort": self.reasoning_effort}
-                    )
-                    generated_code = response.output_text.strip()
-                else:  # We use the completions api for OpenAI SDK compatible models
-                    response = self.client.chat.completions.create(
-                        model=self.model_name, messages=[{"role": "user", "content": effective_prompt}]
-                    )
-                    generated_code = response.choices[0].message.content.strip()
+                generated_code = self._llm_complete(effective_prompt)
 
                 cleaned_code = self._clean_generated_code(generated_code)
 
@@ -335,6 +404,7 @@ class KernelGenerator:
                     definition_text,
                     self.target_gpu,
                     per_task_requirement=per_req,
+                    hw_spec=self._hw_spec_text,
                 )
             prompt = _append_baseline_hint(prompt)
             print(prompt)
@@ -557,6 +627,7 @@ class KernelGenerator:
                         current_best=current_best_for_prompt,
                         previous_round_summary=previous_round_summary_for_prompt,
                         per_task_requirement=per_req,
+                        hw_spec=self._hw_spec_text,
                     )
                 opt_prompt = _append_baseline_hint(opt_prompt)
                 print(opt_prompt)

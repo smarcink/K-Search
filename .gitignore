@@ -1,7 +1,21 @@
 __pycache__/
+.venv/
+.env
 logs/
 .ksearch-output*/
 wandb/
 openevolve_output/
 *.log
 .DS_Store
+
+# IDE
+.vscode/
+
+# Build artifacts
+**/build/
+
+# K-Search experiment outputs
+**/ksearch/
+**/ksearch-*/
+**/k_search_out*/
+**/16_256_256/

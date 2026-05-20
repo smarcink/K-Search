@@ -1,0 +1,37 @@
+{
+  "name": "RTX 5090 Mobile",
+  "vendor": "nvidia",
+  "architecture": "Blackwell",
+  "compute_capability": "sm_100",
+  "aliases": ["RTX5090Mobile", "RTX 5090 mobile", "rtx5090 mobile", "5090 mobile"],
+
+  "compute_units": 82,
+  "compute_unit_label": "SM",
+  "max_threads_per_unit": 2048,
+  "simd_width": 32,
+  "simd_unit_label": "Warp",
+  "clock_mhz": 1515,
+  "peak_fp32_tflops": 31.8,
+  "peak_fp16_tflops": 31.8,
+
+  "matrix_accel_label": "Tensor Core",
+  "matrix_accel_ops": [
+    {"dtype": "FP16",  "throughput_tflops": 210.0, "shape": "m16n8k16", "accum_dtype": "FP32"},
+    {"dtype": "FP16",  "throughput_tflops": 420.0, "shape": "m16n8k16", "accum_dtype": "FP16"},
+    {"dtype": "TF32",  "throughput_tflops": 105.0, "shape": "m16n8k8",  "accum_dtype": "FP32"},
+    {"dtype": "INT8",  "throughput_tflops": 838.0, "shape": "m16n8k32", "accum_dtype": "INT32"}
+  ],
+
+  "memory_size_gb": 24,
+  "memory_type": "GDDR7",
+  "memory_bandwidth_gb_s": 896,
+
+  "l2_cache_mb": 64,
+  "shared_mem_kb_per_unit": 128,
+  "shared_mem_label": "Shared Memory",
+  "max_shared_mem_per_block_kb": 127,
+  "registers_per_thread": 255,
+  "registers_per_unit": 65536,
+
+  "notes": []
+}

@@ -85,11 +85,13 @@ class WorldModelManager:
         llm_call: LLMCall,
         target_gpu: str,
         language: str,
+        hw_spec_text: str = "",
         config: WorldModelConfig | None = None,
     ):
         self._llm_call = llm_call
         self._target_gpu = target_gpu
         self._language = language
+        self._hw_spec_text = str(hw_spec_text or "")
         self._cfg = config or WorldModelConfig()
         self._world_models: Dict[str, str] = {}
         # Debug/reporting: last edit-ops application summary (applied vs skipped).
@@ -181,6 +183,7 @@ class WorldModelManager:
             chosen_action_text=None,
             prediction=None,
             max_chars_per_block=self._cfg.max_chars_per_block,
+            hw_spec_text=self._hw_spec_text,
         )
         raw = (self._llm_call(prompts.init_prompt) or "").strip()
         parsed = try_parse_world_model_json(raw)
@@ -731,6 +734,7 @@ class WorldModelManager:
                 prediction=prediction,
                 eval_result=eval_result,
                 max_chars=self._cfg.max_chars_per_block,
+                hw_spec_text=self._hw_spec_text,
             )
             raw = (self._llm_call(edit_prompt) or "").strip()
             edits = try_parse_decision_tree_edit_ops(raw)
@@ -926,6 +930,7 @@ class WorldModelManager:
                 prediction=None,
                 eval_result=None,
                 max_chars=self._cfg.max_chars_per_block,
+                hw_spec_text=self._hw_spec_text,
             )
             raw = (self._llm_call(edit_prompt) or "").strip()
             edits = try_parse_decision_tree_edit_ops(raw)
@@ -1002,6 +1007,7 @@ class WorldModelManager:
             prediction=None,
             eval_result=eval_result,
             max_chars=self._cfg.max_chars_per_block,
+            hw_spec_text=self._hw_spec_text,
         )
         raw = (self._llm_call(edit_prompt) or "").strip()
         edits = try_parse_decision_tree_edit_ops(raw)
