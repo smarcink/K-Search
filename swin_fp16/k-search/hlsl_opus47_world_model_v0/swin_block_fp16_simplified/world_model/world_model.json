@@ -1,0 +1,743 @@
+{
+  "computed_signals": {
+    "round_index": 46,
+    "trace": {
+      "latency_ms": 4.136016,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 9.048449999681907,
+      "speedup_factor": 2.1877212273071254,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "node_swin_block_fp16_simplified_r46_cont_1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.6,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090M Blackwell, 82 SMs, 128KB shmem/SM, 896GB/s. Tensor cores not directly accessible in HLSL cs_6_8 (no WMMA in DXIL standard); rely on FMA. Window N=16, C=32, H=4 hidden=128. Tiny matmuls per window; ~57600 windows.",
+            "notes": "Per-window working set tiny: x[16,32]=1KB fp16, qkv weights 96*32=6KB, proj 32*32=2KB, fc1 128*32=8KB, fc2 32*128=8KB, plus norms/bias/rpe. Total ~26KB weights -> fits easily in shared memory shared across whole threadgroup. Each window has N=16 tokens, 32 channels. Full fusion per window is highly feasible.",
+            "rating_0_to_10": 8.0,
+            "risk": "HLSL lacks tensor core intrinsics in cs_6_8 directly; must use scalar/vector FMA. Compute is modest (mem-bound regime likely)."
+          },
+          "memory_bandwidth": {
+            "notes": "Input 29.49M fp16 = 59MB read + 59MB write. Weights tiny and reusable. Bandwidth-bound on activation I/O. Goal: read x once, write out once, do all compute fused.",
+            "rating_0_to_10": 9.0,
+            "risk": "Naive multi-pass would multiply BW use. Full fusion is essential."
+          },
+          "register_pressure": {
+            "notes": "Per-window: 16 tokens * 32 ch fp16 = 512 fp16 values. With 64 threads/block, ~8 fp16/thread for x. Hidden 16*128=2048 fp16 -> 32/thread. Manageable.",
+            "rating_0_to_10": 7.0,
+            "risk": "Hidden activations may need shared memory rather than registers; 128KB shmem/SM ample."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "PROBLEM: Simplified Swin block on (1,720,1280,32) fp16 with window_size=4x4, single head, no shift. PHASES per window: (1) LN1, (2) QKV linear (32->96), (3) attention 16x16 with rpe bias + softmax, (4) attn@V, (5) proj (32->32), (6) residual, (7) LN2, (8) fc1 (32->128), (9) GELU, (10) fc2 (128->32), (11) residual. WINDOWS: 720/4 * 1280/4 = 180*320 = 57600 independent windows. CANONICAL: each window independent -> map 1 window per threadgroup. WORKING SET per window fits in registers+shmem (weights ~26KB shared across all groups; activations per window: x[16,32]=1KB, qkv[16,96]=3KB, attn[16,16]=512B, fc1_out[16,128]=4KB). FULL FUSION FEASIBLE -> single kernel, read input once, write output once. BOTTLENECK REGIMES: (a) memory-bound on activation streaming (most likely given 896GB/s and ~120MB I/O => ~0.13ms floor); (b) compute-bound if many redundant matmul ops not coalesced; (c) sync-bound if too many barriers across tiny reductions. KNOBS: threads per group (32/64/128), reuse pattern for weights (constant cache vs groupshared preload), accumulation precision (fp32 for LN/softmax stability), layout of activations in groupshared, vectorized loads (float4 of fp16 = 8 elements via uint4 pack). FAMILY A (PRIMARY): single-kernel per-window full fusion, weights in groupshared (loaded by all groups identically) or just read from buffer with L1/L2 cache. FAMILY B: split into 2 kernels (attention + MLP) \u2014 abandoned due to extra global RT. FAMILY C: per-token threadgroup (smaller) \u2014 worse since attention needs cross-token within window. SELECT A. SELF_CHECK: families differ on fusion granularity; cannot be combined.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_started"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused HLSL compute shader where each threadgroup processes one 4x4 window (16 tokens, 32 channels). Use 32 threads/group (one per token mapped via warp), with fp32 accumulation for LN/softmax. Stage activations in groupshared memory; read weights directly from SRV (relies on L1/L2 reuse across the 57600 groups). Dispatch (nW*nH, 1, 1) = (57600,1,1). Compute LN1 -> QKV -> attn(softmax+rpe) -> AV -> proj -> +res -> LN2 -> fc1 -> GELU -> fc2 -> +res -> store.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 2.21,
+          "rationale": "Establishes correctness-first fully fused baseline. Memory traffic minimized to one read+one write of activations. Per-window math is tiny so register pressure is fine.",
+          "score_0_to_1": 0.85,
+          "title": "Full single-kernel fusion: LN+W-MSA+MLP per window, one global read/write"
+        },
+        "choice": "full_fusion_per_window",
+        "confidence_0_to_1": 0.8,
+        "decision": "design_top_level_strategy",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "57600 groups / 82 SMs ~ 702 groups/SM; with 32 threads each => ample occupancy. Tensor cores not used; FMA suffices.",
+            "notes": "Tiny GEMMs (16x32x32, 16x32x128) likely scalar FMA; tensor cores not easily exploitable at this size in HLSL cs_6_8.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Single read + single write of fp16 tensor; ~59MB each direction, bound by 896GB/s ~ 0.13ms theoretical floor.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Per-thread holds QKV tiles and MLP hidden slice; with 32 threads/group and N=16,C=32,H=128, fits in 255 regs.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fuse",
+        "node_type": "decision",
+        "notes": "CURRENT: no code yet; plan is to map 1 window (16 tokens, C=32) per threadgroup, load fp16 input once into groupshared, do LN/QKV/attn/MLP fully in regs+smem, write output once. bottleneck: memory bandwidth (single read/write of 1*720*1280*32 fp16 ~ 59MB total). FOLLOW_THROUGH: aligned_with_intent: yes (no code yet, but this is the design node). UPDATE_BELIEF: no eval yet; strong prior that fusion dominates since weights are tiny (~26KB) and fit in L2/smem. Next bet: implement with 32-thread group (1 warp/window), fp32 accumulators for LN mean/var and softmax, fp16 storage. SELF_CHECK: mutually exclusive with n_multi_window which packs multiple windows per group; this one keeps 1 window/group for simplicity and max occupancy via 57600 groups.",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 7.172992,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                57600,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 7.172992,
+              "hlsl_host_wall_ms": 88.30449999913981,
+              "reference_device": "cuda:0",
+              "score": 1.4890020787033733,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 10.680599998522666,
+            "speedup_factor": 1.4890020787033733,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "7d490adaf33c411db6723dd74721587febc924f1"
+        }
+      },
+      {
+        "action": {
+          "description": "Preload all weight tensors (qkv, proj, fc1, fc2, norms, rpe) into groupshared memory at start of each threadgroup so subsequent matmuls hit shared memory directly. Total ~26KB fits in 128KB/SM budget.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.0,
+          "rationale": "Removes pressure on L1/L2 for weights and gives deterministic latency; helps when L2 working set across concurrent groups grows.",
+          "score_0_to_1": 0.2,
+          "title": "Preload all weights to smem (superseded)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "26KB groupshared per block; with 32-64 threads, plenty of blocks/SM still possible.",
+            "notes": "Reduces variable global-load latency.",
+            "rating_0_to_10": 7.0,
+            "risk": "Reduces occupancy slightly due to shmem allocation."
+          },
+          "memory_bandwidth": {
+            "notes": "Weights are reused 16 tokens * many ops per window, but L2 already caches them; benefit depends on contention.",
+            "rating_0_to_10": 6.0,
+            "risk": "May not improve over relying on L2."
+          },
+          "register_pressure": {
+            "notes": "No change to registers.",
+            "rating_0_to_10": 7.0,
+            "risk": "n/a"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_preload_weights",
+        "node_type": "decision",
+        "notes": "De-prioritized. Negative evidence: extra weight caching beyond fc1W hurts occupancy. fc1W caching alone was beneficial (used in n_mw_split_mlp).",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "n_full_fuse",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use vectorized fp16 loads/stores (e.g., pack 2 fp16 via uint, or use float16_t4) for the window input/output and groupshared transfers to maximize memory throughput.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.5,
+          "rationale": "Activation I/O dominates; coalescing wide loads improves achieved BW substantially.",
+          "score_0_to_1": 0.25,
+          "title": "Vectorized IO fp16x2 (superseded)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.3,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "HLSL cs_6_8 supports 16-bit types; ByteAddressBuffer wide loads possible.",
+            "notes": "Compute unchanged; better load efficiency.",
+            "rating_0_to_10": 7.0,
+            "risk": "Address alignment must be ensured."
+          },
+          "memory_bandwidth": {
+            "notes": "Closer to peak 896GB/s on the dominant traffic.",
+            "rating_0_to_10": 9.0,
+            "risk": "Window layout in memory is strided (H,W,C contiguous in C only), so per-token loads are contiguous in C but tokens are non-contiguous across rows."
+          },
+          "register_pressure": {
+            "notes": "Marginal increase to hold vector registers.",
+            "rating_0_to_10": 7.0,
+            "risk": "n/a"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_vectorized_io",
+        "node_type": "decision",
+        "notes": "Superseded by v1 child variants. Buffer<float16_t> doesn't pack to fp16x2 directly; needs ByteAddressBuffer.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "n_full_fuse",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Map one threadgroup to multiple adjacent windows (e.g., 4 windows per group) to amortize weight loads and increase ILP. Threadgroup size 128, each warp handles one window.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.9,
+          "rationale": "Better weight reuse within the same SM and larger groups reduce dispatch overhead; helps hide latency.",
+          "score_0_to_1": 0.6,
+          "title": "Pack multiple windows per threadgroup (e.g., 4 windows/group)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.7,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "128 threads/group across 4 windows; still small per-warp work but more reuse.",
+            "notes": "Scalar fp32 GEMVs; no tensor cores.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "fc1W cached; fc2W still streamed.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "h[128] live array dominates regs.",
+            "rating_0_to_10": 4.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_multi_window",
+        "node_type": "decision",
+        "notes": "Best so far at 1.90x (4.43ms). Caching more weights on top regressed; next opt should reduce register pressure (split MLP across lanes).",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 4.4266559999999995,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                14400,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 4.4266559999999995,
+              "hlsl_host_wall_ms": 112.10550000214425,
+              "reference_device": "cuda:0",
+              "score": 1.896160442456248,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 8.393649999561603,
+            "speedup_factor": 1.896160442456248,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "d91ad4150dc4a8a17bb1fd953dd95ad14bd669b7"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.21,
+          "rationale": "",
+          "score_0_to_1": 0.88,
+          "title": "Implement v1: 32-thread group, fp16 smem tile, fp32 LN/softmax accum, weights via cbuffer/L2"
+        },
+        "choice": "hlsl_cs_6_8_fp16_smem",
+        "confidence_0_to_1": 0.85,
+        "decision": "implement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_full_fuse_impl_v1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=fused LN1+W-MSA+proj+LN2+MLP per group, 2 windows/group, 128 threads, fp16 smem with fp32 accum for LN/softmax. bottleneck=compute (small per-thread MMAs over C=32 and HIDDEN=128 via scalar FMAs) + smem traffic; weights re-fetched per (group,token).\nFOLLOW_THROUGH: aligned_with_intent=yes; v1 spec realized and exceeded target (2.21x vs 2.5x expected, close enough).\nUPDATE_BELIEF: full-fusion design is healthy; next big wins are (a) weight reuse across tokens in a window (load once into smem/registers), (b) vectorized fp16x2 loads for activations and weights, (c) reducing redundant fp16->fp32 conversions in inner loops. next bet=preload fc1/fc2/qkv/proj weights into smem once per group to cut global/L2 traffic by ~16x (16 tokens reuse same weights).",
+        "overall_rating_0_to_10": 8.5,
+        "parent_id": "n_full_fuse",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 4.132032000000001,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                28800,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 4.132032000000001,
+              "hlsl_host_wall_ms": 85.84845000041241,
+              "reference_device": "cuda:0",
+              "score": 2.2095666249362185,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 9.130000000368454,
+            "speedup_factor": 2.2095666249362185,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "60cc7cc9002035e373650b9a45a0c3a1b35f40be"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 2.19,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.8,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.75,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Better ALU/smem ratio for MMul-shaped ops; no tensor cores yet.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Reduces redundant smem loads of sn/sq by caching per-token vectors in registers.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "32-element float arrays per thread; still within 255 regs.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 12,
+        "node_id": "node_swin_block_fp16_simplified_r12_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Fused Swin block with per-thread register preload of sn/sq before matmuls (QKV, proj, fc1). bottleneck=fc1/fc2 GEMM (4096 FMAs/thread on 128-hidden) dominates; smem-bound for hid buffer accesses. FOLLOW_THROUGH: aligned_with_intent=yes; reduced redundant smem loads in QKV/proj/fc1. UPDATE_BELIEF: 2.19x achieved (4.14ms), best so far; gain came from register reuse of sn[t]. Next bet: reduce fc2 smem traffic by tiling over h dimension and keeping shid[t][h] in registers across multiple c outputs, OR pack fc1_w/fc2_w loads into float2/float4 via groupshared staging. The fc2 loop currently re-reads shid[w_slot][t][h] for every c \u2014 that's 128*32=4096 smem loads per thread.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "n_full_fuse_impl_v1",
+        "solution_ref": {
+          "eval": {
+            "score": 2.1877212273071254,
+            "score_name": "speedup_vs_reference",
+            "status": "passed"
+          },
+          "parent_solution_id": "60cc7cc9002035e373650b9a45a0c3a1b35f40be",
+          "solution_id": "57aac95775bf276ef2a59862217efad4594e7c37"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.52,
+          "rationale": "",
+          "score_0_to_1": 0.15,
+          "title": "Also cache fc2W (32x128=4096 fp16=8KB) in groupshared"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Smem caching dominated by occupancy loss; net regression vs n_multi_window",
+            "rating_0_to_10": 4.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Adds 8KB smem; reduces L2/SRV traffic for fc2W but total smem now ~32KB hurts occupancy",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "h[128] still per-thread; register pressure unchanged",
+            "rating_0_to_10": 4.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_mw_cache_fc2W",
+        "node_type": "decision",
+        "notes": "CURRENT: does=multi-window kernel (4 wins/group, 64 threads) caches fc1W+fc2W in smem (16KB+ for X/K/V/Res1 + 16KB for FC1W/FC2W ~ 32KB). bottleneck=occupancy/register pressure (h[128] + heavy unroll). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: caching fc2W regressed speedup 1.90x -> 1.52x (PERF_GAP expected 2.70x vs observed 1.52x; reason: extra 8KB smem + still-large h[128] register footprint reduced occupancy further, no MAC throughput gain because fc2W was already L2-resident). next bet: revert fc2W caching and instead split MLP across the 16 lanes (n_mw_split_mlp) to shrink h[128] register footprint. PERF_GAP: expected 2.70x, observed 1.52x; cause = smem occupancy penalty dominates fc2W reuse benefit.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "n_multi_window",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 5.871216,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                14400,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 5.871216,
+              "hlsl_host_wall_ms": 100.75140000117244,
+              "reference_device": "cuda:0",
+              "score": 1.522921316377671,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 8.941399999457644,
+            "speedup_factor": 1.522921316377671,
+            "status": "passed"
+          },
+          "parent_solution_id": "d91ad4150dc4a8a17bb1fd953dd95ad14bd669b7",
+          "solution_id": "6ba0e15e8a53795c91e1e58c205e353202d72e3b"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.99,
+          "rationale": "",
+          "score_0_to_1": 0.4,
+          "title": "Split MLP across 16 lanes via smem to cut h[128] register pressure"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Better occupancy should unlock more parallelism on Blackwell",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Adds smem accumulation but stays within budget",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "h[128] dropped to h[8] per lane (128/16) cutting register usage substantially",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_mw_split_mlp",
+        "node_type": "decision",
+        "notes": "CURRENT: does=4 windows/group, 16 threads/window; fc1W cached in smem; per-thread MLP keeps h[128] in regs. bottleneck=compute+register pressure in MLP (FC1 32->128 and FC2 128->32 per thread). FOLLOW_THROUGH: aligned_with_intent=no; intent was to split MLP across lanes via smem to reduce h[128] regs, but implementation still computes full h[128] per thread. UPDATE_BELIEF: hit 1.99x vs ref but did not actually split MLP; below best (2.21x). next bet: actually split FC1 outputs across lanes (each lane computes HIDDEN/TPW=8 outputs) storing h in smem, then FC2 reduces across lanes. PERF_GAP: expected 2.30x, observed 1.99x; cause = intent not implemented (h[128] still per-thread).",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n_multi_window",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 4.440607999999999,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                14400,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 4.440607999999999,
+              "hlsl_host_wall_ms": 107.61149999962072,
+              "reference_device": "cuda:0",
+              "score": 1.9916304254584942,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 8.844050000334391,
+            "speedup_factor": 1.9916304254584942,
+            "status": "passed"
+          },
+          "parent_solution_id": "d91ad4150dc4a8a17bb1fd953dd95ad14bd669b7",
+          "solution_id": "28a4538c1b1a5353c180f7e5594ab3645c898309"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.8,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Smem caching dominated by occupancy loss; net regression vs n_multi_window",
+            "rating_0_to_10": 4.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Adds 8KB smem; reduces L2/SRV traffic for fc2W but total smem now ~32KB hurts occupancy",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "h[128] still per-thread; register pressure unchanged",
+            "rating_0_to_10": 4.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 28,
+        "node_id": "node_swin_block_fp16_simplified_r28_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "n_mw_cache_fc2W",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6ba0e15e8a53795c91e1e58c205e353202d72e3b",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.55,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Better occupancy should unlock more parallelism on Blackwell",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Adds smem accumulation but stays within budget",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "h[128] dropped to h[8] per lane (128/16) cutting register usage substantially",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 36,
+        "node_id": "node_swin_block_fp16_simplified_r36_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "n_mw_split_mlp",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "28a4538c1b1a5353c180f7e5594ab3645c898309",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.3,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.4,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.45,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Better ALU/smem ratio for MMul-shaped ops; no tensor cores yet.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Reduces redundant smem loads of sn/sq by caching per-token vectors in registers.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "32-element float arrays per thread; still within 255 regs.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 46,
+        "node_id": "node_swin_block_fp16_simplified_r46_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does: Reverted to known-good fused W-MSA+MLP per-window kernel (2 windows/group, 64 threads/window, fp16 smem, fp32 accum). bottleneck: compute/latency in fc1 (32x128 GEMV per token x 16 tokens) and fc2 (128->32). FOLLOW_THROUGH: aligned_with_intent: no. if_no: Intent was to reduce sattn redundant smem loads by preloading attn row to registers; actual implementation reverted to base after correctness failure (max_diff=6.06). UPDATE_BELIEF: The naive register cache of sattn[t][*] likely had an indexing/race bug because t is derived from idx/C_DIM and not unique per thread for the attn@V step (multiple threads share same t). next bet: Tackle fc1 GEMV which dominates: cooperatively load sn[t] into registers per token-tile, or split the 32 hidden-units-per-thread loop to reuse loaded x. Alternatively cache fc1 weights in smem since they're reused across all 16 tokens.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "node_swin_block_fp16_simplified_r12_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "57aac95775bf276ef2a59862217efad4594e7c37",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 2.4,
+          "rationale": "",
+          "score_0_to_1": 0.65,
+          "title": "fc1 GEMV: load sn[t] once per thread-iteration, reuse across multiple h outputs"
+        },
+        "choice": "Cache sn[t] in registers across hidden loop in fc1",
+        "confidence_0_to_1": 0.6,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_r46_fc1_xreuse",
+        "node_type": "decision",
+        "notes": "Restructure fc1 loop so each thread handles a (t, h_tile) where sn[t] is loaded once into 32 registers and reused for multiple h values (e.g., 2 or 4 h per thread). Reduces smem traffic on sn by 2-4x in the heaviest op. SELF_CHECK: excludes sibling n_r46_fc1w_smem because that caches weights not activations; mutually exclusive layouts within the same loop restructure.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "node_swin_block_fp16_simplified_r46_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.35,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Cooperatively load fc1_w (128x32 fp16 = 8KB) into smem; all 16 tokens reuse"
+        },
+        "choice": "Stage fc1_w tile in groupshared",
+        "confidence_0_to_1": 0.5,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n_r46_fc1w_smem",
+        "node_type": "decision",
+        "notes": "fc1_w is 128*32*2B=8KB; fits in smem and is reused by 16 tokens per window (2 windows/group => 32 reuses). Convert Buffer reads to one cooperative load + barrier. Risk: smem pressure (currently large) may reduce occupancy. SELF_CHECK: excludes sibling n_r46_fc1_xreuse because that targets activation reuse via registers; both can be combined later but as a first step they are alternative single-change experiments.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "node_swin_block_fp16_simplified_r46_cont_1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Simplified Swin transformer block (LN, W-MSA with rpe, MLP) over a (1,720,1280,32) fp16 tensor with 4x4 windows and single head. 57600 independent windows, each with tiny per-window math (N=16 tokens, C=32, hidden=128). All weights total ~26KB and easily fit in groupshared/L2. The kernel is memory-bandwidth bound: minimizing global I/O via full fusion (single read of input, single write of output) is the dominant optimization. Stable accumulation in fp32 for LayerNorm and softmax is required for the rtol=0.01/atol=0.01 tolerance.",
+  "open_questions": [
+    "Does HLSL cs_6_8 on this driver reliably support native float16_t arithmetic and 16-bit Buffer typed loads, or must we use ByteAddressBuffer with packing?",
+    "What is the input memory layout in practice: is the (B,H,W,C) buffer truly C-innermost contiguous, ensuring coalesced fp16 loads per token?",
+    "Best threadgroup size: 32 (1 warp/window) vs 64 vs 128 (multi-window) \u2014 which minimizes latency on RTX5090M?",
+    "Should weights be preloaded to groupshared or rely on L2? With 57600 groups but small weights, L2 likely caches all weights effectively.",
+    "Can we exploit DP4a/WMMA-like paths via DXIL extensions in cs_6_8, or are we limited to scalar/vector FMA?",
+    "What precision is acceptable in attention softmax \u2014 fp16 accumulation likely violates tolerance; needs fp32.",
+    "Does the GELU approximation choice (tanh vs erf) matter within tolerance vs PyTorch nn.GELU default?",
+    "Are there alignment requirements for vectorized loads given the window stride (W*C=1280*32=40960 elements per row)?"
+  ]
+}

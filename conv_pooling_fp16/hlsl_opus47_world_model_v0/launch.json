@@ -1,0 +1,9 @@
+{
+  "target": "cs_6_8",
+  "entry": "main",
+  "dispatch": [
+    80,
+    45,
+    1
+  ]
+}

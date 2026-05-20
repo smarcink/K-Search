@@ -1,0 +1,24 @@
+{
+  "claude-opus-4-7_elementwise_add_fp16_hlsl_r1_20260521_082521_dffc46ad": {
+    "status": "passed",
+    "latency_ms": 0.713984,
+    "reference_latency_ms": 6.145649999780289,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 8.607545827049751,
+    "log_excerpt": "PASSED: hlsl_gpu=0.713984ms host=208.425500ms ref=6.145650ms speedup=8.608x",
+    "metrics": {
+      "score_name": "speedup_vs_reference",
+      "score": 8.607545827049751,
+      "hlsl_gpu_time_ms": 0.713984,
+      "hlsl_host_wall_ms": 208.42549999997573,
+      "target": "cs_6_8",
+      "dispatch": [
+        32768,
+        1,
+        1
+      ],
+      "reference_device": "cpu"
+    },
+    "profiler_metrics": {}
+  }
+}

@@ -254,7 +254,7 @@ def main():
     parser.add_argument("--model-name", required=True, help="LLM model name (e.g., gpt-4.1, gpt-5, gemini-2.5-pro via OpenAI-compatible endpoint, or claude-opus-4-6/claude-4-6-opus via Anthropic-compatible endpoint)")
     parser.add_argument("--base-url", default=None, help="Provider base URL (OpenAI-compatible). For Claude/Anthropic models, a /providers/openai URL is auto-rewritten to /providers/anthropic.")
     parser.add_argument("--api-key", default=None, help="API key; if omitted, uses LLM_API_KEY env var")
-    parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda"], help="Target language for generated kernel. 'cuda' uses the CUDA kernel task; 'triton'/'python' uses the Triton kernel task.")
+    parser.add_argument("--language", default="triton", choices=["triton", "python", "cuda", "hlsl"], help="Target language for generated kernel. 'cuda' uses the CUDA kernel task; 'triton'/'python' uses the Triton kernel task; 'hlsl' uses the Direct3D 12 probe task.")
     parser.add_argument("--target-gpu", default=None, help="Target GPU architecture hint (e.g. 'H100', 'RTX 5090'). Mutually exclusive with --hw-spec.")
     parser.add_argument("--hw-spec", default=None, help="Path to a HW spec JSON file. Mutually exclusive with --target-gpu.")
     parser.add_argument("--max-opt-rounds", type=int, default=5, help="Max optimization rounds for each solution generation")
@@ -353,6 +353,27 @@ def main():
     parser.add_argument("--triton-num-correct-trials", type=int, default=5, help="Number of correctness trials (triton kernel task)")
     parser.add_argument("--triton-num-perf-trials", type=int, default=100, help="Number of performance trials (triton kernel task)")
 
+    # HLSL Kernel options (Direct3D 12 probe backend)
+    parser.add_argument("--hlsl-target", default="cs_6_8", help="DXC shader model target for HLSL kernels (default: cs_6_8)")
+    parser.add_argument(
+        "--hlsl-linalg",
+        default="auto",
+        choices=["auto", "off", "force"],
+        help="Enable D3D12 Linear Algebra prompt/eval path when available (auto, off, force)",
+    )
+    parser.add_argument(
+        "--hlsl-precision",
+        default="fp16",
+        choices=["fp32", "fp16"],
+        help="dtype for HLSL reference/eval tensor conversion",
+    )
+    parser.add_argument("--hlsl-reference-device", default="auto", help="PyTorch device for reference evaluation (auto, cuda, xpu, cpu)")
+    parser.add_argument("--hlsl-num-correct-trials", type=int, default=5, help="Number of correctness trials (hlsl kernel task)")
+    parser.add_argument("--hlsl-num-perf-trials", type=int, default=100, help="Number of performance trials (hlsl kernel task)")
+    parser.add_argument("--hlsl-num-warmup", type=int, default=5, help="Warmup dispatches/runs before HLSL timing")
+    parser.add_argument("--hlsl-timeout", type=int, default=300, help="Timeout in seconds for HLSL evaluator subprocess")
+    parser.add_argument("--hlsl-agility-sdk-path", default=None, help="Optional Agility SDK runtime path passed to hlsl_probe")
+
     args = parser.parse_args()
 
     if args.hw_spec and args.target_gpu:
@@ -413,6 +434,29 @@ def main():
             profile_repeats=args.profile_repeats,
             artifacts_dir=args.artifacts_dir,
             enable_profiling=args.enable_profiling,
+            verbose=args.verbose,
+        )
+    elif language == "hlsl":
+        from k_search.tasks.hlsl_kernel_task import HlslKernelTask
+
+        if not task_path:
+            raise ValueError("--task-path is required for --language=hlsl (path to reference .py file)")
+
+        task = HlslKernelTask(
+            ref_path=task_path,
+            gpu=args.target_gpu,
+            hlsl_target=args.hlsl_target,
+            hlsl_linalg=args.hlsl_linalg,
+            precision=args.hlsl_precision,
+            reference_device=args.hlsl_reference_device,
+            num_correct_trials=args.hlsl_num_correct_trials,
+            num_perf_trials=args.hlsl_num_perf_trials,
+            num_warmup=args.hlsl_num_warmup,
+            timeout=args.hlsl_timeout,
+            rtol=args.rtol,
+            atol=args.atol,
+            agility_sdk_path=args.hlsl_agility_sdk_path,
+            artifacts_dir=args.artifacts_dir,
             verbose=args.verbose,
         )
     else:

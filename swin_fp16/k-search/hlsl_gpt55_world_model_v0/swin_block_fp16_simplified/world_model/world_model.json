@@ -1,0 +1,320 @@
+{
+  "computed_signals": {
+    "round_index": 29,
+    "trace": {
+      "latency_ms": 25.129072,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 9.154450000096404,
+      "speedup_factor": 0.3642971773926392,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "phase_reused_shared_weight_tile",
+    "nodes": [
+      {
+        "action": {
+          "description": "No implementation action at the root; this node records the initial analysis and branches into mutually exclusive first-kernel ownership plans.",
+          "difficulty_1_to_5": 1,
+          "expected_vs_baseline_factor": 0.57,
+          "rationale": "Root is a dummy decision point required by the world model.",
+          "score_0_to_1": 0.56,
+          "title": "Analysis root"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.74,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX 5090 Mobile has ample FP32/FP16 throughput, 82 SMs, 32-wide waves, 64 MB L2, but HLSL cs_6_8 path limits groupshared memory to 32 KiB per threadgroup.",
+            "notes": "The workload is small fixed-window dense linear algebra plus softmax; hardware fit is good, but HLSL tensor-core access is uncertain and scalar code may dominate.",
+            "rating_0_to_10": 7.0,
+            "risk": "Incorrect use of groupshared or excessive scalar reductions could underuse the GPU despite high theoretical throughput."
+          },
+          "memory_bandwidth": {
+            "notes": "Input and output alone are about 118 MB each, while all model weights are tiny and should remain resident in L2; avoiding global intermediates is the largest bandwidth win.",
+            "rating_0_to_10": 7.0,
+            "risk": "Repeated state reads per token/window can create heavy L2 traffic if weights are not staged or reused effectively."
+          },
+          "register_pressure": {
+            "notes": "Full fusion is plausible because C=32 and N=16 are fixed, but q/k/v, softmax rows, MLP accumulators, and layernorm temporaries can quickly exceed comfortable per-thread registers.",
+            "rating_0_to_10": 6.0,
+            "risk": "A naive all-in-register mapping may reduce occupancy or spill, especially when fc1/fc2 accumulators are kept for many channels."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "Evidence now includes a passed fused HLSL implementation at 5.992704 ms vs 10.5455 ms reference, 1.76x speedup. The root family choice space remains useful: ownership granularity is the dominant architectural branch, while lower-level tactics should be chained below the successful single-window family.",
+        "overall_rating_0_to_10": 6.6,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a full fused shader where one threadgroup owns one 4x4 window and computes LN1, QKV, attention, projection, residual, LN2, MLP, and final write without global intermediates. Use registers for owner-local reductions/accumulators and a compact q/k/v groupshared exchange only where cross-token attention needs it.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.57,
+          "rationale": "This directly exploits the fixed small window and channel dimensions, eliminates all intermediate global round-trips, and keeps the ownership model simple enough for a first correct high-performance kernel.",
+          "score_0_to_1": 0.83,
+          "title": "Single-window full-block ownership"
+        },
+        "choice": "one_threadgroup_per_4x4_window",
+        "confidence_0_to_1": 0.88,
+        "decision": "parallel_unit_ownership",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "57600 windows provide enough groups for 82 SMs; C=32 and N=16 align naturally with 32-lane waves and small reductions.",
+            "notes": "Wave-size reductions align well with C=32, enabling one lane per channel and efficient WaveActiveSum patterns. It still uses scalar FP32/FP16 conversions rather than tensor cores, but the small dimensions favor wave-level scalar execution.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "One group per window reloads small weights for each window, but it writes only final output and keeps most per-window intermediates on-chip. The measured 1.76x speedup shows traffic is acceptable for the fixed C=32,H=128 shape.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "The full fused schedule has nontrivial live ranges and shared exchange buffers, but limiting ownership to one 4x4 window keeps pressure manageable compared with attempted batching.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "single_window_full_block_owner",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The passed single-window family assigns one threadgroup to one 4x4 window and fuses the entire transformer-like block, using wave reductions for 32-channel dot products and writing only final output. This matches the compact-window shape and avoids staging global intermediate tensors.\n- bottleneck: remaining cost is mostly sync and scalar transcendental/MLP compute, with some repeated tiny-weight bandwidth.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes.\nUPDATE_BELIEF:\n- The sibling window-batch attempt was much slower, which increases confidence that the smaller ownership granularity is the safer end-to-end mapping for this HLSL/DXIL runner. The prior 1.76x speedup is now the best evidence-backed path.\n- next bet: Apply a lifetime refinement under this node: reuse one compact groupshared weight/input tile per phase and keep owner-local values in registers to reduce simultaneous shared residency and barriers without changing ownership.\nSELF_CHECK: This root child is mutually exclusive with window_batch_full_block_owner and output_token_block_owner because the full block for exactly one 4x4 window is owned by one threadgroup.",
+        "overall_rating_0_to_10": 8.7,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": 1.7597231565838418,
+            "score_name": "speedup_vs_reference",
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "ec3b74949568aeda52b83dc6fea001fb5866796a"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a fused shader where one threadgroup owns a small batch of adjacent 4x4 windows and runs the complete block for all of them, using the repeated model state across those windows to reduce per-window state traffic while still writing only final outputs.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 2.75,
+          "rationale": "Model weights are tiny but reused for every window; batching windows inside a group can amortize cooperative state movement and improve arithmetic per synchronization if register/shared-memory pressure remains controlled.",
+          "score_0_to_1": 0.18,
+          "title": "Window-batch full-block ownership"
+        },
+        "choice": "one_threadgroup_per_small_window_batch",
+        "confidence_0_to_1": 0.81,
+        "decision": "parallel_unit_ownership",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "The 32 KiB HLSL groupshared limit constrains simultaneous state tiles plus per-window q/k/v exchange buffers; larger groups may reduce occupancy on 82 SMs.",
+            "notes": "The shader uses wave reductions over C=32 and scalar FP32 math/exp/tanh rather than tensor cores. Larger window batches increase scalar work and barriers without improving hardware fit.",
+            "rating_0_to_10": 3.0,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "The intended batching should amortize tiny state tensors, but measured latency indicates weight/state reuse was not enough to offset extra per-group work, occupancy loss, and synchronization. Input/output traffic is small relative to redundant arithmetic and intermediate movement.",
+            "rating_0_to_10": 4.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Batching adjacent windows increases live values and intermediate arrays; even with groupshared staging, the full fused block stresses registers and occupancy. This likely reduces active warps and hides memory latency poorly.",
+            "rating_0_to_10": 2.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "window_batch_full_block_owner",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The current solution launches one 256-thread group per 4x4 window despite the node intent of batching multiple adjacent windows; it fuses LN, QKV, attention, projection, second LN, MLP, and final residual for all 16 tokens. It uses gs_tmp/gs_big/gs_attn/gs_res as cross-wave exchange buffers and intermediate storage, with repeated group-wide barriers between phases.\n- bottleneck: sync/latency and occupancy/register pressure dominate; bandwidth savings from model-state reuse did not materialize.\n- groupshared classification: gs_tmp is an exchange buffer for normalized token vectors and attention outputs, produced by token/wave owners and consumed by projection/MLP waves with one reuse per phase; gs_big is an exchange buffer for QKV and hidden activations, produced by reduction waves and consumed by attention/MLP output waves with limited reuse; gs_attn is an exchange buffer for softmax rows, produced by lane-0 attention row owners and consumed by value accumulation threads; gs_res is an exchange buffer for residual values, produced after attention projection and consumed by LN2/output. Each cross-thread read requires the following GroupMemoryBarrierWithGroupSync, causing phase-by-phase synchronization.\nFOLLOW_THROUGH:\n- aligned_with_intent: no.\n- if_no: Expected intent was one threadgroup owning a small batch of adjacent windows to amortize repeated model-state movement. The implemented code still maps one group to one window, while adding a heavy full-block fused schedule with many shared-memory exchanges.\nUPDATE_BELIEF:\n- The evaluation passed numerically but was much slower than reference: 25.129 ms vs 9.154 ms, only 0.364x speedup. This strongly downgrades the window-batch family as currently realized and suggests that full-block ownership with excessive barriers is fragile.\n- next bet: Return to the proven single-window full-block owner and refine shared-memory lifetime/weight tiling, because the single-window result already matched the expected latency factor and avoids the failed batching overhead. If this family is revisited, first repair the implementation to actually batch windows and stream a single reusable tile rather than retaining many phase buffers.\nPERF_GAP:\n- expected: latency factor about 0.48x baseline/reference from batching state reuse.\n- observed: latency factor about 2.75x reference, equivalent to 0.364x speedup.\n- hypothesized_reason: implementation mismatch plus high synchronization count, extra exchange-buffer traffic, scalar reductions, and lower occupancy overwhelmed any state-reuse benefit.\nSELF_CHECK: This root child is mutually exclusive with single_window_full_block_owner and output_token_block_owner because ownership is intended to cover a batch of windows per group, not one window or one output row/token.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 25.129072,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                57600,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 25.129072,
+              "hlsl_host_wall_ms": 101.40679999949498,
+              "reference_device": "cuda:0",
+              "score": 0.3642971773926392,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 9.154450000096404,
+            "speedup_factor": 0.3642971773926392,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "0aeeae20172d20baf0c4e7f641957d0a846d1494"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a fused shader where work is owned by output tokens or attention rows rather than whole windows, streaming or recomputing peer token quantities as needed and minimizing groupshared exchange. Preserve single-dispatch final-output-only behavior.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.82,
+          "rationale": "This is a lower-shared-memory fallback that may simplify synchronization and avoid the 32 KiB groupshared constraint, at the cost of redundant QKV/LN and state reads.",
+          "score_0_to_1": 0.47,
+          "title": "Output-token / attention-row ownership"
+        },
+        "choice": "owner_per_output_token_or_attention_row",
+        "confidence_0_to_1": 0.48,
+        "decision": "parallel_unit_ownership",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Token-level ownership creates far more independent work items but each has small reductions over C=32 and N=16, which may map well to waves but poorly to tensor cores.",
+            "notes": "Attention rows map naturally to wave reductions, but MLP/projection phases would become fragmented and lose cross-phase fusion. This is less compelling after the single-window full-block evidence.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Per-token or per-attention-row ownership risks rereading weights and token activations many times and may require materializing phase outputs to UAV/SRV because the current runner is single-dispatch without graph staging.",
+            "rating_0_to_10": 3.5,
+            "risk": "high"
+          },
+          "register_pressure": {
+            "notes": "Smaller owner units reduce per-group live state and may improve occupancy, but that benefit is likely offset by more dispatch work units and redundant loads.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "output_token_block_owner",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: Open alternative would assign ownership to individual output tokens or attention rows rather than completing a full window/block in one group. It has no attached implementation yet.\n- bottleneck: expected bandwidth/materialization and redundant state loads are the main risks; latency could also rise from fragmented ownership.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes, still open and not evaluated.\nUPDATE_BELIEF:\n- The failed heavy window-batch result shows that larger ownership is risky, but it does not prove per-row ownership is better; the proven single-window full-block path remains stronger. This node is kept as an alternative, but downscored because fragmentation may forfeit fusion benefits.\n- next bet: Only explore this after exhausting single-window refinements, or if register/sync profiling shows full-block fusion cannot improve further.\nSELF_CHECK: This root child is mutually exclusive with the full-block window owners because ownership would be per token/row rather than per complete window or window batch.",
+        "overall_rating_0_to_10": 5.8,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.52,
+          "rationale": "",
+          "score_0_to_1": 0.8,
+          "title": "Single reused shared/input tile per phase"
+        },
+        "choice": "single_reused_weight_tile_per_phase",
+        "confidence_0_to_1": 0.65,
+        "decision": "shared_memory_lifetime_refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Preserves the good C=32 wave-reduction mapping from the single-window owner while targeting fewer barriers and less shared-memory traffic.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "The small state tensors can be streamed or cooperatively staged phase-by-phase, reducing repeated loads without retaining all weights or intermediate tensors in groupshared at once.",
+            "rating_0_to_10": 7.5,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Reusing one tile and keeping single-owner intermediates in registers should shorten live ranges and reduce shared allocation pressure versus simultaneous gs buffers.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "phase_reused_shared_weight_tile",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: Open refinement under the passed single-window owner; replace simultaneous phase buffers/weight residency with a single reused groupshared tile where it has true cross-thread reuse, and otherwise keep values in registers. No attached implementation yet.\n- bottleneck: expected bottleneck is sync/shared-memory lifetime, not raw bandwidth.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes, this is a composable child refinement of the best evidence-backed family.\nUPDATE_BELIEF:\n- The bad window-batch result makes a conservative refinement of the known-good single-window mapping more attractive than changing top-level ownership. Reducing barriers and shared residency should address the current shader's most likely overhead without risking major remapping.\n- next bet: Implement this next; classify every groupshared array as either a reusable read-only tile, exchange buffer, or reduction scratch, and remove phase barriers where values are register-owned or wave-local.\nSELF_CHECK: This is not a sibling ownership family; it is a child optimization of single_window_full_block_owner and therefore composes with, rather than competes with, that parent.",
+        "overall_rating_0_to_10": 8.4,
+        "parent_id": "single_window_full_block_owner",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": "ec3b74949568aeda52b83dc6fea001fb5866796a",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.35,
+          "rationale": "",
+          "score_0_to_1": 0.36,
+          "title": "Repair batched-window path with streamed reusable tile"
+        },
+        "choice": "stream_one_reusable_tile_and_reduce_barriers",
+        "confidence_0_to_1": 0.42,
+        "decision": "shared_memory_lifetime_refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Does not change the scalar wave-reduction compute pattern; improvement would come from fewer barriers and less shared traffic, not better tensor-core fit.",
+            "rating_0_to_10": 4.5,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "If actual adjacent-window batching is implemented, a streamed shared tile could amortize small model-state loads across windows. Expected benefit is limited because weights are tiny and likely L2-resident.",
+            "rating_0_to_10": 5.5,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Still inherits the larger ownership unit's occupancy risk, but streaming one tile and dropping unnecessary exchange buffers may reduce live state enough to make the family testable.",
+            "rating_0_to_10": 4.5,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "window_batch_streamed_tile_repair",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: Proposed child repair for the failed window-batch family: make the implementation actually batch adjacent windows only where state reuse is real, and use one short-lived reusable tile per phase instead of broad phase buffers. No implementation attached.\n- bottleneck: sync/register pressure remains the main risk.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes, as a refinement/repair of the parent rather than a new top-level ownership family.\nUPDATE_BELIEF:\n- Parent evidence is poor, so this node is low priority and should only be tried if preserving the window-batch idea is required. It exists to satisfy a composable next step after the passed parent solution while acknowledging the family is currently dominated by single-window ownership.\n- next bet: Prefer phase_reused_shared_weight_tile under single_window_full_block_owner first; revisit this only if batching can be implemented with fewer barriers and demonstrable state reuse.\nSELF_CHECK: This child is a refinement of window_batch_full_block_owner, not a sibling alternative to single-window or output-token ownership.",
+        "overall_rating_0_to_10": 4.6,
+        "parent_id": "window_batch_full_block_owner",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": "0aeeae20172d20baf0c4e7f641957d0a846d1494",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This is a fixed-shape, dense, windowed Swin block inference kernel: 57600 independent 4x4 windows over NHWC fp16 input with C=32, single-head N=16 attention, two fp32-accumulating LayerNorm reductions, several tiny dense linear layers, softmax, GELU, and residuals. The best hypothesis is a maximally fused single-dispatch shader that writes only the final tensor, because temporary buffers and multi-dispatch are unavailable and global intermediate traffic would dominate. Model state is only about 25 KiB and highly reused, while q/k/v per window is about 3 KiB; groupshared should be used selectively as a q/k/v exchange buffer and possibly as a compact read-only state tile, not as a home for all intermediates. Likely bottlenecks are L2/state traffic for direct-state scalar code, register pressure and synchronization for fully fused shared-exchange code, and redundant compute for token-owned fallback mappings.",
+  "open_questions": [
+    "Does the evaluator expect PyTorch LayerNorm default eps=1e-5 with fp32 mean/variance and half output rounding at each module boundary, or is keeping fused intermediates in fp32 acceptable within rtol=0.01/atol=0.01?",
+    "Is HLSL float16_t arithmetic and typed Buffer<float16_t>/RWBuffer<float16_t> fully supported and performant in the runner for cs_6_8 on this path?",
+    "Which GELU form matches the reference closely enough: exact erf-based nn.GELU default or a tanh/polynomial approximation?",
+    "What is the actual baseline latency and scoring function, especially whether GPU timestamp excludes CPU staging and descriptor setup as stated?",
+    "Will direct SRV state reads be served efficiently from the 64 MB L2/constant path, or is explicit per-group read-only staging of qkv/proj/fc weights necessary despite the 32 KiB groupshared limit?",
+    "What threadgroup sizes and wave mappings does the HLSL compiler generate efficiently for small reductions over C=32, N=16, and hidden=128?",
+    "Are minor differences from Tensor Core matmul accumulation order in PyTorch tolerated for attention scores and linear layers under the 0.01 absolute/relative tolerance?"
+  ]
+}

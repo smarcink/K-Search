@@ -1,0 +1,25 @@
+{
+  "gpt-5.5_linear_projection_fp16_hlsl_r17_20260527_101906_1fc6181e": {
+    "status": "passed",
+    "latency_ms": 0.647656,
+    "reference_latency_ms": 4.623200000423822,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 7.138357400261592,
+    "log_excerpt": "PASSED: hlsl_gpu=0.647656ms host=100.514250ms ref=4.623200ms speedup=7.138x",
+    "metrics": {
+      "score_name": "speedup_vs_reference",
+      "score": 7.138357400261592,
+      "hlsl_gpu_time_ms": 0.647656,
+      "hlsl_host_wall_ms": 100.51424999983283,
+      "target": "cs_6_10",
+      "dispatch": [
+        512,
+        8,
+        1
+      ],
+      "buffer_view": "raw",
+      "reference_device": "cpu"
+    },
+    "profiler_metrics": {}
+  }
+}
