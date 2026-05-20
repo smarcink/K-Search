@@ -1,6 +1,7 @@
 __pycache__/
 .venv/
 .env
+intel-certs/
 logs/
 .ksearch-output*/
 wandb/

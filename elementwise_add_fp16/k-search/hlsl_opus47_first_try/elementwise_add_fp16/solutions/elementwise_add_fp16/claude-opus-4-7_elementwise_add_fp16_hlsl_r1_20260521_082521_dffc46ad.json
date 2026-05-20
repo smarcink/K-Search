@@ -1,0 +1,24 @@
+{
+  "name": "claude-opus-4-7_elementwise_add_fp16_hlsl_r1_20260521_082521_dffc46ad",
+  "definition": "elementwise_add_fp16",
+  "author": "claude-opus-4-7",
+  "description": "HLSL kernel optimization for elementwise_add_fp16 round 1 (generated 20260521_082521 uid=dffc46ad)",
+  "spec": {
+    "language": "hlsl",
+    "target_hardware": [
+      "RTX 5090 Mobile"
+    ],
+    "entry_point": "kernel.hlsl::main",
+    "dependencies": []
+  },
+  "sources": [
+    {
+      "path": "kernel.hlsl",
+      "content": "Buffer<float16_t> in0 : register(t0);\nBuffer<float16_t> in1 : register(t1);\nRWBuffer<float16_t> out0 : register(u0);\n\n[numthreads(256, 1, 1)]\nvoid main(uint3 gid : SV_DispatchThreadID)\n{\n    uint base = gid.x * 8;\n    [unroll]\n    for (uint i = 0; i < 8; ++i) {\n        uint idx = base + i;\n        out0[idx] = in0[idx] + in1[idx];\n    }\n}"
+    },
+    {
+      "path": "launch.json",
+      "content": "{\n  \"target\": \"cs_6_8\",\n  \"entry\": \"main\",\n  \"dispatch\": [\n    32768,\n    1,\n    1\n  ]\n}"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "gpt-5.5_swin_block_fp16_simplified_hlsl_r19_20260522_091716_6b0d1bba": {
+    "status": "passed",
+    "latency_ms": 5.9168,
+    "reference_latency_ms": 8.93735000045126,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 1.510503988718777,
+    "log_excerpt": "PASSED: hlsl_gpu=5.916800ms host=74.908550ms ref=8.937350ms speedup=1.511x",
+    "metrics": {
+      "score_name": "speedup_vs_reference",
+      "score": 1.510503988718777,
+      "hlsl_gpu_time_ms": 5.9168,
+      "hlsl_host_wall_ms": 74.90854999923613,
+      "target": "cs_6_8",
+      "dispatch": [
+        320,
+        180,
+        1
+      ],
+      "reference_device": "cuda:0"
+    },
+    "profiler_metrics": {}
+  }
+}

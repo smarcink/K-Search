@@ -194,6 +194,7 @@ class SupportedLanguages(str, Enum):
     PYTHON = "python"
     TRITON = "triton"
     CUDA = "cuda"
+    HLSL = "hlsl"
     CPP = "cpp"
 
 
@@ -285,15 +286,26 @@ class Solution:
 def code_from_solution(language: str, solution: Solution) -> tuple[Any, Any]:
     """
     Convert a task_base.Solution back into (current_code, current_raw_code) expected by generators:
-    - For CUDA: return ({path: content} dict, reconstructed XML blocks string)
+    - For CUDA/HLSL: return ({path: content} dict, reconstructed XML blocks string)
     - For Triton/Python: return (entry_source_content, entry_source_content)
     """
     lang = str(language or "").strip().lower()
-    if lang == "cuda":
+    if lang in ("cuda", "hlsl"):
         code_dict: Dict[str, str] = {sf.path: sf.content for sf in (solution.sources or [])}
 
         def _xml_block(tag: str, name: str, content: str) -> str:
             return f"<{tag} name=\"{name}\">\n{content}\n</{tag}>"
+
+        if lang == "hlsl":
+            hlsl = code_dict.get("kernel.hlsl", "")
+            launch = code_dict.get("launch.json", "")
+            parts: list[str] = []
+            if hlsl:
+                parts.append(_xml_block("hlsl_file", "kernel.hlsl", hlsl))
+            if launch:
+                parts.append(_xml_block("json_file", "launch.json", launch))
+            current_raw_code = "\n\n".join(parts) if parts else ""
+            return code_dict, current_raw_code
 
         h = code_dict.get("kernel.h", "")
         cu = code_dict.get("kernel.cu", "")
@@ -375,7 +387,7 @@ def load_ksearch_solution_json(
 
     `solution_ref` can be:
     - an absolute/relative path to a .json file, OR
-    - a directory containing kernel.h/kernel.cu/main.cpp (CUDA) or model_new.py (Triton), OR
+    - a directory containing kernel.h/kernel.cu/main.cpp (CUDA), model_new.py (Triton), or kernel.hlsl/launch.json (HLSL), OR
     - a solution name, resolved under the k-search artifacts dir:
         <artifacts>/<task_name>/solutions/<definition_name>/<solution_name>.json
 
@@ -413,7 +425,7 @@ def _solution_dict_from_kernel_dir(
     target_hardware: str | None = None,
     description: str | None = None,
 ) -> dict[str, Any]:
-    """Build a Solution JSON dict from a directory with CUDA or Triton source files."""
+    """Build a Solution JSON dict from a directory with CUDA, Triton, or HLSL source files."""
     kernel_dir = kernel_dir.resolve()
     sources: list[dict[str, str]] = []
     language = "triton"
@@ -429,10 +441,18 @@ def _solution_dict_from_kernel_dir(
     elif (kernel_dir / "model_new.py").exists():
         language = "triton"
         sources.append({"path": "model_new.py", "content": (kernel_dir / "model_new.py").read_text()})
+    # HLSL: kernel.hlsl + optional launch.json
+    elif (kernel_dir / "kernel.hlsl").exists():
+        language = "hlsl"
+        sources.append({"path": "kernel.hlsl", "content": (kernel_dir / "kernel.hlsl").read_text()})
+        launch_path = kernel_dir / "launch.json"
+        if launch_path.exists():
+            sources.append({"path": "launch.json", "content": launch_path.read_text()})
     else:
         raise FileNotFoundError(
             f"Kernel directory '{kernel_dir}' must contain either "
-            f"(kernel.cu + main.cpp) for CUDA or (model_new.py) for Triton"
+            f"(kernel.cu + main.cpp) for CUDA, (model_new.py) for Triton, "
+            f"or (kernel.hlsl) for HLSL"
         )
 
     hw_list = [target_hardware] if target_hardware else []
@@ -447,7 +467,11 @@ def _solution_dict_from_kernel_dir(
         "spec": {
             "language": language,
             "target_hardware": hw_list,
-            "entry_point": "main.cpp::run" if language == "cuda" else "model_new.py::ModelNew",
+            "entry_point": (
+                "main.cpp::run"
+                if language == "cuda"
+                else "kernel.hlsl::main" if language == "hlsl" else "model_new.py::ModelNew"
+            ),
         },
         "sources": sources,
     }
@@ -465,6 +489,7 @@ def solution_from_json_dict(d: dict[str, Any]) -> Solution:
         "python": SupportedLanguages.PYTHON,
         "triton": SupportedLanguages.TRITON,
         "cuda": SupportedLanguages.CUDA,
+        "hlsl": SupportedLanguages.HLSL,
         "cpp": SupportedLanguages.CPP,
     }
     lang = lang_map.get(lang_s, SupportedLanguages.PYTHON)

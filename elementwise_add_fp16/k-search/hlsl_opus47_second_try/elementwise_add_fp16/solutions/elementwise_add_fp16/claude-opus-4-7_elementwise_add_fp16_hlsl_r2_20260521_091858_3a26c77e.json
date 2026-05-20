@@ -1,0 +1,24 @@
+{
+  "name": "claude-opus-4-7_elementwise_add_fp16_hlsl_r2_20260521_091858_3a26c77e",
+  "definition": "elementwise_add_fp16",
+  "author": "claude-opus-4-7",
+  "description": "HLSL kernel optimization for elementwise_add_fp16 round 2 (generated 20260521_091858 uid=3a26c77e)",
+  "spec": {
+    "language": "hlsl",
+    "target_hardware": [
+      "RTX 5090 Mobile"
+    ],
+    "entry_point": "kernel.hlsl::main",
+    "dependencies": []
+  },
+  "sources": [
+    {
+      "path": "kernel.hlsl",
+      "content": "ByteAddressBuffer input_0 : register(t0);\nByteAddressBuffer input_1 : register(t1);\nRWByteAddressBuffer output_0 : register(u0);\n\n#define TOTAL 67108864\n#define THREADS 256\n\n[numthreads(THREADS, 1, 1)]\nvoid main(uint3 dtid : SV_DispatchThreadID)\n{\n    uint idx = dtid.x * 16;\n    uint4 a = input_0.Load4(idx);\n    uint4 b = input_1.Load4(idx);\n\n    half2 a0 = (half2)f16tof32(uint2(a.x & 0xFFFF, (a.x >> 16) & 0xFFFF));\n    half2 a1 = (half2)f16tof32(uint2(a.y & 0xFFFF, (a.y >> 16) & 0xFFFF));\n    half2 a2 = (half2)f16tof32(uint2(a.z & 0xFFFF, (a.z >> 16) & 0xFFFF));\n    half2 a3 = (half2)f16tof32(uint2(a.w & 0xFFFF, (a.w >> 16) & 0xFFFF));\n\n    half2 b0 = (half2)f16tof32(uint2(b.x & 0xFFFF, (b.x >> 16) & 0xFFFF));\n    half2 b1 = (half2)f16tof32(uint2(b.y & 0xFFFF, (b.y >> 16) & 0xFFFF));\n    half2 b2 = (half2)f16tof32(uint2(b.z & 0xFFFF, (b.z >> 16) & 0xFFFF));\n    half2 b3 = (half2)f16tof32(uint2(b.w & 0xFFFF, (b.w >> 16) & 0xFFFF));\n\n    half2 c0 = a0 + b0;\n    half2 c1 = a1 + b1;\n    half2 c2 = a2 + b2;\n    half2 c3 = a3 + b3;\n\n    uint4 r;\n    uint2 p0 = f32tof16((float2)c0);\n    uint2 p1 = f32tof16((float2)c1);\n    uint2 p2 = f32tof16((float2)c2);\n    uint2 p3 = f32tof16((float2)c3);\n    r.x = (p0.x & 0xFFFF) | (p0.y << 16);\n    r.y = (p1.x & 0xFFFF) | (p1.y << 16);\n    r.z = (p2.x & 0xFFFF) | (p2.y << 16);\n    r.w = (p3.x & 0xFFFF) | (p3.y << 16);\n    output_0.Store4(idx, r);\n}"
+    },
+    {
+      "path": "launch.json",
+      "content": "{\n  \"target\": \"cs_6_8\",\n  \"entry\": \"main\",\n  \"dispatch\": [\n    32768,\n    1,\n    1\n  ]\n}"
+    }
+  ]
+}
