@@ -169,10 +169,11 @@ def _compare_outputs(
             return False, f"Output {index} shape mismatch: got={tuple(actual.shape)} expected={tuple(expected_cpu.shape)}"
         if actual.dtype != expected_cpu.dtype:
             return False, f"Output {index} dtype mismatch: got={actual.dtype} expected={expected_cpu.dtype}"
+
         if actual.is_floating_point():
             if not torch.allclose(actual.float(), expected_cpu.float(), rtol=rtol, atol=atol):
-                max_diff = (actual.float() - expected_cpu.float()).abs().max().item()
-                return False, f"Output {index} values differ: max_diff={max_diff:.6e} rtol={rtol} atol={atol}"
+                max_abs = (actual.float() - expected_cpu.float()).abs().max().item()
+                return False, f"Output {index} values differ: max_diff={max_abs:.6e} rtol={rtol} atol={atol}"
         else:
             if not torch.equal(actual, expected_cpu):
                 mismatch = (actual != expected_cpu).sum().item()

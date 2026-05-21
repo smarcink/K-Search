@@ -16,7 +16,7 @@ Usage:
 
     # Compare an HLSL K-Search artifact or extracted HLSL dir through hlsl_probe
     python compare_kernels.py elementwise_add_fp16/elementwise_add_fp16.py best_hlsl/ \
-        --hlsl-reference-device cpu --warmup 1 --iters 100
+        --device cpu --warmup 1 --iters 100
 
     # With options
     python compare_kernels.py path/to/reference.py path/to/kernels \\
@@ -29,8 +29,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -236,14 +238,14 @@ def benchmark_hlsl_kernel(
     iters: int,
     atol: float,
     hlsl_target: str,
-    hlsl_reference_device: str,
-    hlsl_num_correct_trials: int,
+    reference_device: str,
     hlsl_agility_sdk_path: str | None,
 ) -> dict[str, Any]:
-    """Evaluate an HLSL kernel with the same hlsl_probe evaluator used by K-Search."""
-    from argparse import Namespace
+    """Evaluate an HLSL kernel and return timing plus tensors for the common diff path."""
+    from k_search.tasks import hlsl_kernel_eval as hlsl_eval
 
-    from k_search.tasks.hlsl_kernel_eval import evaluate
+    hlsl_eval._ensure_hlsl_probe_on_path()
+    from hlsl_probe import HlslProbe, compile_hlsl_source
 
     with tempfile.TemporaryDirectory(prefix="compare_hlsl_") as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -251,20 +253,96 @@ def benchmark_hlsl_kernel(
         launch_path = tmp_path / "launch.json"
         hlsl_path.write_text(kernel_hlsl, encoding="utf-8")
         launch_path.write_text(launch_json or "{}", encoding="utf-8")
-        return evaluate(Namespace(
-            ref_path=str(ref_path),
-            hlsl_path=str(hlsl_path),
-            launch_path=str(launch_path),
-            hlsl_target=hlsl_target,
-            precision=precision,
-            reference_device=hlsl_reference_device,
-            num_correct_trials=max(1, int(hlsl_num_correct_trials)),
-            num_perf_trials=max(1, int(iters)),
-            num_warmup=max(0, int(warmup)),
-            rtol=atol,
-            atol=atol,
-            agility_sdk_path=hlsl_agility_sdk_path,
-        ))
+
+        launch = hlsl_eval._load_launch_config(launch_path, hlsl_target)
+        dxil = compile_hlsl_source(kernel_hlsl, target=launch["target"], entry=launch["entry"])
+        model, get_inputs_fn, _dtype, selected_reference_device = hlsl_eval._load_reference(
+            str(ref_path),
+            precision,
+            reference_device,
+        )
+        state_tensors = hlsl_eval._state_tensors_for_probe(model)
+
+        with HlslProbe(hlsl_agility_sdk_path) as probe:
+            inputs = get_inputs_fn()
+            expected_outputs = hlsl_eval._run_reference(model, inputs)
+            hlsl_eval._synchronize(selected_reference_device)
+
+            metadata, output_bytes = probe.run_dxil(
+                dxil,
+                inputs=hlsl_eval._make_probe_inputs(inputs, state_tensors),
+                outputs=hlsl_eval._make_output_specs(expected_outputs),
+                dispatch=tuple(launch["dispatch"]),
+            )
+            actual_outputs = [
+                hlsl_eval._tensor_from_output_bytes(data, expected)
+                for data, expected in zip(output_bytes, expected_outputs)
+            ]
+            ok, error = hlsl_eval._compare_outputs(actual_outputs, expected_outputs, atol, atol)
+            if not ok:
+                raise RuntimeError(error)
+
+            perf_inputs = get_inputs_fn()
+            perf_expected_outputs = hlsl_eval._run_reference(model, perf_inputs)
+            hlsl_eval._synchronize(selected_reference_device)
+            perf_probe_inputs = hlsl_eval._make_probe_inputs(perf_inputs, state_tensors)
+            perf_output_specs = hlsl_eval._make_output_specs(perf_expected_outputs)
+
+            for _ in range(max(0, int(warmup))):
+                probe.run_dxil(
+                    dxil,
+                    inputs=perf_probe_inputs,
+                    outputs=perf_output_specs,
+                    dispatch=tuple(launch["dispatch"]),
+                )
+                hlsl_eval._run_reference(model, perf_inputs)
+                hlsl_eval._synchronize(selected_reference_device)
+
+            gpu_times: list[float] = []
+            host_times: list[float] = []
+            for _ in range(max(1, int(iters))):
+                t0 = time.perf_counter()
+                metadata, _ = probe.run_dxil(
+                    dxil,
+                    inputs=perf_probe_inputs,
+                    outputs=perf_output_specs,
+                    dispatch=tuple(launch["dispatch"]),
+                )
+                host_times.append((time.perf_counter() - t0) * 1000.0)
+                gpu_time = metadata.get("gpu_time_ms") if isinstance(metadata, dict) else None
+                if isinstance(gpu_time, (int, float)):
+                    gpu_times.append(float(gpu_time))
+
+            ref_times: list[float] = []
+            for _ in range(max(1, int(iters))):
+                t0 = time.perf_counter()
+                hlsl_eval._run_reference(model, perf_inputs)
+                hlsl_eval._synchronize(selected_reference_device)
+                ref_times.append((time.perf_counter() - t0) * 1000.0)
+
+        hlsl_gpu_ms = statistics.median(gpu_times) if gpu_times else None
+        hlsl_host_ms = statistics.median(host_times) if host_times else None
+        ref_ms = statistics.median(ref_times) if ref_times else None
+        latency_ms = hlsl_gpu_ms or hlsl_host_ms
+        speedup = (float(ref_ms) / float(latency_ms)) if ref_ms and latency_ms else None
+        return {
+            "compiled": True,
+            "correct": True,
+            "latency_ms": latency_ms,
+            "hlsl_gpu_time_ms": hlsl_gpu_ms,
+            "hlsl_host_wall_ms": hlsl_host_ms,
+            "ref_latency_ms": ref_ms,
+            "speedup_factor": speedup,
+            "reference_device": selected_reference_device,
+            "actual_output": _flatten_outputs(actual_outputs),
+            "expected_output": _flatten_outputs([value.detach().cpu().contiguous() for value in expected_outputs]),
+        }
+
+
+def _flatten_outputs(outputs: list[torch.Tensor]) -> torch.Tensor:
+    if len(outputs) == 1:
+        return outputs[0].detach().cpu().contiguous()
+    return torch.cat([value.detach().cpu().contiguous().flatten() for value in outputs])
 
 
 @torch.inference_mode()
@@ -312,7 +390,8 @@ def diff(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
     max_abs = abs_err.max().item()
     mse = abs_err.pow(2).mean().item()
     denom = a32.norm() * b32.norm()
-    cos_sim = (torch.dot(a32, b32) / denom.clamp_min(1e-12)).item() if denom > 0 else 1.0
+    cos_raw = (torch.dot(a32, b32) / denom.clamp_min(1e-12)).item() if denom > 0 else 1.0
+    cos_sim = max(-1.0, min(1.0, float(cos_raw)))
     return max_abs, mse, cos_sim
 
 
@@ -374,13 +453,9 @@ Examples:
     parser.add_argument("--shape", type=int, nargs="+", default=None,
                         help="Override input tensor shape (e.g. --shape 64 1024 1024)")
     parser.add_argument("--device", default=None,
-                        help="Device to use (e.g. cuda:0, xpu:0). Auto-detected if omitted.")
+                        help="PyTorch device for reference/CUDA/Triton timing (e.g. cpu, cuda:0, xpu:0). Auto-detected if omitted. HLSL dispatch still uses hlsl_probe/D3D12.")
     parser.add_argument("--hlsl-target", default="cs_6_8",
                         help="Shader model target used when an HLSL launch.json omits target")
-    parser.add_argument("--hlsl-reference-device", default="auto",
-                        help="PyTorch reference device used by HLSL evaluator: auto, cpu, cuda, cuda:0, xpu:0")
-    parser.add_argument("--hlsl-num-correct-trials", type=int, default=1,
-                        help="Correctness trials for each HLSL kernel")
     parser.add_argument("--hlsl-agility-sdk-path", default=None,
                         help="Optional Direct3D 12 Agility SDK path for hlsl_probe")
     args = parser.parse_args()
@@ -403,15 +478,16 @@ Examples:
     if has_hlsl and args.shape:
         sys.exit("--shape override is not supported for HLSL kernels yet; use the reference get_inputs() shape.")
 
-    device = get_device(args.device) if has_torch_gpu_kernel else None
-    backend = device.split(":")[0] if device else "hlsl"
+    device = get_device(args.device)
+    backend = device.split(":")[0]
     if has_torch_gpu_kernel and backend not in ("cuda", "xpu"):
         sys.exit("CUDA or XPU GPU is required for CUDA/Triton comparison. HLSL-only comparison can use hlsl_probe.")
+    hlsl_reference_device = device
 
     if has_torch_gpu_kernel:
         print(f"Device: {device}  GPU: {get_device_name(device)}")
     else:
-        print(f"Device: hlsl_probe  PyTorch reference device: {args.hlsl_reference_device}")
+        print(f"Device: hlsl_probe  PyTorch reference device: {hlsl_reference_device}")
     print(f"Precision: {args.precision}  Warmup: {args.warmup}  Iters: {args.iters}")
     if args.compile_mode:
         print(f"torch.compile mode: {args.compile_mode}")
@@ -476,6 +552,8 @@ Examples:
         action = "Evaluating" if ktype == "hlsl" else "Compiling"
         print(f"  [{kernel_index+1}/{len(kernels)}] [{ktype}] {action}: {name}...", end=" ", flush=True)
         try:
+            latency_extra_text = ""
+            comparison_ref_out = ref_out
             if ktype == "cuda":
                 if backend == "xpu":
                     raise RuntimeError("CUDA kernel compilation not supported on XPU device")
@@ -501,8 +579,7 @@ Examples:
                     iters=args.iters,
                     atol=args.atol,
                     hlsl_target=args.hlsl_target,
-                    hlsl_reference_device=args.hlsl_reference_device,
-                    hlsl_num_correct_trials=args.hlsl_num_correct_trials,
+                    reference_device=hlsl_reference_device,
                     hlsl_agility_sdk_path=args.hlsl_agility_sdk_path,
                 )
                 if not result.get("compiled") or not result.get("correct"):
@@ -514,25 +591,25 @@ Examples:
                 hlsl_ref_ms = result.get("ref_latency_ms")
                 if ref_ms is None and isinstance(hlsl_ref_ms, (int, float)):
                     ref_ms = float(hlsl_ref_ms)
-                rows.append((name, float(ms), float(speedup) if isinstance(speedup, (int, float)) else None, None, None, None, "PASS"))
+                out = result["actual_output"]
+                comparison_ref_out = result["expected_output"]
                 host_ms = result.get("hlsl_host_wall_ms")
-                host_text = f" host={host_ms:.4f}ms" if isinstance(host_ms, (int, float)) else ""
-                speed_text = f" speedup={float(speedup):.2f}x" if isinstance(speedup, (int, float)) else ""
-                print(f"{float(ms):.4f}ms{host_text}{speed_text}  PASS")
-                continue
+                latency_extra_text = f" host={host_ms:.4f}ms" if isinstance(host_ms, (int, float)) else ""
             else:  # triton
                 triton_model = load_triton_model(
                     kernel["model_new_code"], init_inputs, dtype, name=f"k{kernel_index}", device=device
                 )
                 _copy_weights(triton_model, model)
                 ms, out = benchmark_model(triton_model, inputs, args.warmup, args.iters, device=device)
-            max_abs, mse, cos_sim = diff(out, ref_out)
+            if comparison_ref_out is None:
+                raise RuntimeError("Reference output unavailable for correctness comparison")
+            max_abs, mse, cos_sim = diff(out, comparison_ref_out)
             ok = max_abs <= args.atol
             status = "PASS" if ok else "FAIL"
             speedup = (float(ref_ms) / float(ms)) if isinstance(ref_ms, (int, float)) and ms > 0 else None
             rows.append((name, ms, speedup, max_abs, mse, cos_sim, status))
             speed_text = f" speedup={speedup:.2f}x" if speedup is not None else ""
-            print(f"{ms:.4f}ms{speed_text}  {status}")
+            print(f"{ms:.4f}ms{latency_extra_text}{speed_text}  {status}")
         except Exception as e:
             err_msg = str(e).split("\n")[0][:80]
             rows.append((name, None, None, None, None, None, "ERROR"))
