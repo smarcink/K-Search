@@ -1,10 +1,11 @@
 """Generic kernel comparison script.
 
-Compares optimized kernel solutions (CUDA or Triton) against a reference
+Compares optimized kernel solutions (CUDA, Triton, or HLSL) against a reference
 PyTorch model. Works with any task that follows the K-Search convention:
   - Reference .py file with: Model class, get_inputs(), get_init_inputs()
   - CUDA solutions: kernel.h / kernel.cu / main.cpp (or K-Search artifacts)
   - Triton solutions: model_new.py with ModelNew class (or K-Search artifacts)
+    - HLSL solutions: kernel.hlsl / launch.json (or K-Search artifacts)
 
 Usage:
     # Compare extracted kernel dirs against a reference
@@ -12,6 +13,10 @@ Usage:
 
     # Compare K-Search artifacts directories
     python compare_kernels.py path/to/reference.py path/to/ksearch-artifacts1 path/to/ksearch-artifacts2
+
+    # Compare an HLSL K-Search artifact or extracted HLSL dir through hlsl_probe
+    python compare_kernels.py elementwise_add_fp16/elementwise_add_fp16.py best_hlsl/ \
+        --hlsl-reference-device cpu --warmup 1 --iters 100
 
     # With options
     python compare_kernels.py path/to/reference.py path/to/kernels \\
@@ -105,12 +110,57 @@ def load_triton_model(code: str, init_inputs: list, dtype, name: str = "triton",
     return model
 
 
+def _solution_from_json_file(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    sources = data.get("sources")
+    if isinstance(sources, list):
+        return data
+    return None
+
+
+def _kernel_from_solution_json(sol_file: Path, sol: dict) -> dict | None:
+    sources = sol.get("sources", [])
+    if not isinstance(sources, list):
+        return None
+    src_map = {s["path"]: s["content"] for s in sources if isinstance(s, dict) and "path" in s and "content" in s}
+    name = str(sol.get("name", sol_file.stem))[:60]
+    if "kernel.cu" in src_map and "main.cpp" in src_map:
+        return {
+            "type": "cuda",
+            "name": name,
+            "kernel_h": src_map.get("kernel.h", ""),
+            "kernel_cu": src_map["kernel.cu"],
+            "main_cpp": src_map["main.cpp"],
+            "source": str(sol_file),
+        }
+    if "model_new.py" in src_map:
+        return {
+            "type": "triton",
+            "name": name,
+            "model_new_code": src_map["model_new.py"],
+            "source": str(sol_file),
+        }
+    if "kernel.hlsl" in src_map:
+        return {
+            "type": "hlsl",
+            "name": name,
+            "kernel_hlsl": src_map["kernel.hlsl"],
+            "launch_json": src_map.get("launch.json", "{}"),
+            "source": str(sol_file),
+        }
+    return None
+
+
 def collect_kernels(paths: list[str]) -> list[dict]:
     """Collect kernel sources from artifacts dirs or direct kernel dirs.
 
     Returns list of dicts with either:
       - type='cuda', kernel_h, kernel_cu, main_cpp
       - type='triton', model_new_code
+            - type='hlsl', kernel_hlsl, launch_json
     """
     kernels = []
 
@@ -118,6 +168,14 @@ def collect_kernels(paths: list[str]) -> list[dict]:
         path = Path(p).resolve()
         if not path.exists():
             print(f"  [warn] path not found: {path}", file=sys.stderr)
+            continue
+
+        # Case 0: a solution JSON file directly
+        if path.is_file() and path.suffix.lower() == ".json":
+            sol = _solution_from_json_file(path)
+            kernel = _kernel_from_solution_json(path, sol) if sol else None
+            if kernel:
+                kernels.append(kernel)
             continue
 
         # Case 1a: directory with kernel.h/kernel.cu/main.cpp directly
@@ -142,36 +200,71 @@ def collect_kernels(paths: list[str]) -> list[dict]:
             })
             continue
 
+        # Case 1c: directory with kernel.hlsl directly
+        if (path / "kernel.hlsl").exists():
+            kernels.append({
+                "type": "hlsl",
+                "name": path.name,
+                "kernel_hlsl": (path / "kernel.hlsl").read_text(),
+                "launch_json": (path / "launch.json").read_text() if (path / "launch.json").exists() else "{}",
+                "source": str(path),
+            })
+            continue
+
         # Case 2: K-Search artifacts directory — scan for solution JSONs
         for sol_file in sorted(path.rglob("*.json")):
             if sol_file.name == "solution.json" or "eval_report" in sol_file.name:
                 continue
             try:
                 sol = json.loads(sol_file.read_text())
-                sources = sol.get("sources", [])
-                if not isinstance(sources, list):
-                    continue
-                src_map = {s["path"]: s["content"] for s in sources if isinstance(s, dict)}
-                if "kernel.cu" in src_map and "main.cpp" in src_map:
-                    kernels.append({
-                        "type": "cuda",
-                        "name": sol.get("name", sol_file.stem)[:60],
-                        "kernel_h": src_map.get("kernel.h", ""),
-                        "kernel_cu": src_map["kernel.cu"],
-                        "main_cpp": src_map["main.cpp"],
-                        "source": str(sol_file),
-                    })
-                elif "model_new.py" in src_map:
-                    kernels.append({
-                        "type": "triton",
-                        "name": sol.get("name", sol_file.stem)[:60],
-                        "model_new_code": src_map["model_new.py"],
-                        "source": str(sol_file),
-                    })
+                kernel = _kernel_from_solution_json(sol_file, sol)
+                if kernel:
+                    kernels.append(kernel)
             except (json.JSONDecodeError, KeyError):
                 continue
 
     return kernels
+
+
+def benchmark_hlsl_kernel(
+    kernel_hlsl: str,
+    launch_json: str,
+    *,
+    ref_path: Path,
+    precision: str,
+    warmup: int,
+    iters: int,
+    atol: float,
+    hlsl_target: str,
+    hlsl_reference_device: str,
+    hlsl_num_correct_trials: int,
+    hlsl_agility_sdk_path: str | None,
+) -> dict[str, Any]:
+    """Evaluate an HLSL kernel with the same hlsl_probe evaluator used by K-Search."""
+    from argparse import Namespace
+
+    from k_search.tasks.hlsl_kernel_eval import evaluate
+
+    with tempfile.TemporaryDirectory(prefix="compare_hlsl_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        hlsl_path = tmp_path / "kernel.hlsl"
+        launch_path = tmp_path / "launch.json"
+        hlsl_path.write_text(kernel_hlsl, encoding="utf-8")
+        launch_path.write_text(launch_json or "{}", encoding="utf-8")
+        return evaluate(Namespace(
+            ref_path=str(ref_path),
+            hlsl_path=str(hlsl_path),
+            launch_path=str(launch_path),
+            hlsl_target=hlsl_target,
+            precision=precision,
+            reference_device=hlsl_reference_device,
+            num_correct_trials=max(1, int(hlsl_num_correct_trials)),
+            num_perf_trials=max(1, int(iters)),
+            num_warmup=max(0, int(warmup)),
+            rtol=atol,
+            atol=atol,
+            agility_sdk_path=hlsl_agility_sdk_path,
+        ))
 
 
 @torch.inference_mode()
@@ -282,86 +375,113 @@ Examples:
                         help="Override input tensor shape (e.g. --shape 64 1024 1024)")
     parser.add_argument("--device", default=None,
                         help="Device to use (e.g. cuda:0, xpu:0). Auto-detected if omitted.")
+    parser.add_argument("--hlsl-target", default="cs_6_8",
+                        help="Shader model target used when an HLSL launch.json omits target")
+    parser.add_argument("--hlsl-reference-device", default="auto",
+                        help="PyTorch reference device used by HLSL evaluator: auto, cpu, cuda, cuda:0, xpu:0")
+    parser.add_argument("--hlsl-num-correct-trials", type=int, default=1,
+                        help="Correctness trials for each HLSL kernel")
+    parser.add_argument("--hlsl-agility-sdk-path", default=None,
+                        help="Optional Direct3D 12 Agility SDK path for hlsl_probe")
     args = parser.parse_args()
-
-    device = get_device(args.device)
-    backend = device.split(":")[0]
-    if backend not in ("cuda", "xpu"):
-        sys.exit("CUDA or XPU GPU is required.")
 
     torch.manual_seed(SEED)
 
-    print(f"Device: {device}  GPU: {get_device_name(device)}")
+    ref_path = Path(args.ref).resolve()
+    if not ref_path.exists():
+        sys.exit(f"Reference file not found: {ref_path}")
+
+    # Collect kernels first so HLSL-only comparisons do not require CUDA/XPU PyTorch events.
+    kernels = collect_kernels(args.paths)
+    if not kernels:
+        sys.exit("No kernel solutions found in the provided paths.")
+
+    has_hlsl = any(kernel.get("type") == "hlsl" for kernel in kernels)
+    has_torch_gpu_kernel = any(kernel.get("type") != "hlsl" for kernel in kernels)
+    if has_hlsl and args.precision == "bf16":
+        sys.exit("HLSL evaluator currently supports fp16/fp32 only; use --precision fp16 or --precision fp32.")
+    if has_hlsl and args.shape:
+        sys.exit("--shape override is not supported for HLSL kernels yet; use the reference get_inputs() shape.")
+
+    device = get_device(args.device) if has_torch_gpu_kernel else None
+    backend = device.split(":")[0] if device else "hlsl"
+    if has_torch_gpu_kernel and backend not in ("cuda", "xpu"):
+        sys.exit("CUDA or XPU GPU is required for CUDA/Triton comparison. HLSL-only comparison can use hlsl_probe.")
+
+    if has_torch_gpu_kernel:
+        print(f"Device: {device}  GPU: {get_device_name(device)}")
+    else:
+        print(f"Device: hlsl_probe  PyTorch reference device: {args.hlsl_reference_device}")
     print(f"Precision: {args.precision}  Warmup: {args.warmup}  Iters: {args.iters}")
     if args.compile_mode:
         print(f"torch.compile mode: {args.compile_mode}")
     print()
 
-    # Load reference
-    ref_path = Path(args.ref).resolve()
-    if not ref_path.exists():
-        sys.exit(f"Reference file not found: {ref_path}")
     print(f"Reference: {ref_path.name}")
-    model, get_inputs_fn, get_init_inputs_fn, dtype = load_reference(ref_path, args.precision, device=device)
+    ref_ms: float | None = None
+    ref_out = None
+    model = None
+    get_init_inputs_fn = None
+    inputs: list[Any] = []
+    dtype = None
 
-    # Get inputs
-    if args.shape:
-        orig_inputs = get_inputs_fn()
-        num_tensors = sum(1 for x in orig_inputs if isinstance(x, torch.Tensor))
-        inputs = [torch.randn(args.shape, dtype=dtype, device=device) for _ in range(num_tensors)]
-    else:
-        inputs = get_inputs_fn()
-        inputs = [x.to(dtype=dtype, device=device) if isinstance(x, torch.Tensor) else x for x in inputs]
-    print(f"Input shapes: {[tuple(t.shape) for t in inputs if isinstance(t, torch.Tensor)]}")
+    if has_torch_gpu_kernel:
+        model, get_inputs_fn, get_init_inputs_fn, dtype = load_reference(ref_path, args.precision, device=device)
 
-    # Compute reference output from EAGER model (for correctness comparison)
-    with torch.inference_mode():
-        ref_out = model(*inputs)
-    synchronize(device)
+        # Get inputs
+        if args.shape:
+            orig_inputs = get_inputs_fn()
+            num_tensors = sum(1 for x in orig_inputs if isinstance(x, torch.Tensor))
+            inputs = [torch.randn(args.shape, dtype=dtype, device=device) for _ in range(num_tensors)]
+        else:
+            inputs = get_inputs_fn()
+            inputs = [x.to(dtype=dtype, device=device) if isinstance(x, torch.Tensor) else x for x in inputs]
+        print(f"Input shapes: {[tuple(t.shape) for t in inputs if isinstance(t, torch.Tensor)]}")
 
-    # Optionally compile reference for timing (compile can change numerics via tf32 etc.)
-    ref_model_for_timing = model
-    if args.compile_mode:
-        try:
-            compiled = torch.compile(model, mode=args.compile_mode)
-            # Warm-up to trigger compilation and catch errors early
-            with torch.inference_mode():
-                compiled(*inputs)
-            synchronize(device)
-            ref_model_for_timing = compiled
-        except Exception as e:
-            print(f"  [warn] torch.compile failed ({type(e).__name__}), using eager reference.")
+        # Compute reference output from EAGER model (for correctness comparison)
+        with torch.inference_mode():
+            ref_out = model(*inputs)
+        synchronize(device)
 
-    # Benchmark reference
-    ref_ms, _ = benchmark_model(ref_model_for_timing, inputs, args.warmup, args.iters, device=device)
-    print(f"Reference latency: {ref_ms:.4f} ms\n")
+        # Optionally compile reference for timing (compile can change numerics via tf32 etc.)
+        ref_model_for_timing = model
+        if args.compile_mode:
+            try:
+                compiled = torch.compile(model, mode=args.compile_mode)
+                # Warm-up to trigger compilation and catch errors early
+                with torch.inference_mode():
+                    compiled(*inputs)
+                synchronize(device)
+                ref_model_for_timing = compiled
+            except Exception as e:
+                print(f"  [warn] torch.compile failed ({type(e).__name__}), using eager reference.")
 
-    # Collect kernels
-    kernels = collect_kernels(args.paths)
-    if not kernels:
-        sys.exit("No kernel solutions found in the provided paths.")
+        # Benchmark reference
+        ref_ms, _ = benchmark_model(ref_model_for_timing, inputs, args.warmup, args.iters, device=device)
+        print(f"Reference latency: {ref_ms:.4f} ms\n")
 
     print(f"Found {len(kernels)} kernel(s) to compare\n")
 
     # Get init_inputs for triton models
-    init_inputs = get_init_inputs_fn()
+    init_inputs = get_init_inputs_fn() if get_init_inputs_fn is not None else []
 
     # Collect model parameters for CUDA kernels that may need them
-    model_params = [p.data for p in model.parameters()]
+    model_params = [p.data for p in model.parameters()] if model is not None else []
 
     # Benchmark each kernel
-    rows: list[tuple[str, float, float, float, float, str]] = []
-    for i, kernel in enumerate(kernels):
+    rows: list[tuple[str, float | None, float | None, float | None, float | None, float | None, str]] = []
+    for kernel_index, kernel in enumerate(kernels):
         name = kernel["name"]
         ktype = kernel.get("type", "cuda")
-        print(f"  [{i+1}/{len(kernels)}] [{ktype}] Compiling: {name}...", end=" ", flush=True)
+        action = "Evaluating" if ktype == "hlsl" else "Compiling"
+        print(f"  [{kernel_index+1}/{len(kernels)}] [{ktype}] {action}: {name}...", end=" ", flush=True)
         try:
             if ktype == "cuda":
                 if backend == "xpu":
                     raise RuntimeError("CUDA kernel compilation not supported on XPU device")
                 module = compile_kernel(
                     kernel["kernel_h"], kernel["kernel_cu"], kernel["main_cpp"],
-                    name=f"k{i}",
+                    name=f"k{kernel_index}",
                 )
                 # If the module exposes set_params(), pass reference model weights
                 if hasattr(module, "set_params"):
@@ -371,20 +491,51 @@ Examples:
                     ms, out = benchmark_cuda_module(module, inputs, args.warmup, args.iters, device=device)
                 except TypeError:
                     ms, out = benchmark_cuda_module(module, inputs + model_params, args.warmup, args.iters, device=device)
+            elif ktype == "hlsl":
+                result = benchmark_hlsl_kernel(
+                    kernel["kernel_hlsl"],
+                    kernel.get("launch_json", "{}"),
+                    ref_path=ref_path,
+                    precision=args.precision,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    atol=args.atol,
+                    hlsl_target=args.hlsl_target,
+                    hlsl_reference_device=args.hlsl_reference_device,
+                    hlsl_num_correct_trials=args.hlsl_num_correct_trials,
+                    hlsl_agility_sdk_path=args.hlsl_agility_sdk_path,
+                )
+                if not result.get("compiled") or not result.get("correct"):
+                    raise RuntimeError(str(result.get("error") or "HLSL evaluation failed"))
+                ms = result.get("latency_ms")
+                if not isinstance(ms, (int, float)):
+                    raise RuntimeError("HLSL evaluation passed but did not report latency_ms")
+                speedup = result.get("speedup_factor")
+                hlsl_ref_ms = result.get("ref_latency_ms")
+                if ref_ms is None and isinstance(hlsl_ref_ms, (int, float)):
+                    ref_ms = float(hlsl_ref_ms)
+                rows.append((name, float(ms), float(speedup) if isinstance(speedup, (int, float)) else None, None, None, None, "PASS"))
+                host_ms = result.get("hlsl_host_wall_ms")
+                host_text = f" host={host_ms:.4f}ms" if isinstance(host_ms, (int, float)) else ""
+                speed_text = f" speedup={float(speedup):.2f}x" if isinstance(speedup, (int, float)) else ""
+                print(f"{float(ms):.4f}ms{host_text}{speed_text}  PASS")
+                continue
             else:  # triton
                 triton_model = load_triton_model(
-                    kernel["model_new_code"], init_inputs, dtype, name=f"k{i}", device=device
+                    kernel["model_new_code"], init_inputs, dtype, name=f"k{kernel_index}", device=device
                 )
                 _copy_weights(triton_model, model)
                 ms, out = benchmark_model(triton_model, inputs, args.warmup, args.iters, device=device)
             max_abs, mse, cos_sim = diff(out, ref_out)
             ok = max_abs <= args.atol
             status = "PASS" if ok else "FAIL"
-            rows.append((name, ms, max_abs, mse, cos_sim, status))
-            print(f"{ms:.4f}ms  speedup={ref_ms/ms:.2f}x  {status}")
+            speedup = (float(ref_ms) / float(ms)) if isinstance(ref_ms, (int, float)) and ms > 0 else None
+            rows.append((name, ms, speedup, max_abs, mse, cos_sim, status))
+            speed_text = f" speedup={speedup:.2f}x" if speedup is not None else ""
+            print(f"{ms:.4f}ms{speed_text}  {status}")
         except Exception as e:
             err_msg = str(e).split("\n")[0][:80]
-            rows.append((name, float("nan"), float("nan"), float("nan"), float("nan"), "ERROR"))
+            rows.append((name, None, None, None, None, None, "ERROR"))
             print(f"ERROR: {err_msg}")
 
     # Summary table
@@ -396,18 +547,27 @@ Examples:
     print(f"{'-'*100}")
 
     # Reference row
-    print(f"{ref_label:<{name_w}}  {ref_ms:>10.4f}  {'1.00x':>8}  {'0.000e+00':>11}  {'0.000e+00':>11}  {'1.000000':>10}  REF")
+    if isinstance(ref_ms, (int, float)):
+        print(f"{ref_label:<{name_w}}  {ref_ms:>10.4f}  {'1.00x':>8}  {'0.000e+00':>11}  {'0.000e+00':>11}  {'1.000000':>10}  REF")
+    else:
+        print(f"{ref_label:<{name_w}}  {'N/A':>10}  {'1.00x':>8}  {'0.000e+00':>11}  {'0.000e+00':>11}  {'1.000000':>10}  REF")
 
-    for name, ms, ma, mse_v, cs, status in rows:
+    for name, ms, speedup, ma, mse_v, cs, status in rows:
         display_name = name[:name_w]
-        if ms != ms or ms <= 0:  # nan check
+        if not isinstance(ms, (int, float)) or ms <= 0:
             print(f"{display_name:<{name_w}}  {'N/A':>10}  {'-':>8}  {'N/A':>11}  {'N/A':>11}  {'N/A':>10}  {status}")
         else:
-            speed = f"{ref_ms / ms:.2f}x"
-            print(f"{display_name:<{name_w}}  {ms:>10.4f}  {speed:>8}  {ma:>11.3e}  {mse_v:>11.3e}  {cs:>10.6f}  {status}")
+            speed = f"{speedup:.2f}x" if isinstance(speedup, (int, float)) else "-"
+            max_abs_text = f"{ma:>11.3e}" if isinstance(ma, (int, float)) else f"{'N/A':>11}"
+            mse_text = f"{mse_v:>11.3e}" if isinstance(mse_v, (int, float)) else f"{'N/A':>11}"
+            cos_text = f"{cs:>10.6f}" if isinstance(cs, (int, float)) else f"{'N/A':>10}"
+            print(f"{display_name:<{name_w}}  {ms:>10.4f}  {speed:>8}  {max_abs_text}  {mse_text}  {cos_text}  {status}")
 
     print(f"{'='*100}")
-    print(f"(reference latency = {ref_ms:.4f} ms)")
+    if isinstance(ref_ms, (int, float)):
+        print(f"(reference latency = {ref_ms:.4f} ms)")
+    else:
+        print("(reference latency unavailable; all kernel evaluations failed before timing)")
 
 
 if __name__ == "__main__":

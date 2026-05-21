@@ -1,4 +1,4 @@
-"""Extract the fastest kernel from a K-Search CUDA artifacts folder.
+"""Extract the fastest kernel from a K-Search artifacts folder.
 
 Scans solutions/ and eval/ dirs (or the solution_db.jsonl) to find the
 solution with the best speedup. Prints its details and optionally writes
@@ -7,6 +7,7 @@ the kernel source files to an output directory.
 Usage:
     python extract_best_kernel.py elementwise_add_fp16/ksearch-sonnet46_cuda
     python extract_best_kernel.py elementwise_add_fp16/ksearch-sonnet46_cuda --output-dir best_kernel/
+    python extract_best_kernel.py elementwise_add_fp16/k-search/hlsl_opus47_first_try -o best_hlsl/
 """
 
 from __future__ import annotations
@@ -119,8 +120,8 @@ def _parse_xml_sources(code: str) -> list[dict]:
     """Parse XML-formatted code into a list of {path, content} dicts."""
     import re
     sources = []
-    # Match <header_file name="...">, <cuda_file name="...">, <cpp_file name="...">
-    pattern = r'<(header_file|cuda_file|cpp_file)\s+name="([^"]+)">(.*?)</\1>'
+    # Match CUDA multi-file blocks, HLSL blocks, and generic <file name="..."> blocks.
+    pattern = r'<(header_file|cuda_file|cpp_file|hlsl_file|json_file|file)\s+name="([^"]+)">(.*?)</\1>'
     for match in re.finditer(pattern, code, re.DOTALL):
         sources.append({"path": match.group(2), "content": match.group(3).strip()})
     # Also handle model_new.py (triton/python format) — just raw code
@@ -165,7 +166,7 @@ def main():
     parser = argparse.ArgumentParser(description="Extract fastest kernel from K-Search artifacts")
     parser.add_argument("artifacts_dir", help="Path to K-Search artifacts folder")
     parser.add_argument("--output-dir", "-o", default=None,
-                        help="Directory to write kernel files (kernel.h, kernel.cu, main.cpp)")
+                        help="Directory to write kernel files, e.g. kernel.hlsl/launch.json or kernel.h/kernel.cu/main.cpp")
     parser.add_argument("--metric", default="speedup_factor",
                         choices=["speedup_factor", "latency_ms"],
                         help="Metric to rank by (default: speedup_factor)")
@@ -238,10 +239,14 @@ def main():
     else:
         # Print main source content
         sources = sol_data.get("sources", [])
-        # Prefer kernel.cu for CUDA, otherwise print first/only source
+        # Prefer the backend's main source, otherwise print first/only source.
         display_src = None
         for src in sources:
-            if src.get("path") == "kernel.cu":
+            if src.get("path") == "kernel.hlsl":
+                display_src = src
+                break
+        for src in sources:
+            if display_src is None and src.get("path") == "kernel.cu":
                 display_src = src
                 break
         if display_src is None and sources:

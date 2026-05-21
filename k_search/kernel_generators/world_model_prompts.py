@@ -72,7 +72,7 @@ HLSL_OPTIMIZATION_HINTS = """Key HLSL/DX12 POC constraints:
 - The current runner is single-dispatch and CPU-staged through hlsl_probe; optimize the shader GPU timestamp.
 - Use fixed shape constants from the task metadata. Root constants, CBVs, temporary buffers, and multi-dispatch graphs are not wired up yet.
 - Bind forward inputs and model state as SRVs t0, t1, ... and outputs as UAVs u0, u1, ... exactly as specified.
-- Target cs_6_8/cs_6_9 style HLSL unless the task explicitly requests a newer target. Do not use dx/linalg or SM 6.10-only WaveMMA in this slice.
+- Target cs_6_8/cs_6_9 style HLSL unless the task explicitly requests a newer target.
 """
 
 
