@@ -1,0 +1,24 @@
+{
+  "claude-opus-4-7_swin_block_fp16_simplified_hlsl_r12_20260521_111850_a6fe1ceb": {
+    "status": "passed",
+    "latency_ms": 4.134304,
+    "reference_latency_ms": 8.462750000035157,
+    "mean_vs_baseline_factor": null,
+    "speedup_factor": 2.046958810971607,
+    "log_excerpt": "PASSED: hlsl_gpu=4.134304ms host=82.368750ms ref=8.462750ms speedup=2.047x",
+    "metrics": {
+      "score_name": "speedup_vs_reference",
+      "score": 2.046958810971607,
+      "hlsl_gpu_time_ms": 4.134304,
+      "hlsl_host_wall_ms": 82.36874999965949,
+      "target": "cs_6_8",
+      "dispatch": [
+        28800,
+        1,
+        1
+      ],
+      "reference_device": "cuda:0"
+    },
+    "profiler_metrics": {}
+  }
+}

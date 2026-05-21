@@ -73,6 +73,8 @@ HLSL_OPTIMIZATION_HINTS = """Key HLSL/DX12 POC constraints:
 - Use fixed shape constants from the task metadata. Root constants, CBVs, temporary buffers, and multi-dispatch graphs are not wired up yet.
 - Bind forward inputs and model state as SRVs t0, t1, ... and outputs as UAVs u0, u1, ... exactly as specified.
 - Target cs_6_8/cs_6_9 style HLSL unless the task explicitly requests a newer target.
+- For cs_6_8/cs_6_9, total groupshared memory is limited to 32 KiB per threadgroup in this D3D/DXIL path; hardware CUDA shared-memory-per-SM figures do not raise that limit.
+- Keep groupshared allocations comfortably below 32 KiB after type/layout alignment. If a fused design needs more, reduce tile/window count, stream weights from SRVs/L2, or split the work.
 """
 
 

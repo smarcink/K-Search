@@ -72,7 +72,8 @@ _HLSL_GENERATION_GUIDELINES = """## HLSL/DX12 Optimization Guidelines
 - Hardcode the fixed shapes shown in the metadata. Dynamic/root constants are not wired up yet.
 - Flatten tensors in row-major contiguous order. For shape [A, B, C], linear offset is ((a * B) + b) * C + c.
 - Prefer coalesced adjacent loads/stores across SV_DispatchThreadID.x.
-- Use groupshared memory when it removes repeated global reads and the fixed tile is small enough.
+- For cs_6_8/cs_6_9, keep total groupshared memory under 32 KiB per threadgroup. Do not use CUDA per-SM shared-memory limits as the HLSL per-group limit.
+- Use groupshared memory only when it removes repeated global reads and the fixed tile is small enough; leave safety margin below 32 KiB for layout/alignment.
 - For fp16 elementwise work, use float16_t where possible. Widen to float only when needed for numerical tolerance.
 """
 
