@@ -1,0 +1,484 @@
+{
+  "computed_signals": {
+    "round_index": 24,
+    "trace": {
+      "latency_ms": 0.7045920000000001,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 0.7976500000950182,
+      "speedup_factor": 1.132073597337208,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "node_elementwise_add_fp16_r18_cont_1",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX5090M: 896 GB/s BW, 82 SMs. 67M fp16 elements per tensor = 134MB read + 134MB write = ~402MB traffic. Min latency ~0.45ms at peak BW.",
+            "notes": "Pure elementwise add: 1 FLOP per 6 bytes touched. Compute negligible; purely BW-bound.",
+            "rating_0_to_10": 5.0,
+            "risk": "Compute cores will be idle; nothing to gain from tensor cores."
+          },
+          "memory_bandwidth": {
+            "notes": "Need to saturate 896 GB/s. Wide vectorized loads (uint4 = 8 fp16 per lane) crucial. Avoid scalar Buffer<float16_t> loads which may be inefficient.",
+            "rating_0_to_10": 6.0,
+            "risk": "If we use scalar fp16 loads, we may get <50% of peak BW. Need ByteAddressBuffer or wider types."
+          },
+          "register_pressure": {
+            "notes": "Trivial \u2014 only a few regs needed for vectorized add. Plenty of headroom for unrolling.",
+            "rating_0_to_10": 9.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "ANALYSIS:\n1) CLASSIFY: Pure elementwise binary add. No reductions, dense contiguous access, fp16. 67,108,864 elements total (16*2048*2048). Flatten to 1D.\n2) MATH: out[i] = x[i] + y[i], fully independent across i.\n3) LAYOUT: All three tensors contiguous fp16, identical shape. Read-once, write-once, no reuse. Stream-through pattern.\n4) REGIMES: (a) BW-bound large N \u2014 current case, dominant; (b) Latency-bound small N \u2014 N/A here; (c) Issue-bound if too few threads \u2014 avoid by launching ~1M+ threads.\n5) KNOBS: vectorization width (1/2/4/8 fp16 per thread), threads/group (64-256), elements per thread (loop unroll), buffer type (typed Buffer<float16_t> vs ByteAddressBuffer with uint2/uint4 + bitcast), dispatch shape (1D vs 3D).\n6) SKELETON: 1D dispatch; each thread loads K consecutive fp16 from x and y via wide load, adds, stores K fp16 to out. No shared memory, no sync.\n7) FAMILIES: (A) Wide vectorized ByteAddressBuffer (load uint4 = 8 fp16, bitcast, add, store) \u2014 best BW efficiency; (B) Typed Buffer<float16_t> with 1 elem/thread \u2014 simplest, may underperform on BW; (C) Typed Buffer<float16_t> with 4-8 elems/thread unroll \u2014 middle ground.\nFULL FUSION: trivially fused already (single op).\nPRIMARY LIMITER: DRAM bandwidth. Target ~0.45-0.6 ms.\nDISPATCH MATH: 67108864 elems / 8 elems-per-thread = 8388608 threads / 256 threads-per-group = 32768 groups. Fits in single dim < 65535? No \u2014 use multi-dim or larger groups. With 8 elems/thread and 256 tpg \u2192 groups=32768, need [32768,1,1] or split.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use ByteAddressBuffer for x, y and RWByteAddressBuffer for out. Each thread loads uint4 (16 bytes = 8 fp16) from each input, bitcasts to two min16float4 (or unpacks via f16tof32), performs vector add, stores uint4. Use 256 threads/group, 8 elems/thread \u2192 2048 elems/group \u2192 32768 groups in X (fits in 65535 limit).",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.14,
+          "rationale": "Wide loads are essential to saturate 896 GB/s on a pure-BW kernel. uint4 transactions coalesce well and minimize instruction count.",
+          "score_0_to_1": 0.9,
+          "title": "Wide vectorized ByteAddressBuffer (uint4, 8 fp16/thread)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.85,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "32768 groups \u00d7 256 threads = 8.4M threads, ~100k threads/SM available \u2014 plenty of occupancy.",
+            "notes": "f16tof32/f32tof16 pack/unpack adds ALU; could use min16float to avoid pack.",
+            "rating_0_to_10": 5.0,
+            "risk": "med"
+          },
+          "memory_bandwidth": {
+            "notes": "uint4 loads coalesce well; near BW-bound.",
+            "rating_0_to_10": 9.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "~12 regs for a/b/r plus temps.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_uint4",
+        "node_type": "decision",
+        "notes": "CURRENT: does=uint4 loads of 8 fp16, unpacks via f16tof32, fp32 add, repacks, stores uint4. bottleneck=bandwidth (with non-trivial pack ALU overhead). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 1.14x speedup confirms wide loads help; pack/unpack ALU likely leaves perf on table. next bet=use min16float4 bitcast to skip f16tof32 conversion, or widen to 16 fp16/thread.",
+        "overall_rating_0_to_10": 9.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.6879839999999999,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                32768,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 0.6879839999999999,
+              "hlsl_host_wall_ms": 195.12200000008306,
+              "reference_device": "cuda:0",
+              "score": 1.13985208891993,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 0.784199999543489,
+            "speedup_factor": 1.13985208891993,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "1eefd55ad3aa4537c93b99195863d97f18f1e7a9"
+        }
+      },
+      {
+        "action": {
+          "description": "Declare Buffer<float16_t4> for inputs and RWBuffer<float16_t4> for output (if cs_6_8 supports it via 16BitTypes), process 4 fp16 per thread. Simpler than bitcast path. Use 256 threads/group, multiple elems/thread via inner loop unroll.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "Typed buffer with vector element type is the cleanest HLSL idiom; the driver should issue wide loads. Lower implementation risk than manual bitcast.",
+          "score_0_to_1": 0.2,
+          "title": "Typed buffer (Buffer<float4>) alternative binding"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.3,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Requires -enable-16bit-types; cs_6_8 supports it. Buffer<vectorN> typed views may be limited to 4-component max.",
+            "notes": "Same as n1.",
+            "rating_0_to_10": 8.0,
+            "risk": "Some drivers may not issue true 128-bit loads for typed fp16 vector buffers."
+          },
+          "memory_bandwidth": {
+            "notes": "Likely ~70-85% peak; depends on driver lowering.",
+            "rating_0_to_10": 8.0,
+            "risk": "Less control than ByteAddressBuffer."
+          },
+          "register_pressure": {
+            "notes": "Minimal.",
+            "rating_0_to_10": 10.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2_typed",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: mutually exclusive with n1 (alternative resource binding). Deprioritized: n1 family already at 1.15x; typed buffers unlikely to beat ByteAddressBuffer uint4.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Same as n1 (uint4 ByteAddressBuffer) but each thread processes 16 fp16 (two uint4 loads) with manual unroll. Reduces total thread count to 4.2M and group count to 16384, may improve issue efficiency and amortize address computation.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.05,
+          "rationale": "Larger per-thread work may help hide memory latency and reduce dispatch overhead, but risk under-occupancy on small problems (not an issue here).",
+          "score_0_to_1": 0.2,
+          "title": "Wider per-thread work (>=16 fp16/thread)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.3,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Still ample occupancy: 4.2M threads / 82 SMs \u2248 51k threads/SM (caps at 2048 active).",
+            "notes": "More ILP per thread.",
+            "rating_0_to_10": 9.0,
+            "risk": "None significant for this N."
+          },
+          "memory_bandwidth": {
+            "notes": "Two outstanding loads per thread improves MLP.",
+            "rating_0_to_10": 9.0,
+            "risk": "Diminishing returns past a point."
+          },
+          "register_pressure": {
+            "notes": "~24 regs/thread, still tiny.",
+            "rating_0_to_10": 10.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3_wider",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: mutually exclusive with n1 granularity. Evidence from n1_uint4_child_async (2x uint4) shows wider per-thread work does NOT help; downscored.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.15,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Bitcast uint4 -> min16float4x2 (skip f16tof32 pack/unpack)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Pure add; mostly BW-bound",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Two uint4 loads/stores per thread; near BW limit",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "~16 fp16 in regs per thread, fine",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_uint4_child_min16",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Each thread loads 2x uint4 from x and y (16 fp16 elements total), unpacks via asfloat16, adds, repacks, stores 2x uint4. bottleneck=memory bandwidth (compute is trivial fp16 add). FOLLOW_THROUGH: aligned_with_intent=yes; uses asfloat16/asuint16 bitcasts instead of f16tof32. UPDATE_BELIEF: eval shows 1.146x, similar to parent 1.140x; bitcast saved little because compiler likely already optimized f16tof32. Next bet: expose more MLP via deeper unroll or larger per-thread tile, or try groupshared-free wider vector path.",
+        "overall_rating_0_to_10": 7.5,
+        "parent_id": "n1_uint4",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.6879360000000001,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                16384,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 0.6879360000000001,
+              "hlsl_host_wall_ms": 194.49450000047364,
+              "reference_device": "cuda:0",
+              "score": 1.1464002475320016,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 0.7886500006861752,
+            "speedup_factor": 1.1464002475320016,
+            "status": "passed"
+          },
+          "parent_solution_id": "1eefd55ad3aa4537c93b99195863d97f18f1e7a9",
+          "solution_id": "6810baa9368def283de8d21a032356dc09092f99"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.13,
+          "rationale": "",
+          "score_0_to_1": 0.4,
+          "title": "Increase ILP: 2x uint4 per thread, interleaved loads then adds"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "f16<->f32 conversions add ALU but not the bottleneck.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Already near BW limit; wider per-thread doesn't help.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "2x uint4 doubles live registers.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1_uint4_child_async",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Each thread loads 2x uint4 from x and y (16 fp16 each = 32B/thread), unpacks via f16tof32, adds, repacks, stores 2x uint4. bottleneck=memory bandwidth (elementwise add is BW-bound; ILP only helps if MLP not already saturated). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: 2x uint4 ILP gave 1.13x, slightly worse than 1x uint4 (1.15x at min16 sibling). Wider per-thread work increases register pressure and reduces occupancy without BW gain. next bet: try fewer threads/block + prefetch pattern, OR revert to 1x uint4 with tuned group size. PERF_GAP: expected 1.15x observed 1.13x; reason: register pressure / occupancy loss outweighs MLP gain on BW-bound kernel.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "n1_uint4",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 0.7045920000000001,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                16384,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 0.7045920000000001,
+              "hlsl_host_wall_ms": 193.9268500000253,
+              "reference_device": "cuda:0",
+              "score": 1.132073597337208,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 0.7976500000950182,
+            "speedup_factor": 1.132073597337208,
+            "status": "passed"
+          },
+          "parent_solution_id": "1eefd55ad3aa4537c93b99195863d97f18f1e7a9",
+          "solution_id": "dfc5bd8dc0a7a6b21bc8a4a3107631ce3330edf7"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.2,
+          "title": "Next-step refinement: 2x uint4 per thread (FAILED correctness)"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.3,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "More work/thread but lower occupancy",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Strided pattern may break coalescing",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "2x uint4 doubles live regs",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 18,
+        "node_id": "node_elementwise_add_fp16_r18_cont_1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Each thread loads/stores 2 uint4 chunks (32 fp16) using strided addressing (gtid stride 16B within a 256*32B block). bottleneck=bandwidth. FOLLOW_THROUGH: aligned_with_intent=no; intent was a small refinement of the min16 bitcast path; implementation changed mapping to 2x uint4/thread with addr0/addr1 stride pattern that produces wrong outputs (max_diff=7.58). UPDATE_BELIEF: The strided addressing scheme likely overlaps/misses elements causing incorrect sums; doubling work per thread also didn't help in prior n1_uint4_child_async. Next bet: revert to single uint4/thread and try a small refinement like explicit [unroll] tightening, removing per-lane masking via uint2 bitcasts, or coalesced contiguous addressing without stride games.",
+        "overall_rating_0_to_10": 3.0,
+        "parent_id": "n1_uint4_child_min16",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6810baa9368def283de8d21a032356dc09092f99",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.5,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "f16<->f32 conversions add ALU but not the bottleneck.",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Already near BW limit; wider per-thread doesn't help.",
+            "rating_0_to_10": 7.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "2x uint4 doubles live registers.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 24,
+        "node_id": "node_elementwise_add_fp16_r24_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "n1_uint4_child_async",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "dfc5bd8dc0a7a6b21bc8a4a3107631ce3330edf7",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.16,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Fix: revert to 1x uint4/thread with asuint16/asfloat16 bitcast, contiguous coalesced addressing"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Matches proven n1_uint4_child_min16 layout",
+            "rating_0_to_10": 6.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Fully coalesced 16B/thread",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Small live set",
+            "rating_0_to_10": 4.0,
+            "risk": "low"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "node_em_add_fp16_r24_fix",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child of min16 node, refines it by ensuring correctness with contiguous DTid*16 addressing rather than strided multi-chunk. Mutually exclusive with the failed 2x-uint4 sibling because it uses different per-thread workload (1 vs 2 uint4). CURRENT plan: addr = gid.x*16; load uint4 a,b; do 4 lanes of float16_t2 add via asfloat16; store. Targets correctness first then microtuning.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1_uint4_child_min16",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6810baa9368def283de8d21a032356dc09092f99",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Pure elementwise fp16 add of two (16,2048,2048) tensors \u2014 67.1M independent operations, fully bandwidth-bound on the RTX5090M's 896 GB/s GDDR7. Total traffic ~402 MB (2 reads + 1 write of 134 MB each), giving a BW-limited floor near 0.45 ms. No reductions, no reuse, no compute pressure: success hinges entirely on issuing the widest coalesced memory transactions possible (preferably 128-bit uint4 via ByteAddressBuffer), giving each thread enough work (8-16 fp16) to amortize address math, and launching enough threads (~1M+) across 82 SMs to hide DRAM latency. Constraints: cs_6_8 with 16-bit types, dispatch group counts \u226465535 per dim, no CBVs/root constants available so shape is hardcoded.",
+  "open_questions": [
+    "Does the cs_6_8 compiler/driver issue true 128-bit loads for Buffer<float16_t4>, or must we use ByteAddressBuffer + uint4 + bitcast to guarantee it?",
+    "What is the optimal elements-per-thread (4 vs 8 vs 16 vs 32) to balance MLP and instruction overhead on Blackwell?",
+    "Is the dispatch limit per-dim 65535 \u2014 do we need to split into [gx, gy, 1] for >65535 groups?",
+    "Will using min16float4 add be lowered to native fp16 vector adds, or promoted to fp32 (still fine for BW but more regs)?",
+    "Is there any benefit to using groupshared as a staging buffer, or is it pure overhead for this streaming pattern? (Almost certainly overhead.)",
+    "Should output be written via RWByteAddressBuffer.Store4 (uint4) for symmetry with reads, and does this fully coalesce?",
+    "How does the evaluator validate numerics \u2014 does fp32 intermediate accumulation matter for rtol=0.01 (likely not, fp16 add is exact for this tolerance)?"
+  ]
+}
