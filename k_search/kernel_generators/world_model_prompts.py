@@ -78,8 +78,11 @@ HLSL_OPTIMIZATION_HINTS = """Key HLSL/DX12 POC constraints:
 - Treat groupshared memory as an explicitly synchronized communication/cache resource. Good uses include compact read-only tiles/tables loaded cooperatively once and consumed many times, reusable input tiles, cross-thread or cross-wave exchange buffers, and reduction scratch.
 - Do not justify groupshared use only because a tensor or working set fits under 32 KiB. For every groupshared array, classify it as read-only reusable tile, exchange buffer, or reduction scratch, and state the producer thread set, consumer thread set, reuse count/traffic saving, and required synchronization point.
 - Keep groupshared allocations comfortably below 32 KiB after type/layout alignment. Do not stage a whole working set or whole phase tensors in groupshared merely to pass values between sequential phases when streaming from SRVs/L2, using wave communication, keeping owner-local registers, or recomputing a small value is cheaper.
+- Prefer mappings where one fixed-size wave owns one independent work unit/tile when the tile fits wave-local ownership. Use WaveGetLaneIndex, WaveReadLaneAt, WaveReadLaneFirst, WaveActiveSum/Max/Min, and related wave intrinsics for lane exchange and reductions.
+- Do not route wave-local intermediate values through groupshared memory. Keep them in registers and exchange through wave intrinsics; this avoids turning warp/wave-local dependencies into group-wide barriers.
+- Avoid splitting one independent work unit across multiple waves unless the extra parallelism clearly pays for the required inter-wave handoff. If multiple waves share a threadgroup, prefer each wave owning an independent work unit, with at most compact read-only shared tiles loaded once for all waves.
 - Minimize GroupMemoryBarrierWithGroupSync calls. They are usually needed only after cross-thread groupshared writes before cross-thread reads; avoid phase-by-phase barriers for values that can stay in registers or have a single producer/consumer.
-- Prefer wave intrinsics for wave-local reductions, broadcasts, scans, or shuffles when they fit the mapping; use group-wide barriers only for true group-wide communication.
+- Use [WaveSize(32)] when the target accepts it and the mapping assumes 32 lanes. Prefer wave intrinsics for wave-local reductions, broadcasts, scans, or shuffles; use group-wide barriers only for true group-wide communication.
 """
 
 
