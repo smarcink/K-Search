@@ -64,6 +64,29 @@ const char* cooperative_vector_tier_name(D3D12_COOPERATIVE_VECTOR_TIER tier) {
     }
 }
 
+const char* linear_algebra_datatype_name(D3D12_LINEAR_ALGEBRA_DATATYPE datatype) {
+    switch (datatype) {
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_SINT16: return "sint16";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_UINT16: return "uint16";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32: return "sint32";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_UINT32: return "uint32";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16: return "float16";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32: return "float32";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8_T4_PACKED: return "sint8_t4_packed";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_UINT8_T4_PACKED: return "uint8_t4_packed";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_UINT8: return "uint8";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8: return "sint8";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT_E4M3: return "float_e4m3";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT_E5M2: return "float_e5m2";
+    default: return "unknown";
+    }
+}
+
+void write_datatype_json_field(const char* name, D3D12_LINEAR_ALGEBRA_DATATYPE datatype) {
+    std::cout << "\"" << name << "\":\"" << linear_algebra_datatype_name(datatype) << "\",";
+    std::cout << "\"" << name << "_value\":" << static_cast<int>(datatype);
+}
+
 std::vector<uint8_t> read_file(const char* path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
@@ -294,6 +317,51 @@ int main(int argc, char** argv) {
     std::cout << "  \"matrix_vector_mul_add_property_count\": " << coop_props.MatrixVectorMulAddPropCount << ",\n";
     std::cout << "  \"outer_product_accumulate_property_count\": " << coop_props.OuterProductAccumulatePropCount << ",\n";
     std::cout << "  \"vector_accumulate_property_count\": " << coop_props.VectorAccumulatePropCount << ",\n";
+    std::cout << "  \"matrix_vector_mul_add_properties\": [";
+    for (size_t i = 0; i < mul_props.size(); ++i) {
+        if (i != 0) {
+            std::cout << ",";
+        }
+        const D3D12_COOPERATIVE_VECTOR_PROPERTIES_MUL& prop = mul_props[i];
+        std::cout << "{\"index\":" << i << ",";
+        write_datatype_json_field("input_type", prop.InputType);
+        std::cout << ",";
+        write_datatype_json_field("input_interpretation", prop.InputInterpretation);
+        std::cout << ",";
+        write_datatype_json_field("matrix_interpretation", prop.MatrixInterpretation);
+        std::cout << ",";
+        write_datatype_json_field("bias_interpretation", prop.BiasInterpretation);
+        std::cout << ",";
+        write_datatype_json_field("output_type", prop.OutputType);
+        std::cout << ",\"transpose_supported\":" << (prop.TransposeSupported ? "true" : "false") << "}";
+    }
+    std::cout << "],\n";
+    std::cout << "  \"outer_product_accumulate_properties\": [";
+    for (size_t i = 0; i < outer_props.size(); ++i) {
+        if (i != 0) {
+            std::cout << ",";
+        }
+        const D3D12_COOPERATIVE_VECTOR_PROPERTIES_ACCUMULATE& prop = outer_props[i];
+        std::cout << "{\"index\":" << i << ",";
+        write_datatype_json_field("input_type", prop.InputType);
+        std::cout << ",";
+        write_datatype_json_field("accumulation_type", prop.AccumulationType);
+        std::cout << "}";
+    }
+    std::cout << "],\n";
+    std::cout << "  \"vector_accumulate_properties\": [";
+    for (size_t i = 0; i < vector_props.size(); ++i) {
+        if (i != 0) {
+            std::cout << ",";
+        }
+        const D3D12_COOPERATIVE_VECTOR_PROPERTIES_ACCUMULATE& prop = vector_props[i];
+        std::cout << "{\"index\":" << i << ",";
+        write_datatype_json_field("input_type", prop.InputType);
+        std::cout << ",";
+        write_datatype_json_field("accumulation_type", prop.AccumulationType);
+        std::cout << "}";
+    }
+    std::cout << "],\n";
     std::cout << "  \"dxil_path\": \"" << (dxil_path ? dxil_path : "") << "\",\n";
     std::cout << "  \"dxil_size\": " << dxil_size << ",\n";
     std::cout << "  \"compute_pso_hresult\": \"" << hresult_hex(pso_hr) << "\",\n";
