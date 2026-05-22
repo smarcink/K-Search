@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,11 @@ __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
 }
 
 namespace {
+
+enum class JsonOutputMode {
+    Pretty,
+    Compact,
+};
 
 std::string quote_arg(const std::string& value) {
     std::string out = "\"";
@@ -83,6 +89,71 @@ std::string json_escape(const std::string& value) {
             break;
         }
     }
+    return output;
+}
+
+std::string pretty_json(const std::string& value) {
+    std::string output;
+    output.reserve(value.size() + value.size() / 4);
+
+    int indent = 0;
+    bool in_string = false;
+    bool escaped = false;
+
+    auto append_indent = [&]() {
+        output.append(static_cast<size_t>(indent) * 2, ' ');
+    };
+
+    for (char ch : value) {
+        if (in_string) {
+            output += ch;
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        switch (ch) {
+        case '"':
+            in_string = true;
+            output += ch;
+            break;
+        case '{':
+        case '[':
+            output += ch;
+            output += '\n';
+            ++indent;
+            append_indent();
+            break;
+        case '}':
+        case ']':
+            output += '\n';
+            if (indent > 0) {
+                --indent;
+            }
+            append_indent();
+            output += ch;
+            break;
+        case ',':
+            output += ch;
+            output += '\n';
+            append_indent();
+            break;
+        case ':':
+            output += ": ";
+            break;
+        default:
+            if (!std::isspace(static_cast<unsigned char>(ch))) {
+                output += ch;
+            }
+            break;
+        }
+    }
+
     return output;
 }
 
@@ -247,14 +318,14 @@ HlslProbeBufferDesc raw_u32_desc(uint64_t size_bytes) {
     return desc;
 }
 
-void print_and_free(char* text) {
+void print_json_and_free(char* text, JsonOutputMode output_mode) {
     if (text) {
-        std::cout << text << std::endl;
+        std::cout << (output_mode == JsonOutputMode::Compact ? text : pretty_json(text)) << std::endl;
         hlsl_probe_free_string(text);
     }
 }
 
-int command_probe() {
+int command_probe(JsonOutputMode output_mode) {
     HlslProbeHandle handle = create_probe_or_throw();
     char* caps = hlsl_probe_get_caps_json(handle);
     if (!caps) {
@@ -262,7 +333,7 @@ int command_probe() {
         hlsl_probe_destroy(handle);
         return 1;
     }
-    print_and_free(caps);
+    print_json_and_free(caps, output_mode);
     hlsl_probe_destroy(handle);
     return 0;
 }
@@ -391,7 +462,7 @@ int command_compile_only(const std::string& shader_path, const std::string& out_
 
 void usage() {
     std::cerr << "Usage:\n"
-              << "  hlsl_probe --probe\n"
+              << "  hlsl_probe --probe [--pretty-json|--compact-json]\n"
               << "  hlsl_probe --self-test\n"
               << "  hlsl_probe --linalg-test [--target cs_6_10]\n"
               << "  hlsl_probe --compile-only shader.hlsl [--out shader.dxil]\n";
@@ -407,7 +478,19 @@ int main(int argc, char** argv) {
         }
         std::string command = argv[1];
         if (command == "--probe") {
-            return command_probe();
+            JsonOutputMode output_mode = JsonOutputMode::Pretty;
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--pretty-json") {
+                    output_mode = JsonOutputMode::Pretty;
+                } else if (arg == "--compact-json") {
+                    output_mode = JsonOutputMode::Compact;
+                } else {
+                    usage();
+                    return 2;
+                }
+            }
+            return command_probe(output_mode);
         }
         if (command == "--self-test") {
             return command_self_test();

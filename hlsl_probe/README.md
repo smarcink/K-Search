@@ -16,11 +16,12 @@ The script enters the Visual Studio x64 developer environment internally, config
 
 ```powershell
 .\hlsl_probe\build\bin\Debug\hlsl_probe.exe --probe
+.\hlsl_probe\build\bin\Debug\hlsl_probe.exe --probe --compact-json
 .\hlsl_probe\build\bin\Debug\hlsl_probe.exe --self-test
 .\hlsl_probe\build\bin\Debug\hlsl_probe.exe --linalg-test
 ```
 
-`--probe` prints adapter, shader model, Agility SDK, WaveMMA, and modern D3D12 linear algebra capability JSON. `--self-test` compiles a tiny SM 6.8 compute shader with the downloaded DXC, dispatches it, reads back a 32-bit value, and reports GPU timestamp timing. `--linalg-test` compiles a tiny `dx/linalg.h` matrix-vector shader for `cs_6_10` by default, then reports whether failure happened during compile, PSO creation, dispatch/readback, or output verification.
+`--probe` prints adapter, shader model, Agility SDK, WaveMMA, and modern D3D12 linear algebra capability JSON in an indented terminal-readable form. Use `--probe --compact-json` for the original single-line machine output. `--self-test` compiles a tiny SM 6.8 compute shader with the downloaded DXC, dispatches it, reads back a 32-bit value, and reports GPU timestamp timing. `--linalg-test` compiles a tiny `dx/linalg.h` matrix-vector shader for `cs_6_10` by default, then reports whether failure happened during compile, PSO creation, dispatch/readback, or output verification.
 
 ## Run From Python
 
