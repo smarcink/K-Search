@@ -1,0 +1,511 @@
+{
+  "computed_signals": {
+    "round_index": 24,
+    "trace": {
+      "latency_ms": 5.431008,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 10.051899998870795,
+      "speedup_factor": 1.8508350565623903,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "n1a",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "RTX 5090M Blackwell, 82 SMs, 32KB groupshared cap in DXIL path. Tensor cores not directly usable from HLSL cs_6_8 here.",
+            "notes": "Most ops are tiny GEMMs (32x32, 32x96, 32x128) per window of 16 tokens; compute is modest. Main work is the 2 LN, attention (16x16 tokens), MLP (32->128->32). With B*nH*nW=180*320=57600 windows of N=16 tokens each, total tokens=921600.",
+            "rating_0_to_10": 6.0,
+            "risk": "Naive per-token threading underutilizes; per-window threadgroup likely optimal."
+          },
+          "memory_bandwidth": {
+            "notes": "Input is 29.49M fp16 elements = ~59MB; fits in 64MB L2 partially. Output 59MB. Weights are tiny (<20KB) and reusable across all windows -> cache-resident easily. Bottleneck is global load/store of activations once each if fused.",
+            "rating_0_to_10": 7.0,
+            "risk": "Multiple global round-trips between sub-stages would dominate; full fusion needed."
+          },
+          "register_pressure": {
+            "notes": "Per window (16 tokens x 32 ch fp16) = 512 fp16 = 1KB. Per thread if 1 token/thread: 32 fp16 = small. Hidden MLP 128: 128 fp16 per token = 256B/thread, fine.",
+            "rating_0_to_10": 8.0,
+            "risk": "Low pressure; comfortable register residency for per-window working set."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) CLASSIFICATION: Fused Swin transformer block (no shift, single-head, window=4x4). Mixed: LayerNorm + linear projections + small attention (softmax+matmul) + MLP (GELU). Dense access. Window N=16 tokens, C=32, hidden=128. Input (1,720,1280,32) tiled into nH=180, nW=320 -> 57600 independent windows.\n2) MATH: Per window of 16 tokens c32: ln1 -> qkv(32->96) -> attn 16x16 + rpe + softmax -> *V -> proj(32->32) + residual1 -> ln2 -> fc1(32->128) -> GELU -> fc2(128->32) + residual2. All reductions are within a 16-token window or within C=32/hidden=128.\n3) LAYOUT: x is (B,H,W,C) row-major contiguous; window partition is a permute. Window index (wh,ww) maps to H tile rows of 4 and W tile cols of 4. Per-window 16 tokens reside in non-contiguous H rows but contiguous within each row of 4. Weights tiny: qkv 3072 fp16=6KB; proj 1KB; fc1 4096=8KB; fc2 4096=8KB; norms+biases trivial; rpe 256=0.5KB. Total weights ~25KB, fits in L2 trivially, fits in groupshared if needed.\n4) REGIMES: (a) bandwidth-bound: streaming input once + output once dominates -> aim for single fused kernel, ~118MB traffic at 896GB/s ~0.13ms floor. (b) latency-bound for tiny windows if 1 threadgroup per window with under-utilization. (c) compute-bound on MLP fc1/fc2: 16*32*128*2 + 16*128*32*2 = 262K flops/window * 57600 ~15GF, trivial. So memory-bound is dominant.\n5) KNOBS: threadgroup size (e.g., 32 threads = 1 warp per window, or 64 = 2 warps for 2 windows); per-window mapping (1 thread per token vs cooperative); weight residency (registers via constants vs groupshared vs reload from L2); softmax via wave intrinsics; GELU approximation; vectorized float16_t4 loads.\n6) SKELETON: Each threadgroup processes K windows. Load 16 tokens*32ch into registers/groupshared. Apply LN1 (reduce over C=32 within wave). Compute QKV by mat-vec into registers. Compute attn = q@k^T (16x16), add rpe, softmax (reduce over 16). Compute attn@v -> token. proj + residual. LN2 over C=32. fc1 mat-vec into 128 hidden registers. GELU. fc2 mat-vec back to 32. Add residual2. Store. Weights stay in L2 (cache) or load to groupshared once per group.\n7) FAMILIES:\n - F1 Per-window threadgroup (32 threads, 1 warp): each thread = 1 of 16 tokens (16 active) or 2 tokens, uses wave intrinsics for LN/softmax/matmul reductions. Strength: minimal sync, fully register-resident. Limiter: thread underutilization at N=16.\n - F2 Multi-window per threadgroup: pack 4-8 windows into a 128-256 thread group sharing weight loads in groupshared. Strength: amortize weight load, higher occupancy. Weakness: more groupshared, sync needs.\n - F3 Per-token thread (3-pass kernels): split-stage; rejected because it forces global round-trips, dominating BW. Full fusion preferred.\nFull-fusion is register-feasible (per-token state ~32-128 fp16 fits easily in 255 regs), so single fused kernel is the top choice.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Build the initial fully-fused single-pass HLSL kernel: one threadgroup of 32 threads (single warp) processes one 4x4 window. Each thread handles one of 16 tokens (16 active lanes, optionally 2 tokens/thread to use all 32). Sequence: load token (32 fp16) from global into registers; layernorm via wave reductions; QKV matvec with weights streamed from L2; compute attn=q.k^T cross-token via wave shuffles + rpe load + softmax via wave max/sum; attn@v via wave shuffles; proj + residual1 in registers; ln2; fc1 to 128 hidden in registers; GELU; fc2 to 32; add residual2; write back. No groupshared except possibly tiny rpe/weights staging.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.21,
+          "rationale": "Establishes the maximally fused baseline that eliminates intermediate global traffic. With ~118MB input+output, theoretical floor ~0.13ms. Tiny weights stay L2-resident across all 57600 windows.",
+          "score_0_to_1": 0.55,
+          "title": "F1: Single-warp-per-window fully fused kernel"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.75,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Wave size 32 matches window size N=16 (use 2 tokens/thread) cleanly. 57600 windows / 82 SMs * (warps/SM) maps well.",
+            "notes": "All math fits in registers, no tensor core needed at these sizes.",
+            "rating_0_to_10": 7.0,
+            "risk": "Wave intrinsic correctness for cross-token attention reductions."
+          },
+          "memory_bandwidth": {
+            "notes": "Streams input and output once; weights cache-resident in L2 (~25KB).",
+            "rating_0_to_10": 9.0,
+            "risk": "Window-partition gather pattern causes uncoalesced loads; need to coalesce across the 4 horizontally-adjacent tokens per row."
+          },
+          "register_pressure": {
+            "notes": "Per thread holds ~32 fp16 token + 128 fp16 hidden + scratch ~ <300 fp16 ~ 600B; fine.",
+            "rating_0_to_10": 8.0,
+            "risk": "Hidden=128 array may spill if not carefully sized."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single warp (32 threads, 16 active) per 4x4 window does LN1->QKV->attn(softmax)->proj+res->LN2->FC1+GELU+FC2+res fully in registers, using WaveReadLaneAt for K/V exchange. bottleneck=compute+register pressure: each active lane does ~6k MACs scalar fp32 with HIDDEN=128 reg array (h[128]) creating spill risk; half the warp idle (16/32 lanes). PERF_GAP: expected 3.0x vs observed 1.21x \u2014 gap explained by (a) only 16 active lanes wasting warp issue, (b) scalar fp32 MAC throughput not using tensor cores or fp16 packing, (c) huge unrolled loops causing register spills/long shader. FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: F1 fused design works and passes, but yields modest speedup; next bet is to (i) use all 32 lanes (2 tokens/thread or two windows/warp) and (ii) replace scalar fp32 matmuls with fp16 dot4/dot2 packed math or wave-collaborative GEMM.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 9.578368000000001,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                57600,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 9.578368000000001,
+              "hlsl_host_wall_ms": 147.5710499980778,
+              "reference_device": "cuda:0",
+              "score": 1.2077631595805522,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 11.568399999305257,
+            "speedup_factor": 1.2077631595805522,
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "7c176dd227307292af661bb3beaf107c907afe2c"
+        }
+      },
+      {
+        "action": {
+          "description": "Pack 4 windows (64 tokens) per threadgroup with 128 threads (4 warps), sharing one staged copy of weights (qkv/proj/fc1/fc2) and rpe in groupshared (~25KB, under 32KB cap). Each warp handles one window using the same wave-intrinsic recipe as F1. Goal: amortize weight loads and improve SM occupancy/issue rate.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "If L2 weight reuse already saturates, groupshared staging may not help; but it can reduce L1/L2 pressure and increase warps-per-SM. Worth comparing vs F1.",
+          "score_0_to_1": 0.4,
+          "title": "F2: Multi-warp threadgroup with groupshared staging"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.35,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "25KB groupshared near the 32KB DXIL cap. Need to confirm occupancy with that allocation.",
+            "notes": "More parallel warps per SM may better hide memory latency.",
+            "rating_0_to_10": 6.0,
+            "risk": "Groupshared near cap reduces blocks/SM, possibly hurting occupancy."
+          },
+          "memory_bandwidth": {
+            "notes": "Weight traffic drops 4x but weights are tiny; main BW is activations which are unchanged.",
+            "rating_0_to_10": 6.0,
+            "risk": "Activation BW unchanged; weight reuse via L2 likely already free."
+          },
+          "register_pressure": {
+            "notes": "Similar per-thread footprint to F1.",
+            "rating_0_to_10": 7.0,
+            "risk": "Same as F1."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: distinct from F1/n1 \u2014 uses multiple warps per window with LDS staging to enable larger tiles or cooperative GEMM via WMMA. Risk: 32KB LDS cap and barriers may not pay off given window is tiny (16 tokens x 32 ch). Deprioritized vs n1a/n1b refinements.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Optimize the global memory access by coalescing the window-partition gather: for each window's 4 rows of 4 contiguous tokens (4*32 fp16 = 256B per row), use vectorized float16_t4 loads and ensure threads within a wave read contiguous addresses. Likewise for the output write. Combine with F1 mapping (token-to-thread arranged so consecutive lanes hit consecutive global addresses within each of the 4 rows of the window).",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.15,
+          "rationale": "Window-partition is the only non-trivial access pattern. Coalescing the 4 rows separately (each row is contiguous 16 fp16 channels x 4 tokens) hits peak BW.",
+          "score_0_to_1": 0.45,
+          "title": "Coalesced vectorized input gather/output scatter"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Buffer<float16_t> typed loads may not vectorize; may need ByteAddressBuffer with Load4 for fp16x4.",
+            "notes": "No effect on compute layout itself.",
+            "rating_0_to_10": 5.0,
+            "risk": "Typed Buffer<float16_t> doesn't support .Load4 vector; might need ByteAddressBuffer for true vectorization."
+          },
+          "memory_bandwidth": {
+            "notes": "Up to ~896GB/s sustainable only with coalesced wide loads.",
+            "rating_0_to_10": 9.0,
+            "risk": "If uncoalesced, BW drops significantly."
+          },
+          "register_pressure": {
+            "notes": "Minor.",
+            "rating_0_to_10": 8.0,
+            "risk": "None."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: composable refinement (orthogonal to mapping), addresses global access pattern using float16_t4 loads/stores on contiguous C=32 token vectors. Smaller expected gain since n1 is already compute-bound; keep as later composable refinement under whichever of n1a/n1b wins.",
+        "overall_rating_0_to_10": 5.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.85,
+          "rationale": "",
+          "score_0_to_1": 0.72,
+          "title": "Full-warp utilization: 2 tokens/thread (or 2 windows/warp)"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.8,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "Good fp32 ALU utilization; tensor cores unused.",
+            "rating_0_to_10": 7.0,
+            "risk": "low"
+          },
+          "memory_bandwidth": {
+            "notes": "Each lane re-fetches QKV/proj/FC weights; vectorized fp16x4 loads could help.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "h[128] + xn/x_in/q/k/v/ao push register usage; may limit occupancy.",
+            "rating_0_to_10": 4.0,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a",
+        "node_type": "decision",
+        "notes": "CURRENT: does: 2 windows packed per warp (half-warp per window, 16 lanes per window owning 1 token each); fully fused LN1->QKV->Attn(via WaveReadLaneAt)->Proj->LN2->FC1+GELU->FC2 with per-thread registers for x_in/xn/q/k/v/ao/r1/xn2 and h[128]. bottleneck: compute + register pressure from h[128] FC1 intermediate and per-thread C=32 inner products; some bandwidth on weight reloads since weights are not shared across lanes.\nFOLLOW_THROUGH: aligned_with_intent: yes (packed 2 windows/warp realized as sub=t>>4).\nUPDATE_BELIEF: 1.85x measured matches the 1.8x prediction closely; lane utilization fix paid off. Next bet: attack h[128] register footprint and FC1/FC2 compute via wave-cooperative MLP (lanes share weights and partition the 128 hidden units), or use float16_t4 vectorized weight loads to reduce L1/L2 pressure.",
+        "overall_rating_0_to_10": 7.8,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 5.431008,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "dispatch": [
+                28800,
+                1,
+                1
+              ],
+              "hlsl_gpu_time_ms": 5.431008,
+              "hlsl_host_wall_ms": 130.4850999986229,
+              "reference_device": "cuda:0",
+              "score": 1.8508350565623903,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 10.051899998870795,
+            "speedup_factor": 1.8508350565623903,
+            "status": "passed"
+          },
+          "parent_solution_id": "7c176dd227307292af661bb3beaf107c907afe2c",
+          "solution_id": "6b4a09860fdb8436d032e8441ec0506fd74d53ae"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 1.6,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "fp16/dot4 packed matmuls + reduce register pressure"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1b",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: distinct from n1a because it tackles arithmetic precision/throughput and register spill of h[128], not lane utilization. Use half precision accumulation where safe, dot()/mad with float16_t4 vector loads on weights, and stream FC1->FC2 to avoid materializing h[128] fully (e.g., tile HIDDEN in chunks of 32 to keep <=32 regs live). Reduces spills and boosts FP throughput.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "n1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "7c176dd227307292af661bb3beaf107c907afe2c",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 2.4,
+          "rationale": "",
+          "score_0_to_1": 0.15,
+          "title": "Wave-cooperative FC1/FC2: partition HIDDEN=128 across 16 lanes/window (8 each), eliminate h[128] register array"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a1",
+        "node_type": "decision",
+        "notes": "CURRENT: does=Single warp processes 2 windows; each lane owns 1 token; FC1 produces 8 hidden units/lane, fc2 reduced via WaveReadLaneAt across 16 lanes. bottleneck=correctness (failed eval, max_diff=3.64). FOLLOW_THROUGH: aligned_with_intent=yes. UPDATE_BELIEF: Correctness failed \u2014 likely cause: lane indexing for fc1 outputs. Code uses hidden_idx=token_id*8+kk, but fc2 expects fc2w[oc*HIDDEN+hi] with hi matching producer lane's hidden index. The reduction sums part[oc] across lanes l in [0,16), so each lane l must own hidden units [l*8..l*8+8); however token_id (per-window lane index) is correct. The bug is more likely: h_local indexing vs fc2w layout mismatch, OR the residual add 'r1[oc] + s' is correct only if s includes fc2b once \u2014 currently fc2b is added once which is fine. Most probable: fc1w/fc2w layout assumption \u2014 fc1w may be [HIDDEN][C] or [C][HIDDEN]; verify. next bet: Debug fc1w/fc2w layout (transpose) before claiming approach broken. PERF_GAP: expected 2.4x, observed FAIL.",
+        "overall_rating_0_to_10": 3.5,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6b4a09860fdb8436d032e8441ec0506fd74d53ae",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 2.1,
+          "rationale": "",
+          "score_0_to_1": 0.55,
+          "title": "Vectorized fp16x4 weight/input loads (ByteAddressBuffer or float16_t4 typed) for QKV/proj/FC1/FC2"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: orthogonal refinement focused on memory throughput only; does not change mapping. Distinct from n1a1 (compute partitioning) and n1a3 (LDS staging). Low risk, modest gain expected since weights dominate traffic.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6b4a09860fdb8436d032e8441ec0506fd74d53ae",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": "Stage FC1 weights (128x32 fp16 = 8KB) in groupshared once per group; lanes broadcast-read"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.45,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: distinct LDS-based approach; only one barrier after cooperative load. Mutually exclusive with n1a1 (which removes the need by partitioning) and n1a2 (which keeps SRV loads). Risk: extra barrier and limited reuse if only 2 windows/group; may need larger groups (e.g., 4-8 windows) to amortize.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "n1a",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "6b4a09860fdb8436d032e8441ec0506fd74d53ae",
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.3,
+          "rationale": "",
+          "score_0_to_1": 0.6,
+          "title": "Fix wave-cooperative FC1/FC2 correctness: verify fc1w/fc2w layout and lane->hidden mapping"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.55,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "memory_bandwidth": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          },
+          "register_pressure": {
+            "notes": "",
+            "rating_0_to_10": 0.0,
+            "risk": ""
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1a1_fix",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: child (debug-and-improve) of n1a1, not a sibling alternative. Re-examine indexing: fc1w[o*32+c] with o=token_id*8+kk maps lane l to hidden indices [l*8, l*8+8). fc2w[oc*HIDDEN+hi] must use the same hi. If reference uses fc1w stored as [HIDDEN,C] row-major, indexing is fine. Suspect bug: WaveReadLaneAt loop across 16 lanes only reads lanes [lane_base..lane_base+15], but if warp packs 2 windows (sub=0/1), lane_base correctly selects half. Possible real bug: in attention K/V wave shuffle path interaction with later FC reductions (uniform control flow?). Try: (a) keep h[128] register array but compute FC2 cooperatively only, (b) ensure WaveReadLaneAt is called from uniform control flow with [unroll]. Plan: revert to per-lane full HIDDEN=128 with 8-wide vectorized loop (no cross-lane reduction) and measure; if correct, reintroduce cooperation step-by-step.",
+        "overall_rating_0_to_10": 6.5,
+        "parent_id": "n1a1",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "Fused simplified Swin transformer block over a (1,720,1280,32) fp16 feature map with window=4x4 (N=16 tokens), single head, no shift: LayerNorm -> QKV(32->96) -> scaled dot-product attention with RPE -> proj(32->32) + residual -> LayerNorm -> fc1(32->128) -> GELU -> fc2(128->32) + residual. 57600 independent windows; tiny weights (~25KB total) easily L2-resident; per-window working set fits in registers (16 tokens x 32 ch). Memory-bound (~118MB activation traffic; floor ~0.13ms at 896GB/s). Best strategy: full fusion in a single compute shader, one warp per window with wave intrinsics for LN/softmax/attention reductions, coalesced fp16 vector loads/stores. Constraints: cs_6_8, 32KB groupshared cap, prefer register residency, minimize barriers.",
+  "open_questions": [
+    "Does Buffer<float16_t> support vectorized loads, or must we use ByteAddressBuffer + Load2/Load4 to coalesce fp16x4 reads?",
+    "What is the optimal threadgroup size: 32 threads (1 warp = 1 window with 2 tokens/thread) vs 64/128 (multiple windows sharing groupshared weights)?",
+    "Is L2 sufficient to keep all ~25KB weights resident across 57600 windows, or do we need explicit groupshared staging to avoid repeated L2 fetches?",
+    "Should LayerNorm accumulate mean/variance in fp32 (matching PyTorch reference) to meet rtol/atol=0.01, and is fp16 accumulation in the small GEMMs accurate enough?",
+    "Which GELU approximation (tanh-based vs erf-based) matches the PyTorch fp16 reference within tolerance?",
+    "How are the 16 tokens of a window laid out in memory after window_partition, and what is the most coalesced gather pattern (per row of 4 contiguous tokens)?",
+    "Does the dispatch need exact integer group counts equal to nH*nW=57600 (e.g., dispatch [320,180,1]), and does the launch.json shape align with that?",
+    "Are wave intrinsics (WaveActiveSum/Max, WaveReadLaneAt) reliably available and performant on RTX 5090 Mobile under cs_6_8?"
+  ]
+}

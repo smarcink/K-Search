@@ -73,7 +73,12 @@ _HLSL_GENERATION_GUIDELINES = """## HLSL/DX12 Optimization Guidelines
 - Flatten tensors in row-major contiguous order. For shape [A, B, C], linear offset is ((a * B) + b) * C + c.
 - Prefer coalesced adjacent loads/stores across SV_DispatchThreadID.x.
 - For cs_6_8/cs_6_9, keep total groupshared memory under 32 KiB per threadgroup. Do not use CUDA per-SM shared-memory limits as the HLSL per-group limit.
-- Use groupshared memory only when it removes repeated global reads and the fixed tile is small enough; leave safety margin below 32 KiB for layout/alignment.
+- Prefer register-resident scalars/vectors for per-thread or single-owner intermediate values. Full fusion should minimize materialization, not store every phase's output in groupshared memory.
+- Treat groupshared memory as an explicitly synchronized communication/cache resource. Use it only when multiple threads or waves reuse the same data, or when it reduces global traffic enough to pay for occupancy and synchronization costs.
+- Do not justify groupshared use only because a tensor or working set fits under 32 KiB. For every groupshared array, there must be a clear producer thread set, consumer thread set, reuse count/traffic saving, and required synchronization point.
+- Leave safety margin below 32 KiB for groupshared layout/alignment. Do not stage a whole working set or whole phase tensors in groupshared when streaming from SRVs/L2, using wave communication, keeping owner-local registers, or recomputing a small value is cheaper.
+- Minimize GroupMemoryBarrierWithGroupSync calls. They are usually needed only after cross-thread groupshared writes before cross-thread reads; avoid phase-by-phase barriers for values that can stay in registers or have a single producer/consumer.
+- Prefer wave intrinsics for wave-local reductions, broadcasts, scans, or shuffles when they fit the mapping; use group-wide barriers only for true group-wide communication.
 - For fp16 elementwise work, use float16_t where possible. Widen to float only when needed for numerical tolerance.
 """
 

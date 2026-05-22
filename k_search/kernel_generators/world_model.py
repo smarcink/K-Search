@@ -41,6 +41,18 @@ def get_dimensions_for_target(target_gpu: str = "H100") -> tuple[str, ...]:
         return XPU_DIMENSIONS
     return BASE_DIMENSIONS
 
+
+def _language_constraints_block(language: str) -> str:
+    """Return language-specific WM constraints that should override generic hardware facts."""
+    if str(language or "").strip().lower() == "hlsl":
+        from k_search.kernel_generators.world_model_prompts import HLSL_OPTIMIZATION_HINTS
+
+        return (
+            "Language-specific constraints that override generic hardware facts when they conflict:\n"
+            f"{HLSL_OPTIMIZATION_HINTS.strip()}\n\n"
+        )
+    return ""
+
 DIMENSION_ENTRY_DEFAULT: dict[str, Any] = {
     "hypothesis": "",
     "confidence": 0.0,
@@ -873,12 +885,15 @@ def build_world_model_prompts(
     if hw_spec_text and hw_spec_text.strip():
         hw_block = f"\n{hw_spec_text.strip()}\n\n"
 
+    language_constraints_block = _language_constraints_block(language)
+
     init_prompt = (
         "You are a GPU kernel performance engineer.\n"
         "Create an initial WORLD MODEL for the kernel problem below.\n\n"
         f"Target GPU: {target_gpu}\n"
         f"Language: {language}\n"
         f"{hw_block}"
+        f"{language_constraints_block}"
         "Kernel Specification:\n"
         f"{_truncate(definition_text, max_chars_per_block)}\n\n"
         "Return ONLY a single valid JSON object matching this schema guide (keys must exist; fill strings/lists as needed):\n"
@@ -902,17 +917,22 @@ def build_world_model_prompts(
         "3) Data layout & access patterns\n"
         "- For each tensor: symbolic shape, dtype, contiguous/strided/transposed vs indirect indexing.\n"
         "- Identify dominant global reads/writes and reuse (thread/warp/block).\n"
-        "- Note what can be staged (register/shared) and what is read-once.\n\n"
+        "- Separately note register-resident private values, shared/threadgroup-staged data, and read-once data.\n"
+        "- Treat shared memory as a communication/cache choice, not the default home for every intermediate.\n\n"
         "4) Bottleneck hypotheses by regime (>=3 regimes)\n"
         "- Define at least 3 runtime regimes and for each: likely bottleneck (bandwidth/latency/compute/sync) and what triggers it.\n\n"
         "5) Kernel design space (knobs)\n"
         "- Enumerate tunable dimensions: mapping/parallelization, tiling, memory movement, compute strategy, numerics, special-case paths.\n\n"
         "6) High-level kernel skeleton (no code)\n"
-        "- Describe phases, what lives in registers vs shared, and where sync is needed.\n\n"
+        "- Describe phases, what lives in registers vs shared, where cross-thread/wave communication happens, and why each sync is needed.\n\n"
         "7) Candidate kernel families (pruned)\n"
         "- Propose 2-3 families; for each: intended regime, tiling philosophy, memory strategy, strengths/weaknesses, primary limiter.\n"
         "- FULL FUSION PRIORITY: Estimate the total working set per independent parallel unit (all weights, activations, intermediates).\n"
-        "  If it fits in registers + shared memory, propose a maximally-fused single-kernel approach as the TOP candidate.\n"
+        "  Classify that working set by ownership: private/register, wave-local, shared/threadgroup-staged, or direct global/SRV stream.\n"
+        "  Do NOT count every activation or intermediate as shared memory by default, and do NOT use 'fits in shared memory' alone as a reason to stage it.\n"
+        "  If it fits in registers plus selectively staged shared memory, propose a maximally-fused single-kernel approach as the TOP candidate.\n"
+        "  Full fusion means avoiding global round-trips; it does not require materializing every intermediate in shared memory.\n"
+        "  Prefer register-resident intermediate values and use shared memory only for true inter-thread reuse/communication.\n"
         "  Do NOT split into incremental partial fusions when full fusion is register-feasible — partial fusion leaves global memory\n"
         "  round-trips between sub-kernels that dominate latency. Small dimensions make cross-operation fusion straightforward, not hard.\n\n"
         "- FORBIDDEN: implementation tactics as families (CRITICAL):\n"
@@ -1040,6 +1060,7 @@ def build_decision_tree_edit_prompt(
         "Output ONLY a JSON edit script (no markdown, no extra text).\n\n"
         f"Target GPU: {target_gpu}\nLanguage: {language}\n"
         f"{('\n' + str(hw_spec_text or '').strip() + '\n\n') if str(hw_spec_text or '').strip() else '\n'}"
+        f"{_language_constraints_block(language)}"
         "Kernel specification (reference):\n"
         f"{def_s}\n\n"
         "Current world model (compact):\n"
