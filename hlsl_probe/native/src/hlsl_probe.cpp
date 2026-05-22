@@ -149,6 +149,41 @@ const char* shader_model_name(D3D_SHADER_MODEL shader_model) {
     }
 }
 
+const char* linear_algebra_tier_name(D3D12_LINEAR_ALGEBRA_TIER tier) {
+    switch (tier) {
+    case D3D12_LINEAR_ALGEBRA_TIER_NOT_SUPPORTED: return "not_supported";
+    case D3D12_LINEAR_ALGEBRA_TIER_1_0: return "1_0";
+    default: return "unknown";
+    }
+}
+
+const char* linear_algebra_datatype_name(D3D12_LINEAR_ALGEBRA_DATATYPE datatype) {
+    switch (datatype) {
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_SINT16: return "sint16";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_UINT16: return "uint16";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32: return "sint32";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_UINT32: return "uint32";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16: return "float16";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32: return "float32";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8: return "sint8";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_UINT8: return "uint8";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT8_E4M3FN: return "float8_e4m3fn";
+    case D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT8_E5M2: return "float8_e5m2";
+    default: return "unknown";
+    }
+}
+
+std::string linear_algebra_support_flags_json(D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAGS flags) {
+    std::ostringstream oss;
+    oss << "{\"value\":" << static_cast<uint32_t>(flags)
+        << ",\"supported\":" << ((flags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED) ? "true" : "false")
+        << ",\"emulated_inputs\":" << ((flags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_INPUTS) ? "true" : "false")
+        << ",\"emulated_outputs\":" << ((flags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_OUTPUTS) ? "true" : "false")
+        << ",\"transpose\":" << ((flags & D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_TRANSPOSE) ? "true" : "false")
+        << "}";
+    return oss.str();
+}
+
 struct GpuBuffer {
     ComPtr<ID3D12Resource> resource;
     ComPtr<ID3D12Resource> upload;
@@ -494,6 +529,71 @@ struct HlslProbeContext {
         validate_format_support(desc, output, label);
     }
 
+    std::string thread_vector_matrix_multiply_support_json(
+        const char* name,
+        D3D12_LINEAR_ALGEBRA_DATATYPE vector_input,
+        D3D12_LINEAR_ALGEBRA_DATATYPE matrix_input,
+        D3D12_LINEAR_ALGEBRA_DATATYPE bias_input,
+        D3D12_LINEAR_ALGEBRA_DATATYPE vector_result) {
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT support = {};
+        support.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_VECTOR_MATRIX_MULTIPLY;
+        support.ThreadVectorMatrixMultiply.VectorInputType = vector_input;
+        support.ThreadVectorMatrixMultiply.MatrixInputType = matrix_input;
+        support.ThreadVectorMatrixMultiply.BiasInputType = bias_input;
+        support.ThreadVectorMatrixMultiply.VectorResultType = vector_result;
+
+        HRESULT hr = device->CheckFeatureSupport(
+            D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+            &support,
+            sizeof(support));
+
+        std::ostringstream oss;
+        oss << "{\"name\":\"" << name << "\",";
+        oss << "\"operation\":\"thread_vector_matrix_multiply\",";
+        oss << "\"query_ok\":" << (SUCCEEDED(hr) ? "true" : "false") << ",";
+        oss << "\"query_hresult\":\"" << hresult_hex(hr) << "\",";
+        oss << "\"vector_input_type\":\"" << linear_algebra_datatype_name(vector_input) << "\",";
+        oss << "\"matrix_input_type\":\"" << linear_algebra_datatype_name(matrix_input) << "\",";
+        oss << "\"bias_input_type\":\"" << linear_algebra_datatype_name(bias_input) << "\",";
+        oss << "\"vector_result_type\":\"" << linear_algebra_datatype_name(vector_result) << "\",";
+        oss << "\"support_flags\":" << linear_algebra_support_flags_json(support.ThreadVectorMatrixMultiply.SupportFlags);
+        oss << "}";
+        return oss.str();
+    }
+
+    std::string wave_matrix_multiply_support_json(
+        const char* name,
+        UINT wave_size,
+        D3D12_LINEAR_ALGEBRA_DATATYPE matrix_a,
+        D3D12_LINEAR_ALGEBRA_DATATYPE matrix_b,
+        D3D12_LINEAR_ALGEBRA_DATATYPE accumulator) {
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT support = {};
+        support.OperationType = D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY;
+        support.WaveMatrixMultiply.Inputs.WaveSize = wave_size;
+        support.WaveMatrixMultiply.Inputs.MatrixAComponentType = matrix_a;
+        support.WaveMatrixMultiply.Inputs.MatrixBComponentType = matrix_b;
+        support.WaveMatrixMultiply.Inputs.AccumulatorComponentType = accumulator;
+
+        HRESULT hr = device->CheckFeatureSupport(
+            D3D12_FEATURE_LINEAR_ALGEBRA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT,
+            &support,
+            sizeof(support));
+
+        std::ostringstream oss;
+        oss << "{\"name\":\"" << name << "\",";
+        oss << "\"operation\":\"wave_matrix_multiply\",";
+        oss << "\"query_ok\":" << (SUCCEEDED(hr) ? "true" : "false") << ",";
+        oss << "\"query_hresult\":\"" << hresult_hex(hr) << "\",";
+        oss << "\"wave_size\":" << wave_size << ",";
+        oss << "\"matrix_a_type\":\"" << linear_algebra_datatype_name(matrix_a) << "\",";
+        oss << "\"matrix_b_type\":\"" << linear_algebra_datatype_name(matrix_b) << "\",";
+        oss << "\"accumulator_type\":\"" << linear_algebra_datatype_name(accumulator) << "\",";
+        oss << "\"support_flags\":" << linear_algebra_support_flags_json(support.WaveMatrixMultiply.SupportFlags) << ",";
+        oss << "\"num_shapes\":" << support.WaveMatrixMultiply.NumShapes;
+        oss << "}";
+        return oss.str();
+    }
+
     std::string caps_json() {
         D3D12_FEATURE_DATA_SHADER_MODEL shader_model = { D3D_SHADER_MODEL_6_10 };
         HRESULT sm_hr = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model));
@@ -501,6 +601,12 @@ struct HlslProbeContext {
 
         D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9 = {};
         HRESULT opt9_hr = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &options9, sizeof(options9));
+
+        D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT linear_algebra = {};
+        HRESULT linear_algebra_hr = device->CheckFeatureSupport(
+            D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT,
+            &linear_algebra,
+            sizeof(linear_algebra));
 
         UINT64 timestamp_frequency = 0;
         HRESULT freq_hr = queue->GetTimestampFrequency(&timestamp_frequency);
@@ -528,6 +634,44 @@ struct HlslProbeContext {
         oss << "\"options9_query_hresult\":\"" << hresult_hex(opt9_hr) << "\",";
         oss << "\"wave_mma_tier\":" << static_cast<int>(options9.WaveMMATier) << ",";
         oss << "\"wave_mma_tier_name\":\"" << wave_mma_tier_name(options9.WaveMMATier) << "\",";
+        oss << "\"linear_algebra_query_ok\":" << (SUCCEEDED(linear_algebra_hr) ? "true" : "false") << ",";
+        oss << "\"linear_algebra_query_hresult\":\"" << hresult_hex(linear_algebra_hr) << "\",";
+        oss << "\"linear_algebra_tier\":" << static_cast<int>(linear_algebra.LinearAlgebraTier) << ",";
+        oss << "\"linear_algebra_tier_name\":\"" << linear_algebra_tier_name(linear_algebra.LinearAlgebraTier) << "\",";
+        oss << "\"linear_algebra_thread_vector_matrix_multiply\":[";
+        oss << thread_vector_matrix_multiply_support_json(
+            "f16_vector_f16_matrix_f16_bias_f16_result",
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16);
+        oss << "," << thread_vector_matrix_multiply_support_json(
+            "f32_vector_f32_matrix_f32_bias_f32_result",
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32);
+        oss << "," << thread_vector_matrix_multiply_support_json(
+            "sint8_vector_sint8_matrix_sint32_bias_sint32_result",
+            D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32);
+        oss << "],";
+        oss << "\"linear_algebra_wave_matrix_multiply\":[";
+        oss << wave_matrix_multiply_support_json(
+            "wave32_f16_f16_f32",
+            32,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT16,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_FLOAT32);
+        oss << "," << wave_matrix_multiply_support_json(
+            "wave32_sint8_sint8_sint32",
+            32,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8,
+            D3D12_LINEAR_ALGEBRA_DATATYPE_SINT32);
+        oss << "],";
         oss << "\"timestamp_frequency\":" << (SUCCEEDED(freq_hr) ? timestamp_frequency : 0);
         oss << "}";
         return oss.str();

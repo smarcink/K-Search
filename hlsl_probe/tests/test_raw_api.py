@@ -1,7 +1,7 @@
 import struct
 import unittest
 
-from hlsl_probe import BufferArg, BufferSpec, compile_hlsl_source, run_dxil, self_test
+from hlsl_probe import BufferArg, BufferSpec, compile_hlsl_source, probe_caps, run_dxil, self_test
 
 
 class RawApiTests(unittest.TestCase):
@@ -12,6 +12,17 @@ class RawApiTests(unittest.TestCase):
         self.assertEqual(result["output_value"], 123)
         self.assertEqual(result["outputs"][0]["view_kind"], "raw")
         self.assertEqual(result["outputs"][0]["format"], "raw_u32")
+
+    def test_probe_reports_modern_linalg_capabilities(self):
+        caps = probe_caps()
+
+        self.assertEqual(caps["status"], "passed")
+        self.assertIn("linear_algebra_query_ok", caps)
+        self.assertIn("linear_algebra_tier_name", caps)
+        self.assertIn("linear_algebra_thread_vector_matrix_multiply", caps)
+        self.assertIn("linear_algebra_wave_matrix_multiply", caps)
+        self.assertIsInstance(caps["linear_algebra_thread_vector_matrix_multiply"], list)
+        self.assertIsInstance(caps["linear_algebra_wave_matrix_multiply"], list)
 
     def test_raw_u32_add_kernel(self):
         shader = """

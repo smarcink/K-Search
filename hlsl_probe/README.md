@@ -20,7 +20,7 @@ The script enters the Visual Studio x64 developer environment internally, config
 .\hlsl_probe\build\bin\Debug\hlsl_probe.exe --linalg-test
 ```
 
-`--probe` prints adapter, shader model, Agility SDK, and WaveMMA capability JSON. `--self-test` compiles a tiny SM 6.8 compute shader with the downloaded DXC, dispatches it, reads back a 32-bit value, and reports GPU timestamp timing. `--linalg-test` compiles a tiny `dx/linalg.h` matrix-vector shader for `cs_6_10` by default, then reports whether failure happened during compile, PSO creation, dispatch/readback, or output verification.
+`--probe` prints adapter, shader model, Agility SDK, WaveMMA, and modern D3D12 linear algebra capability JSON. `--self-test` compiles a tiny SM 6.8 compute shader with the downloaded DXC, dispatches it, reads back a 32-bit value, and reports GPU timestamp timing. `--linalg-test` compiles a tiny `dx/linalg.h` matrix-vector shader for `cs_6_10` by default, then reports whether failure happened during compile, PSO creation, dispatch/readback, or output verification.
 
 ## Run From Python
 
@@ -81,8 +81,19 @@ python -m unittest discover hlsl_probe/tests
 
 The typed FP16 and int8 tests may report an explicit capability skip/failure if the current runtime does not expose the needed typed SRV/UAV format support.
 
+## Linear Algebra Capabilities
+
+Agility SDK 720 does not expose the older blog-era `D3D12CooperativeVectorExperiment` / `CooperativeVectorTier` names. The probe reports the newer preview capability surface instead:
+
+- `linear_algebra_query_ok`
+- `linear_algebra_tier_name`
+- `linear_algebra_thread_vector_matrix_multiply`
+- `linear_algebra_wave_matrix_multiply`
+
+The thread-vector matrix multiply entries correspond to the current `dx/linalg.h` cooperative vector replacement API. A successful query with `linear_algebra_tier_name` set to `not_supported` means the runtime understands the Agility 720 query but the driver/device does not currently expose the feature.
+
 ## Preview SDK Notes
 
 The current configuration uses the preview DXC and Agility SDK packages in `thirdparty/dxc_preview_2026_04_22` and `thirdparty/microsoft.direct3d.d3d12.1.720.0-preview`. Windows Developer Mode must be enabled for `D3D12ExperimentalShaderModels`; without it, preview Agility device creation can fail before any shader is tested.
 
-On the RTX 5090 Laptop GPU with driver `596.49`, Developer Mode allows Agility SDK 720 to load and reports WaveMMA tier `1_0`, but the runtime still reports highest shader model `6.9`. The `--linalg-test` shader compiles as `cs_6_10` with preview DXC, then currently fails at PSO creation when `supports_sm_6_10` is false.
+On the RTX 5090 Laptop GPU with driver `596.49`, Developer Mode allows Agility SDK 720 to load and reports WaveMMA tier `1_0`, but the runtime still reports highest shader model `6.9` and `linear_algebra_tier_name` as `not_supported`. The `--linalg-test` shader compiles as `cs_6_10` with preview DXC, then currently fails at PSO creation when `supports_sm_6_10` is false.
