@@ -1,15 +1,22 @@
 param(
-    [switch]$SkipShaderCompile
+    [ValidateSet("Debug", "Release")]
+    [string]$Config = "Release",
+    [switch]$SkipShaderCompile,
+    [switch]$SkipRun,
+    [switch]$Clean
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "vs_dev_env.ps1")
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $DxcRoot = Join-Path $RepoRoot "thirdparty\dxc_2025_05_24"
 $AgilityRoot = Join-Path $RepoRoot "thirdparty\microsoft.direct3d.d3d12.1.717.0-preview"
 $ProbeSource = Join-Path $RepoRoot "hlsl_probe\tools\coopvec69_probe.cpp"
 $ShaderSource = Join-Path $RepoRoot "hlsl_probe\tests\fixtures\coopvec69_smoke.hlsl"
-$BuildDir = Join-Path $RepoRoot "hlsl_probe\build\coopvec69"
+$BuildRoot = Join-Path $RepoRoot "hlsl_probe\build\coopvec69"
+$BuildDir = Join-Path $BuildRoot $Config
 $DxilPath = Join-Path $RepoRoot "hlsl_probe\build\coopvec69_smoke.dxil"
 
 $DxcExe = Join-Path $DxcRoot "bin\x64\dxc.exe"
@@ -21,6 +28,10 @@ foreach ($Path in @($DxcExe, $DxcInclude, $AgilityInclude, $AgilityBin, $ProbeSo
     if (-not (Test-Path $Path)) {
         throw "Required path not found: $Path"
     }
+}
+
+if ($Clean -and (Test-Path $BuildDir)) {
+    Remove-Item -Recurse -Force $BuildDir
 }
 
 New-Item -ItemType Directory -Force $BuildDir | Out-Null
@@ -36,30 +47,17 @@ if (-not $SkipShaderCompile) {
 Copy-Item (Join-Path $AgilityBin "D3D12Core.dll") (Join-Path $BuildDir "D3D12") -Force
 Copy-Item (Join-Path $AgilityBin "d3d12SDKLayers.dll") (Join-Path $BuildDir "D3D12") -Force
 
-$VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-if (-not (Test-Path $VsWhere)) {
-    throw "vswhere.exe not found at $VsWhere"
-}
-
-$VsInstall = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-if (-not $VsInstall) {
-    throw "Visual Studio with VC x64 tools was not found."
-}
-
-$VsDevCmd = Join-Path $VsInstall "Common7\Tools\VsDevCmd.bat"
-if (-not (Test-Path $VsDevCmd)) {
-    throw "VsDevCmd.bat not found at $VsDevCmd"
-}
+$VsSetupBlock = New-VsDevCmdSetupBlock
 
 $ProbeExe = Join-Path $BuildDir "coopvec69_probe.exe"
 $ProbeObj = Join-Path $BuildDir "coopvec69_probe.obj"
+$CompileFlags = if ($Config -eq "Release") { "/O2 /DNDEBUG /MD" } else { "/Od /Zi /D_DEBUG /MDd" }
 $CmdFile = Join-Path ([System.IO.Path]::GetTempPath()) "build_coopvec69_probe_$PID.cmd"
 @"
 @echo off
-call "$VsDevCmd" -arch=x64 -host_arch=x64
-if errorlevel 1 exit /b %errorlevel%
+$VsSetupBlock
 cd /d "$RepoRoot"
-cl /nologo /std:c++17 /EHsc /I"$AgilityInclude" /Fo"$ProbeObj" /Fe"$ProbeExe" "$ProbeSource" d3d12.lib dxgi.lib
+cl /nologo /std:c++17 /EHsc $CompileFlags /I"$AgilityInclude" /Fo"$ProbeObj" /Fe"$ProbeExe" "$ProbeSource" d3d12.lib dxgi.lib
 exit /b %errorlevel%
 "@ | Set-Content -Path $CmdFile -Encoding ASCII
 
@@ -71,6 +69,12 @@ try {
 }
 finally {
     Remove-Item $CmdFile -ErrorAction SilentlyContinue
+}
+
+Write-Host "Built: $ProbeExe"
+
+if ($SkipRun) {
+    return
 }
 
 Write-Host "=== shader-models-only ==="
