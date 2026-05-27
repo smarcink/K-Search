@@ -32,6 +32,7 @@ from k_search.tasks.task_base import (
 class HlslKernelTaskConfig:
     gpu: str = "Direct3D 12 GPU"
     hlsl_target: str = "cs_6_8"
+    hlsl_linalg: str = "auto"
     precision: str = "fp16"
     reference_device: str = "auto"
     num_correct_trials: int = 5
@@ -44,24 +45,42 @@ class HlslKernelTaskConfig:
     max_failure_excerpt_chars: int = 4000
 
 
-_HLSL_CODE_FORMAT = """IMPORTANT: Generate code in XML format with exactly 2 files:
+def _shader_model_tuple(target: str) -> tuple[int, int]:
+    match = re.match(r"cs_(\d+)_(\d+)$", str(target or "").lower())
+    if not match:
+        return (0, 0)
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def _hlsl_code_format(target: str, *, linalg_enabled: bool) -> str:
+    buffer_contract = (
+        "- Use raw buffers for tensor data: ByteAddressBuffer for SRVs and RWByteAddressBuffer for UAVs.\n"
+        "- Tensor byte layout is the contiguous PyTorch storage layout shown in the metadata. Compute byte offsets explicitly.\n"
+        "- Buffer sizes are padded to 4-byte raw-u32 alignment by the evaluator; only write the valid output tensor byte range.\n"
+        "- You may include <dx/linalg.h> and use Direct3D 12 Linear Algebra thread-scope vector-matrix APIs when they naturally fit the tensor operation.\n"
+        "- Do not use typed Buffer/RWBuffer declarations in this raw-buffer mode."
+        if linalg_enabled
+        else
+        "- Use typed buffers for tensor data: Buffer<float16_t>, Buffer<float>, Buffer<int>, RWBuffer<float16_t>, etc.\n"
+        "- For int8/uint8 typed descriptors, HLSL exposes elements as int/uint values even though storage is one byte."
+    )
+    return f"""IMPORTANT: Generate code in XML format with exactly 2 files:
 
 <hlsl_file name="kernel.hlsl">
 - A complete HLSL compute shader.
 - Entry point must be `main` unless launch.json says otherwise.
 - Use [numthreads(X, Y, Z)] and fixed shape constants from the task metadata.
 - Declare input SRVs as t0, t1, ... and output UAVs as u0, u1, ... exactly as specified.
-- Use typed buffers for tensor data: Buffer<float16_t>, Buffer<float>, Buffer<int>, RWBuffer<float16_t>, etc.
-- For int8/uint8 typed descriptors, HLSL exposes elements as int/uint values even though storage is one byte.
+{buffer_contract}
 - Do not use CUDA, Triton, PyTorch, root constants, CBVs, descriptor spaces, or undeclared resources.
 </hlsl_file>
 
 <json_file name="launch.json">
-{
-  "target": "cs_6_8",
-  "entry": "main",
-  "dispatch": [1, 1, 1]
-}
+{{
+    "target": "{target}",
+    "entry": "main",
+    "dispatch": [1, 1, 1]
+}}
 </json_file>
 
 Return only these XML blocks. No markdown or explanations."""
@@ -86,6 +105,65 @@ _HLSL_GENERATION_GUIDELINES = """## HLSL/DX12 Optimization Guidelines
 """
 
 
+_HLSL_LINALG_GUIDELINES = """## Direct3D 12 Linear Algebra Guidance
+- This task is running in raw-buffer mode for SM 6.10. Use ByteAddressBuffer/RWByteAddressBuffer and explicit byte offsets for all tensor accesses.
+- The available proven linalg feature is FP16 thread-scope vector-matrix multiply from <dx/linalg.h> with MatrixScope::Thread. FP32 linalg and wave-matrix linalg are not assumed available.
+- Keep linalg usage generic and correctness-first: use the API only when the tensor operation naturally maps to a small fixed vector-matrix operation, and fall back to ordinary scalar/vector HLSL for the rest.
+- Do not require root constants, CBVs, extra temporary buffers, descriptor spaces, multi-dispatch sequencing, or runtime shape metadata.
+"""
+
+
+def _ensure_hlsl_probe_on_path() -> None:
+    probe_python = Path(__file__).resolve().parents[2] / "hlsl_probe" / "python"
+    if str(probe_python) not in sys.path:
+        sys.path.insert(0, str(probe_python))
+
+
+def _normalize_linalg_mode(value: str) -> str:
+    mode = str(value or "auto").lower()
+    if mode not in {"auto", "off", "force"}:
+        raise ValueError(f"unsupported --hlsl-linalg value {value!r}; supported: auto, off, force")
+    return mode
+
+
+def _resolve_linalg_effective(*, mode: str, target: str, precision: str) -> tuple[bool, str]:
+    if mode == "off":
+        return False, "disabled by --hlsl-linalg=off"
+    if _shader_model_tuple(target) < (6, 10):
+        reason = f"target {target} is below cs_6_10"
+        if mode == "force":
+            raise RuntimeError(f"--hlsl-linalg=force requires cs_6_10 or newer; {reason}")
+        return False, reason
+    if str(precision).lower() != "fp16":
+        reason = f"precision {precision} is not fp16"
+        if mode == "force":
+            raise RuntimeError(f"--hlsl-linalg=force currently requires --hlsl-precision=fp16; {reason}")
+        return False, reason
+    try:
+        _ensure_hlsl_probe_on_path()
+        from hlsl_probe import linalg_caps_summary, supports_linalg_fp16_thread
+
+        summary = linalg_caps_summary()
+        if supports_linalg_fp16_thread(summary):
+            adapter = summary.get("adapter_name") or "unknown adapter"
+            tier = summary.get("linear_algebra_tier_name") or "unknown tier"
+            return True, f"FP16 thread vector-matrix linalg supported on {adapter} ({tier})"
+        reason = json.dumps(
+            {
+                "supports_sm_6_10": summary.get("supports_sm_6_10"),
+                "linear_algebra_query_ok": summary.get("linear_algebra_query_ok"),
+                "linear_algebra_tier_name": summary.get("linear_algebra_tier_name"),
+                "fp16_thread_vector_matrix_supported": summary.get("fp16_thread_vector_matrix_supported"),
+            },
+            sort_keys=True,
+        )
+    except Exception as exc:
+        reason = f"capability probe failed: {type(exc).__name__}: {exc}"
+    if mode == "force":
+        raise RuntimeError(f"--hlsl-linalg=force requested, but FP16 thread linalg is unavailable: {reason}")
+    return False, reason
+
+
 class HlslKernelTask:
     """Task for optimizing a PyTorch reference with a generated HLSL compute shader."""
 
@@ -95,6 +173,7 @@ class HlslKernelTask:
         ref_path: str,
         gpu: str = "Direct3D 12 GPU",
         hlsl_target: str = "cs_6_8",
+        hlsl_linalg: str = "auto",
         precision: str = "fp16",
         reference_device: str = "auto",
         num_correct_trials: int = 5,
@@ -112,9 +191,17 @@ class HlslKernelTask:
         if not Path(self._ref_path).exists():
             raise FileNotFoundError(f"Reference file not found: {self._ref_path}")
 
+        linalg_mode = _normalize_linalg_mode(hlsl_linalg)
+        self._linalg_enabled, self._linalg_reason = _resolve_linalg_effective(
+            mode=linalg_mode,
+            target=str(hlsl_target),
+            precision=str(precision),
+        )
+
         self._cfg = HlslKernelTaskConfig(
             gpu=str(gpu),
             hlsl_target=str(hlsl_target),
+            hlsl_linalg=linalg_mode,
             precision=str(precision),
             reference_device=str(reference_device),
             num_correct_trials=int(num_correct_trials),
@@ -136,7 +223,10 @@ class HlslKernelTask:
         self._metadata_text_cache: str | None = None
 
         self._ref_code = Path(self._ref_path).read_text(encoding="utf-8")
-        print(f"[{self._name}] Loaded reference: {self._ref_path}  (HLSL target={self._cfg.hlsl_target})")
+        print(
+            f"[{self._name}] Loaded reference: {self._ref_path}  "
+            f"(HLSL target={self._cfg.hlsl_target}, linalg={'on' if self._linalg_enabled else 'off'}: {self._linalg_reason})"
+        )
 
     @property
     def name(self) -> str:
@@ -149,6 +239,7 @@ class HlslKernelTask:
 **Reference Module**: {Path(self._ref_path).name}
 **Target GPU**: {self._cfg.gpu}
 **HLSL Target**: {self._cfg.hlsl_target}
+**HLSL Linear Algebra**: {'enabled' if self._linalg_enabled else 'disabled'} ({self._linalg_reason})
 **Precision**: {self._cfg.precision}
 
 ## Objective
@@ -169,11 +260,12 @@ Your implementation must produce numerically equivalent outputs (rtol={self._cfg
 - Model state_dict tensors are bound as additional SRVs immediately after the forward inputs, in the order shown above.
 - Output tensors are bound as UAVs starting at register u0 in the order shown above.
 - All tensors are contiguous, flattened, row-major buffers.
+- Buffer view mode: {'raw ByteAddressBuffer/RWByteAddressBuffer with 4-byte padding' if self._linalg_enabled else 'typed Buffer/RWBuffer descriptors'}.
 - The evaluator dispatches exactly the integer group counts from launch.json.
 - The current hlsl_probe runner does not provide root constants, CBVs, temporary buffers, or multi-dispatch graphs.
 
 ## Format
-{_HLSL_CODE_FORMAT}
+{self._code_format_text()}
 """
 
     def get_generation_prompt(self, *, language: str, target_gpu: str) -> str:
@@ -181,7 +273,7 @@ Your implementation must produce numerically equivalent outputs (rtol={self._cfg
 
 {self.get_definition_text(language)}
 
-{_HLSL_GENERATION_GUIDELINES}
+{self._guidelines_text()}
 
 Generate the implementation:"""
 
@@ -208,12 +300,12 @@ Generate the implementation:"""
             prompt += "\n\n## Evaluation Feedback\n" + str(trace_logs).strip()
         if current_best:
             prompt += "\n\n## Current Best Performance\n" + str(current_best).strip()
-        prompt += "\n\n" + _HLSL_GENERATION_GUIDELINES
+        prompt += "\n\n" + self._guidelines_text()
         prompt += "\n\nReturn the full corrected XML blocks only."
         return prompt
 
     def get_code_format_text(self, *, language: str, target_gpu: str) -> str:
-        return _HLSL_CODE_FORMAT
+        return self._code_format_text()
 
     def make_solution_from_generated_code(
         self,
@@ -303,6 +395,7 @@ Generate the implementation:"""
                 "--hlsl-path", str(hlsl_path),
                 "--launch-path", str(launch_path),
                 "--hlsl-target", self._cfg.hlsl_target,
+                "--hlsl-buffer-view", self._buffer_view,
                 "--precision", self._cfg.precision,
                 "--reference-device", self._cfg.reference_device,
                 "--num-correct-trials", str(self._cfg.num_correct_trials),
@@ -371,6 +464,9 @@ Generate the implementation:"""
             "ref_path": self._ref_path,
             "gpu": self._cfg.gpu,
             "hlsl_target": self._cfg.hlsl_target,
+            "hlsl_linalg": self._cfg.hlsl_linalg,
+            "hlsl_linalg_enabled": self._linalg_enabled,
+            "hlsl_buffer_view": self._buffer_view,
             "precision": self._cfg.precision,
             "num_correct_trials": self._cfg.num_correct_trials,
             "num_perf_trials": self._cfg.num_perf_trials,
@@ -437,9 +533,22 @@ Generate the implementation:"""
                 "hlsl_host_wall_ms": host_ms,
                 "target": data.get("target"),
                 "dispatch": data.get("dispatch"),
+                "buffer_view": data.get("buffer_view"),
                 "reference_device": data.get("reference_device"),
             },
         )
+
+    @property
+    def _buffer_view(self) -> str:
+        return "raw" if self._linalg_enabled else "typed"
+
+    def _code_format_text(self) -> str:
+        return _hlsl_code_format(self._cfg.hlsl_target, linalg_enabled=self._linalg_enabled)
+
+    def _guidelines_text(self) -> str:
+        if self._linalg_enabled:
+            return _HLSL_GENERATION_GUIDELINES + "\n" + _HLSL_LINALG_GUIDELINES
+        return _HLSL_GENERATION_GUIDELINES
 
     def _failed_eval(self, message: str, round_num: int | None) -> EvalResult:
         self._last_round_trace_logs = message

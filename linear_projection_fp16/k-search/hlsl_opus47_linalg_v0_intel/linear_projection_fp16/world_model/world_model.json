@@ -1,0 +1,213 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "init"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "root",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.5,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc B580 (Xe2/Battlemage), SIMD16/32 lanes, XMX matrix engines available. HLSL cs_6_10 with Direct3D Linear Algebra FP16 thread vector-matrix supported.",
+            "notes": "Y = X @ W^T + b. M=32768, K=256, N=256, fp16. ~1.07 GFLOPs per batch row pair; total ~4.3 GFLOPS. Compute-light per row; bandwidth-bound on input X reads and output Y writes; weight matrix is 128 KiB (reusable).",
+            "rating_0_to_10": 7.0,
+            "risk": "If linalg intrinsic path doesn't map to XMX, FLOPs may bottleneck on FMA throughput."
+          },
+          "memory_bandwidth": {
+            "notes": "Reads: X=16 MiB, W=128 KiB (broadcast/reused), b=512 B. Writes: Y=16 MiB. Weight reuse factor = BATCH=32768. Bandwidth dominated by X read + Y write (~32 MiB total).",
+            "rating_0_to_10": 8.0,
+            "risk": "Without weight reuse via cache/shared, repeated W reloads would dominate."
+          },
+          "register_pressure": {
+            "notes": "Per-thread accumulator: 256 fp16 outputs would be heavy. Need to tile per-thread output (e.g., one row -> 8/16 outputs per thread, or one wave produces one row's 256 outputs via 32 lanes * 8 outs).",
+            "rating_0_to_10": 5.0,
+            "risk": "Holding entire 256-element accumulator in registers per thread is too large; tile or distribute across lanes."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: dense GEMM (M=32768, K=N=256), fp16, bias-add fused. Single output per (m,n): sum_k X[m,k]*W[n,k] + b[n]. Dense, no reductions across batch. 2) Canonical: Y[m,n] = b[n] + sum_{k=0..255} X[m,k]*W[n,k]. K-reduction; m,n independent. 3) Layout: X row-major (M,K), W row-major (N,K) i.e. weight[out,in], b (N). All fp16 raw ByteAddressBuffer. Dominant traffic: X reads (16MB), Y writes (16MB). W (128KB) is fully reused BATCH times -> stage in groupshared or rely on L2. b (512B) tiny, can be cached/broadcast. 4) Regimes: (a) bandwidth-bound -> need W reuse and coalesced X/Y access; (b) compute-bound if linalg/XMX engages and BW is saturated; (c) latency-bound if too few groups. 5) Knobs: tile size (rows per group), how many output cols per thread, W staging (groupshared vs SRV reads via L2), wave-cooperative reduction vs per-thread K-loop, use of dx/linalg.h Mul/MulAdd FP16 thread vector-matrix. 6) Skeleton: each threadgroup handles a tile of R rows; cooperatively load W (or a column-tile of W) into groupshared once; each thread/wave computes one row's outputs by reading X[m,:] into registers and doing K-loop accumulations across all 256 N outputs (distributed); write Y[m,:] with bias added. Use [WaveSize(32)]; one wave per row -> each lane handles N/32=8 output columns; X row loaded cooperatively into shared or each lane loads its needed K elements. 7) Families: F1 wave-per-row with W in groupshared (one wave owns one output row, 32 lanes * 8 cols = 256). F2 linalg-thread-vector-matrix using <dx/linalg.h> FP16 Mul (each thread does vec-mat partial). F3 group-per-row-block with X tile staged. Top choice: F1 + linalg intrinsic for the K dot products.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement wave-per-row mapping: one SIMD32 wave produces one output row (256 cols). Each lane owns 8 output columns. Load W (256x256 fp16 = 128KiB) ... but 128KiB exceeds 32KiB groupshared budget. Instead: stream W from SRV (relying on L2 reuse across many waves), keep X row in registers (256 fp16 = 128 regs per wave distributed = 8 per lane), accumulate 8 fp16 outputs per lane via K-loop. Add bias and store.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "Maps one independent work unit (row) to one wave; minimal sync; relies on L2 for W reuse (W=128KiB fits easily in L2). Each lane: 8 accumulators, K=256 inner loop. Very register-friendly.",
+          "score_0_to_1": 0.7,
+          "title": "F1: Wave-per-row, W streamed from L2, X-row in lane registers"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.6,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "B580 SIMD32 waves available; WaveReadLaneAt for cross-lane X broadcast.",
+            "notes": "Each lane: 8 acc * 256 K = 2048 FMAs. Wave: 65536 FMAs per row. K-loop can broadcast X[k] across lanes via WaveReadLaneAt(x_chunk, k%32).",
+            "rating_0_to_10": 8.0,
+            "risk": "Wave broadcast overhead per K step; if linalg intrinsic not used, pure scalar FMA throughput must suffice."
+          },
+          "memory_bandwidth": {
+            "notes": "W read: 128KiB * (BATCH/waves_per_W_reload). With L2 reuse and 32768 rows, W loaded effectively once per L2 residency window.",
+            "rating_0_to_10": 8.0,
+            "risk": "If L2 thrashes due to X+Y traffic, W reload cost grows."
+          },
+          "register_pressure": {
+            "notes": "Per lane: 8 fp16 X values + 8 fp16 accumulators + a few temps. Very light.",
+            "rating_0_to_10": 9.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n1",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative to F2 (linalg intrinsic) - this uses plain scalar/vector FMA loop. Cannot trivially combine because intrinsic path uses different per-thread matrix shape and ownership.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Use <dx/linalg.h> FP16 thread-scope vector-matrix multiply. Each thread loads an X row (or chunk) as a fp16 vector and multiplies against a K x Ncol weight tile using linalg::Mul/MulAdd. One thread produces a small output chunk (e.g., 8 or 16 outputs) for one row. Tiles of W loaded cooperatively into groupshared (e.g., a 256x16 fp16 slab = 8KiB) and reused across rows in the group.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 3.0,
+          "rationale": "Leverages XMX/dedicated matrix path explicitly enabled in the spec for this driver. Highest potential throughput.",
+          "score_0_to_1": 0.75,
+          "title": "F2: dx/linalg.h FP16 thread vector-matrix multiply"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.5,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Spec confirms FP16 thread vector-matrix linalg supported on this Intel driver.",
+            "notes": "Best HW fit if intrinsic compiles to matrix engine path. Requires careful layout decoration (RowMajor/ColumnMajor) and Pack matrix shape.",
+            "rating_0_to_10": 9.0,
+            "risk": "Intrinsic shape constraints (K-dim, M-dim multiples) may force padding/restructuring."
+          },
+          "memory_bandwidth": {
+            "notes": "Same external traffic as F1; potentially better cache efficiency due to bigger contiguous loads.",
+            "rating_0_to_10": 8.0,
+            "risk": "Groupshared tile of W only worthwhile if reused across many threads."
+          },
+          "register_pressure": {
+            "notes": "Matrix tiles may consume more registers per thread; need to bound output tile width per thread.",
+            "rating_0_to_10": 6.0,
+            "risk": "Over-tiling per thread spills."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n2",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative to F1; uses linalg intrinsic instead of scalar loop. Mutually exclusive code paths.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Threadgroup-per-row-block: group covers R rows (e.g., R=8). Cooperatively stage X tile (R x K = 8*256*2 = 4KiB) and a W column slab (e.g., K x Ncol_tile = 256*32*2 = 16KiB) in groupshared. Each thread computes outputs for one (row, col_tile) chunk. Iterate over N in col tiles.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 2.0,
+          "rationale": "Maximizes shared-memory reuse of both X and W within a group; good when bandwidth-bound.",
+          "score_0_to_1": 0.55,
+          "title": "F3: Threadgroup tiled GEMM with X+W groupshared staging"
+        },
+        "choice": "",
+        "confidence_0_to_1": 0.4,
+        "decision": "",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Groupshared budget 32KiB; X tile + W tile must fit. R=8 rows, Ncol=32 -> ~20KiB.",
+            "notes": "Group-wide barriers needed after tile loads; risks more synchronization than wave-owned variant.",
+            "rating_0_to_10": 6.0,
+            "risk": "Barriers cost; multi-wave-per-row coordination."
+          },
+          "memory_bandwidth": {
+            "notes": "Each X row read once per group; W column tile read R times reused across rows.",
+            "rating_0_to_10": 7.0,
+            "risk": "Iterating col tiles re-reads X across N iterations unless kept in shared."
+          },
+          "register_pressure": {
+            "notes": "Modest; per-thread accumulators sized by tile.",
+            "rating_0_to_10": 7.0,
+            "risk": "Low."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "n3",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: alternative to F1/F2 - uses group-wide tiling and explicit shared staging instead of wave-per-row register-only or linalg intrinsic. Combining would defeat the design intent.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "FP16 dense linear projection Y[M,N] = X[M,K] @ W[N,K]^T + b[N] with M=32768, K=N=256. Compute is modest (~4.3 GFLOPs total) and the kernel is bandwidth-leaning: X and Y are 16 MiB each while W is only 128 KiB and is reused BATCH times (ideal L2 / groupshared candidate). Bias is 512 B. Constraints: cs_6_10 raw ByteAddressBuffer/RWByteAddressBuffer, FP16 thread-scope linalg available, groupshared <=32 KiB. Best fit is a wave-owned mapping (one wave per output row, 32 lanes x 8 columns = 256), keeping per-lane accumulators in registers, streaming W through L2 (or a small column-tile in groupshared if needed), and optionally invoking dx/linalg.h FP16 vector-matrix multiply for the K-dot products.",
+  "open_questions": [
+    "Does dx/linalg.h FP16 thread vector-matrix actually lower to XMX on this Intel driver, or to scalar SIMD FMAs?",
+    "What are the linalg Mul shape constraints (M/K/N multiples) and required matrix interpretation/layout flags for the (K=256,N=8or16) tile?",
+    "Is SIMD32 the default wave size on B580, and does [WaveSize(32)] compile / improve mapping vs SIMD16?",
+    "Is W fully cacheable in L2 across the whole dispatch (128 KiB), so we don't need to stage it in groupshared at all?",
+    "What groupshared bank/conflict behavior should we expect for fp16 access patterns on Xe2?",
+    "Should X[m,:] be loaded into groupshared once per row owner, or kept distributed across lane registers (8 fp16 per lane) and broadcast via WaveReadLaneAt during the K loop?",
+    "Is bias best broadcast via a single cooperative load of 256 fp16 (512 B) into groupshared, or read per-lane from SRV?",
+    "What dispatch grid (groups in X dimension) best saturates B580 Xe-cores without leaving rows idle (e.g., 32768 rows / waves_per_group)?"
+  ]
+}

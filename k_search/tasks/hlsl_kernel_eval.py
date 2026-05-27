@@ -130,11 +130,12 @@ def _tensor_dtype_name(tensor: torch.Tensor) -> str:
 
 def _tensor_from_output_bytes(data: bytes, expected: torch.Tensor) -> torch.Tensor:
     cpu_expected = expected.detach().cpu().contiguous()
-    return torch.frombuffer(bytearray(data), dtype=cpu_expected.dtype).clone().reshape(tuple(cpu_expected.shape))
+    expected_size = int(cpu_expected.numel()) * int(cpu_expected.element_size())
+    return torch.frombuffer(bytearray(data[:expected_size]), dtype=cpu_expected.dtype).clone().reshape(tuple(cpu_expected.shape))
 
 
-def _make_probe_inputs(inputs: list[Any], state_tensors: list[torch.Tensor]):
-    from hlsl_probe import BufferArg
+def _make_probe_inputs(inputs: list[Any], state_tensors: list[torch.Tensor], buffer_view: str = "typed"):
+    from hlsl_probe import BufferArg, raw_tensor_bytes
 
     probe_inputs = []
     for index, value in enumerate(inputs):
@@ -142,16 +143,38 @@ def _make_probe_inputs(inputs: list[Any], state_tensors: list[torch.Tensor]):
             raise TypeError(
                 f"HLSL evaluator currently supports tensor forward args only; input {index} is {type(value).__name__}"
             )
-        probe_inputs.append(BufferArg.from_tensor(value))
+        if buffer_view == "raw":
+            padded, _ = raw_tensor_bytes(value)
+            probe_inputs.append(BufferArg.raw_u32(padded))
+        else:
+            probe_inputs.append(BufferArg.from_tensor(value))
     for value in state_tensors:
-        probe_inputs.append(BufferArg.from_tensor(value))
+        if buffer_view == "raw":
+            padded, _ = raw_tensor_bytes(value)
+            probe_inputs.append(BufferArg.raw_u32(padded))
+        else:
+            probe_inputs.append(BufferArg.from_tensor(value))
     return probe_inputs
 
 
-def _make_output_specs(expected_outputs: list[torch.Tensor]):
+def _make_output_specs(expected_outputs: list[torch.Tensor], buffer_view: str = "typed"):
     from hlsl_probe import BufferSpec
 
+    if buffer_view == "raw":
+        return [BufferSpec.raw_u32(_raw_padded_tensor_size(tensor)) for tensor in expected_outputs]
     return [BufferSpec.from_tensor(tensor) for tensor in expected_outputs]
+
+
+def _raw_padded_tensor_size(tensor: torch.Tensor) -> int:
+    size = int(tensor.numel()) * int(tensor.element_size())
+    return size + ((-size) % 4)
+
+
+def _normalize_buffer_view(value: str) -> str:
+    normalized = str(value or "typed").lower()
+    if normalized not in {"typed", "raw"}:
+        raise ValueError(f"unsupported HLSL buffer view {value!r}; supported: typed, raw")
+    return normalized
 
 
 def _compare_outputs(
@@ -237,13 +260,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "target": None,
         "entry": None,
         "dispatch": None,
+        "buffer_view": None,
         "error": "",
     }
 
     launch = _load_launch_config(args.launch_path, args.hlsl_target)
+    buffer_view = _normalize_buffer_view(args.hlsl_buffer_view)
     result["target"] = launch["target"]
     result["entry"] = launch["entry"]
     result["dispatch"] = launch["dispatch"]
+    result["buffer_view"] = buffer_view
 
     source = Path(args.hlsl_path).read_text(encoding="utf-8")
     try:
@@ -271,8 +297,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
                 metadata, output_bytes = probe.run_dxil(
                     dxil,
-                    inputs=_make_probe_inputs(inputs, state_tensors),
-                    outputs=_make_output_specs(expected_outputs),
+                    inputs=_make_probe_inputs(inputs, state_tensors, buffer_view),
+                    outputs=_make_output_specs(expected_outputs, buffer_view),
                     dispatch=tuple(launch["dispatch"]),
                 )
                 actual_outputs = [
@@ -290,8 +316,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             perf_inputs = get_inputs_fn()
             perf_expected_outputs = _run_reference(model, perf_inputs)
             _synchronize(reference_device)
-            perf_output_specs = _make_output_specs(perf_expected_outputs)
-            perf_probe_inputs = _make_probe_inputs(perf_inputs, state_tensors)
+            perf_output_specs = _make_output_specs(perf_expected_outputs, buffer_view)
+            perf_probe_inputs = _make_probe_inputs(perf_inputs, state_tensors, buffer_view)
 
             for _ in range(max(0, int(args.num_warmup))):
                 probe.run_dxil(
@@ -348,6 +374,7 @@ def main() -> None:
     parser.add_argument("--hlsl-path", required=True)
     parser.add_argument("--launch-path", default=None)
     parser.add_argument("--hlsl-target", default="cs_6_8")
+    parser.add_argument("--hlsl-buffer-view", default="typed", choices=["typed", "raw"])
     parser.add_argument("--precision", default="fp16", choices=["fp32", "fp16"])
     parser.add_argument("--reference-device", default="auto")
     parser.add_argument("--num-correct-trials", type=int, default=5)

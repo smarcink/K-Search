@@ -356,6 +356,12 @@ def main():
     # HLSL Kernel options (Direct3D 12 probe backend)
     parser.add_argument("--hlsl-target", default="cs_6_8", help="DXC shader model target for HLSL kernels (default: cs_6_8)")
     parser.add_argument(
+        "--hlsl-linalg",
+        default="auto",
+        choices=["auto", "off", "force"],
+        help="Enable D3D12 Linear Algebra prompt/eval path when available (auto, off, force)",
+    )
+    parser.add_argument(
         "--hlsl-precision",
         default="fp16",
         choices=["fp32", "fp16"],
@@ -440,6 +446,7 @@ def main():
             ref_path=task_path,
             gpu=args.target_gpu,
             hlsl_target=args.hlsl_target,
+            hlsl_linalg=args.hlsl_linalg,
             precision=args.hlsl_precision,
             reference_device=args.hlsl_reference_device,
             num_correct_trials=args.hlsl_num_correct_trials,

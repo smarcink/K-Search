@@ -73,6 +73,8 @@ HLSL_OPTIMIZATION_HINTS = """Key HLSL/DX12 POC constraints:
 - Use fixed shape constants from the task metadata. Root constants, CBVs, temporary buffers, and multi-dispatch graphs are not wired up yet.
 - Bind forward inputs and model state as SRVs t0, t1, ... and outputs as UAVs u0, u1, ... exactly as specified.
 - Target cs_6_8/cs_6_9 style HLSL unless the task explicitly requests a newer target.
+- If the task explicitly enables SM 6.10 Direct3D Linear Algebra, use raw ByteAddressBuffer/RWByteAddressBuffer bindings and explicit byte offsets as specified by the task format instead of typed Buffer/RWBuffer descriptors.
+- In that SM 6.10 linalg mode, <dx/linalg.h> FP16 thread-scope vector-matrix multiply may be used when the tensor operation naturally fits it; do not assume FP32 linalg or wave-matrix linalg support unless the task says so.
 - For cs_6_8/cs_6_9, total groupshared memory is limited to 32 KiB per threadgroup in this D3D/DXIL path; hardware CUDA shared-memory-per-SM figures do not raise that limit.
 - Prefer register-resident scalars/vectors for per-thread or single-owner intermediate values. Full fusion should minimize materialization, not store every phase's output in groupshared memory.
 - Treat groupshared memory as an explicitly synchronized communication/cache resource. Good uses include compact read-only tiles/tables loaded cooperatively once and consumed many times, reusable input tiles, cross-thread or cross-wave exchange buffers, and reduction scratch.

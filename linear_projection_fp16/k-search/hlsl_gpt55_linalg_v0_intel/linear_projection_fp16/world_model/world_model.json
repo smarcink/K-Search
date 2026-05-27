@@ -1,0 +1,258 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "no_measurement_initial_world_model"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "root",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.5,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.72,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc B580 through DX12/HLSL cs_6_10 with SM 6.10 Direct3D Linear Algebra enabled for FP16 thread-scope vector-matrix operations; raw ByteAddressBuffer/RWByteAddressBuffer bindings only; D3D groupshared limit is 32 KiB per threadgroup.",
+            "notes": "The computation is a dense fixed-size GEMM-like projection with M=32768, K=256, N=256. Arithmetic work is about 4.29 GFMA-equivalent scalar ops if counting multiply and add separately as about 4.29 GFLOP, or 2.15G fused multiply-adds, so the best kernel should be compute/tensor-unit limited once input/weight reuse is achieved.",
+            "rating_0_to_10": 8.0,
+            "risk": "Actual availability and syntax/performance of HLSL linalg FP16 APIs on this runner are unknown; manual scalar FP32 accumulation may underuse hardware matrix capability."
+          },
+          "memory_bandwidth": {
+            "notes": "The minimum traffic is roughly input 16 MiB + weight 128 KiB with cache reuse + bias 512 B + output 16 MiB, but naive per-output reduction can reread input about 256 times and become bandwidth/cache limited. Weight is tiny enough to live in cache, yet access order and coalescing still matter.",
+            "rating_0_to_10": 7.0,
+            "risk": "Raw half packing and non-coalesced weight reads can inflate transactions; poor tiling can turn a compute-bound GEMM into a bandwidth-bound dot-product swarm."
+          },
+          "register_pressure": {
+            "notes": "Good designs keep accumulators private in registers and only use groupshared for reusable read-only tiles or reduction scratch. Register pressure rises quickly with multiple output columns per thread, FP32 accumulators, and linalg local fragments.",
+            "rating_0_to_10": 6.0,
+            "risk": "Overlarge per-thread output vectors may reduce occupancy or spill; overuse of groupshared for intermediates would add barriers without reducing global round-trips."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Problem classification: dense matrix-multiply-like linear projection, output_0[BATCH=32768, OUT=256] = input_0[32768,256] times proj.weight[256,256]^T plus bias[256]; dense contiguous accesses, no sparse/indirect indexing, one K=256 reduction per output element, all dimensions fixed at compile time.\n2) Canonical math: y[b,o] = bias[o] + sum_{k=0..255} x[b,k] * weight[o,k]. Each (b,o) is independent after its K reduction; rows and output columns can be tiled/reordered freely; stable accumulation likely prefers FP32 accumulators before FP16 store, though task precision is FP16.\n3) Data layout/access: input is row-major half matrix, weight is row-major out-major half matrix where each output row is contiguous over K, bias is contiguous half vector, output is row-major half. Dominant reusable data are x row values reused across many output columns and weight rows reused across many batch rows. Private values should be accumulators/register fragments; groupshared, if used, should be only compact read-only reusable input/weight tiles loaded by producer threads and consumed by all tile compute threads, or true reduction scratch. No whole phase tensors should be staged.\n4) Bottleneck regimes: Regime A naive output-element waves reread x for every output column, likely bandwidth/L2-latency limited despite simple reductions. Regime B rectangular GEMM tiling reuses x and weight enough to become FP16/FMA throughput or linalg throughput limited. Regime C excessive per-thread columns or FP32 accumulation can become register/occupancy limited. Regime D small threadgroups or too many barriers can be synchronization/launch-overhead limited. Regime E raw half extraction/alignment mistakes can become instruction-overhead or correctness limited.\n5) Design knobs: ownership mapping across batch rows/output columns/K; tile sizes; one wave per independent row/column unit vs multiple waves per tile; manual scalar FMA vs SM 6.10 linalg thread-scope vector-matrix; FP16 vs FP32 accumulation; bias addition timing; raw half load/store packing; groupshared tile shapes under 32 KiB; dispatch shape fixed in launch.json.\n6) High-level skeleton: single fused kernel reads input/weight/bias and writes final output only. Accumulators live in registers. Optional groupshared arrays are read-only reusable tiles: input tile produced cooperatively by group threads, consumed by all output-column workers for that batch tile; weight tile produced cooperatively by group threads, consumed by all batch-row workers for that output tile; one group barrier after each cooperative load before compute and no barrier for register-only phases. Wave intrinsics should handle wave-local reductions/exchange without groupshared handoff.\n7) Candidate families: top candidate is a rectangular GEMM tile that fully fuses projection and bias with register accumulators and selective read-only shared tiles; alternative correctness-first family is wave-owned scalar output reductions; alternative linalg family maps small vector-matrix fragments to SM 6.10 thread linalg. Full fusion is mandatory and feasible: no intermediate tensor exists, working set per parallel tile is private accumulators plus selective shared/read-only x/weight tiles or direct SRV streams, final output only.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a correctness-first single-dispatch projection where one wave owns one output element or a very small set of output elements, performs the K=256 reduction with wave operations, adds bias, and writes FP16 output through raw byte offsets.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 1.25,
+          "rationale": "This is the simplest way to validate raw half buffer addressing, bias addition, reduction numerics, and dispatch coverage before investing in more complex tiling. It uses wave-local register reductions and avoids groupshared barriers.",
+          "score_0_to_1": 0.52,
+          "title": "Correctness-first wave-owned scalar projection"
+        },
+        "choice": "wave_owned_scalar_outputs",
+        "confidence_0_to_1": 0.76,
+        "decision": "primary_work_ownership",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "WaveSize(32) fits K=256 as 8 elements per lane for one scalar dot product; wave intrinsics are appropriate for lane reduction.",
+            "notes": "Good hardware fit for a single dot-product reduction, but poor fit for full GEMM throughput because each output element becomes a separate wave-sized work unit with limited reuse across output columns.",
+            "rating_0_to_10": 5.0,
+            "risk": "Large number of tiny wave work units may waste scheduling overhead and underuse FP16 matrix/tensor capabilities."
+          },
+          "memory_bandwidth": {
+            "notes": "Weight rows are contiguous and input row loads are coalesced within each dot, but the same input row is reread for many output columns. This can amplify input traffic by up to 256x if cache reuse is poor.",
+            "rating_0_to_10": 3.0,
+            "risk": "Likely bandwidth or L2-cache limited on large batch; may be slower than the framework baseline despite low implementation risk."
+          },
+          "register_pressure": {
+            "notes": "Very low register footprint: one or a few accumulators plus raw-load temporaries. No groupshared allocation is required.",
+            "rating_0_to_10": 9.0,
+            "risk": "Low register pressure does not compensate for lost data reuse; FP32 accumulation still costs extra registers but remains manageable."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_wave_scalar",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is mutually exclusive with rectangular tile and linalg-fragment families as the initial kernel because it assigns primary ownership to individual scalar output reductions rather than a multi-output tile or linalg fragment. Groupshared classification: none; all intermediates are register-resident and wave reductions use wave intrinsics only.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single fused rectangular GEMM-style output tile over batch rows and output features, with register accumulators, cooperative read-only input and weight K-tiles in groupshared memory, bias add, and final FP16 raw-buffer stores.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.55,
+          "rationale": "This directly matches the dense projection structure and maximizes reuse of both x rows across output columns and weight rows across batch rows while avoiding any intermediate global memory. It is the best initial performance candidate if raw half packing and synchronization are handled correctly.",
+          "score_0_to_1": 0.84,
+          "title": "Fused rectangular projection tile"
+        },
+        "choice": "rectangular_batch_by_output_tile",
+        "confidence_0_to_1": 0.68,
+        "decision": "primary_work_ownership",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Fixed M=32768, N=256, K=256 is a classic small-K GEMM. Threadgroup shared memory must remain comfortably below 32 KiB; WaveSize(32) can be used inside the tile if the selected mapping assumes it.",
+            "notes": "High arithmetic intensity after tiling. Register-resident accumulators over multiple output columns and/or rows should keep the kernel close to FP16/FP32 FMA throughput or linalg throughput, depending on implementation.",
+            "rating_0_to_10": 9.0,
+            "risk": "Manual HLSL scalar tiling may not reach hardware matrix-unit throughput; excessive barriers or wrong tile shape can reduce occupancy."
+          },
+          "memory_bandwidth": {
+            "notes": "Input tile is a read-only reusable tile: produced cooperatively by all group threads, consumed by all output-column computations in the group, reused across the output-feature tile. Weight tile is a read-only reusable tile: produced cooperatively by all group threads, consumed by all batch-row computations in the group, reused across the batch-row tile. Synchronization is needed after each cooperative load before cross-thread reads.",
+            "rating_0_to_10": 8.0,
+            "risk": "If tile shapes cause bank conflicts, uncoalesced raw loads, or too little reuse, shared-memory overhead may outweigh L2 cache benefits."
+          },
+          "register_pressure": {
+            "notes": "Moderate to high register use from per-thread accumulator vectors. No shared exchange buffer is needed for partial outputs if each accumulator has a single owner.",
+            "rating_0_to_10": 6.0,
+            "risk": "Too many accumulators per thread can spill or reduce active waves; FP32 accumulation increases footprint but likely improves correctness."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_rectangular_tile",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is mutually exclusive with wave-scalar and linalg-fragment families as the first implementation because it commits to a threadgroup-owned output rectangle with explicit cooperative tile reuse. Groupshared arrays must be justified as read-only reusable tiles only: input tile producer=group loader lanes, consumers=all compute threads for several output columns, reuse roughly output_tile_width; weight tile producer=group loader lanes, consumers=all compute threads for several batch rows, reuse roughly batch_tile_height; barrier after tile load only. Accumulators and bias-adjusted outputs remain private registers until final UAV store.",
+        "overall_rating_0_to_10": 8.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a fused projection using SM 6.10 Direct3D Linear Algebra FP16 thread-scope vector-matrix operations for small local fragments, with raw ByteAddressBuffer loads into local fragments and direct final output stores.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.7,
+          "rationale": "The task explicitly enables HLSL linalg FP16 thread vector-matrix support. A linalg-fragment kernel may provide better instruction selection than scalar loops while keeping the implementation single-dispatch and fully fused.",
+          "score_0_to_1": 0.66,
+          "title": "Fused thread-linalg fragment projection"
+        },
+        "choice": "thread_linalg_fragments",
+        "confidence_0_to_1": 0.48,
+        "decision": "primary_work_ownership",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "cs_6_10 linalg is explicitly enabled, but only FP16 thread-scope vector-matrix multiply is guaranteed; do not assume FP32 linalg or wave-matrix linalg support.",
+            "notes": "Potentially strong hardware fit if local vector-matrix fragments map to efficient generated instructions. Best for fixed K/N fragments where each thread owns a compact output vector.",
+            "rating_0_to_10": 7.0,
+            "risk": "API constraints, fragment shape limitations, or FP16-only accumulation semantics may hurt correctness or fail compilation."
+          },
+          "memory_bandwidth": {
+            "notes": "Can either stream directly from SRVs/L2 or be combined later with selective read-only shared tiles, but this initial family should avoid over-staging until linalg fragment semantics are confirmed.",
+            "rating_0_to_10": 6.0,
+            "risk": "If each thread independently loads overlapping x/weight fragments, memory traffic may resemble a naive row-block kernel rather than a tiled GEMM."
+          },
+          "register_pressure": {
+            "notes": "Local linalg fragments and output vectors may consume more registers than scalar single-output reductions, but fewer explicit loop variables may reduce overhead.",
+            "rating_0_to_10": 5.0,
+            "risk": "Fragment storage may spill or reduce occupancy; exact register allocation is compiler-dependent."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_thread_linalg",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is mutually exclusive with manual wave-scalar and manual rectangular-tile first attempts because it makes SM 6.10 linalg fragment semantics the core ownership and compute model. Working set ownership: local vectors/matrices are private registers or compiler-managed linalg fragments; optional shared tiles are deferred unless profiling shows repeated SRV traffic dominates. No groupshared exchange should be used for wave-local values.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a row-major projection tile where one work unit owns one or a few batch rows and computes all or many output features by streaming the input row and cached weight/bias, using register output vectors and direct stores.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.85,
+          "rationale": "Because K and N are both only 256 and weight is only 128 KiB, a row-oriented design may rely on L2/constant-like reuse of weights and avoid groupshared complexity while still reusing each input row across many output features inside the work unit.",
+          "score_0_to_1": 0.61,
+          "title": "Fused row-oriented projection work unit"
+        },
+        "choice": "row_oriented_multi_output",
+        "confidence_0_to_1": 0.58,
+        "decision": "primary_work_ownership",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Fixed N=256 permits compile-time unrolling or chunking of output features, but a single thread cannot hold all 256 FP32 accumulators efficiently.",
+            "notes": "Better reuse of an input row than scalar-output waves, but likely less parallel and less coalesced than a rectangular threadgroup GEMM tile.",
+            "rating_0_to_10": 6.0,
+            "risk": "May become register-limited if too many output columns are owned by one thread or wave; may underutilize the GPU if work units are too coarse."
+          },
+          "memory_bandwidth": {
+            "notes": "Input row values are streamed once per output-feature chunk and reused across several accumulators. Weight is small enough for L2 reuse but access may be strided depending on output ownership.",
+            "rating_0_to_10": 6.0,
+            "risk": "If output chunks are small, input rows are still reread for each chunk; if chunks are large, register pressure rises sharply."
+          },
+          "register_pressure": {
+            "notes": "Register pressure is the central tradeoff: private accumulators for multiple output features improve input reuse but consume registers. Groupshared is not required for intermediates.",
+            "rating_0_to_10": 4.0,
+            "risk": "Spills are likely if the output vector is too wide, especially with FP32 accumulation and raw half conversion temporaries."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "family_row_oriented",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is mutually exclusive with the rectangular threadgroup tile as the first implementation because it relies primarily on per-row or per-wave ownership and cache reuse rather than a 2D cooperative output tile. Groupshared classification: initially none; input, weight, and bias stream from SRV/L2, accumulators stay in registers, and only final outputs are materialized.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This task is a fixed-shape dense FP16 linear projection, equivalent to C[32768,256] = X[32768,256] * W[256,256]^T + bias[256], using raw ByteAddressBuffer/RWByteAddressBuffer bindings under HLSL cs_6_10 with optional FP16 Direct3D linalg. The main performance challenge is achieving GEMM-like reuse in a single fused dispatch: naive scalar output reductions reread input rows heavily, while the best candidate should keep output accumulators register-resident, selectively stage only compact read-only input/weight tiles in groupshared when reuse justifies one barrier per K tile, add bias in registers, and write final FP16 output only. The likely bottleneck shifts from bandwidth/L2 latency in naive mappings to FP16/FMA or linalg throughput in well-tiled mappings, with correctness risk around half raw-buffer packing and accumulation precision.",
+  "open_questions": [
+    "Does the evaluator/reference expect PyTorch-like FP32 accumulation for FP16 linear, or is FP16 accumulation accepted within rtol=0.01 and atol=0.01?",
+    "What exact HLSL cs_6_10 raw ByteAddressBuffer half-load/store forms are accepted by the runner/compiler, especially for 2-byte elements inside 4-byte padded raw buffers?",
+    "Does [WaveSize(32)] compile and execute reliably on Intel Arc B580 in this hlsl_probe path, and what is the actual wave size if the attribute is ignored?",
+    "How performant and syntactically stable are the enabled <dx/linalg.h> FP16 thread-scope vector-matrix APIs on this driver compared with manual scalar/vector FMA loops?",
+    "What launch-grid and numthreads limits are imposed by the runner beyond the specified fixed dispatch counts, and are very large dispatch dimensions accepted exactly as launch.json provides?",
+    "Are denormals, rounding mode, and FP16 store packing close enough to PyTorch/XPU output for near-zero values under the absolute tolerance?",
+    "How well does Arc B580 cache the 128 KiB weight matrix across threadgroups in this DX12 path, and does explicit groupshared weight tiling outperform relying on L2?"
+  ]
+}

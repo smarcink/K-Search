@@ -431,6 +431,74 @@ def probe_caps() -> dict:
         return probe.caps()
 
 
+def _support_entry(entries: object, name: str) -> dict:
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("name") == name:
+                return entry
+    return {}
+
+
+def _support_flags_supported(entry: dict) -> bool:
+    flags = entry.get("support_flags") if isinstance(entry, dict) else None
+    return bool(isinstance(flags, dict) and flags.get("supported") is True)
+
+
+def linalg_caps_summary(caps: dict | None = None) -> dict:
+    caps = probe_caps() if caps is None else caps
+    thread_entries = caps.get("linear_algebra_thread_vector_matrix_multiply", []) if isinstance(caps, dict) else []
+    wave_entries = caps.get("linear_algebra_wave_matrix_multiply", []) if isinstance(caps, dict) else []
+
+    fp16_thread = _support_entry(thread_entries, "f16_vector_f16_matrix_f16_bias_f16_result")
+    fp32_thread = _support_entry(thread_entries, "f32_vector_f32_matrix_f32_bias_f32_result")
+    int8_thread = _support_entry(thread_entries, "sint8_vector_sint8_matrix_sint32_bias_sint32_result")
+    fp16_wave = _support_entry(wave_entries, "wave32_f16_f16_f32")
+    int8_wave = _support_entry(wave_entries, "wave32_sint8_sint8_sint32")
+
+    return {
+        "status": caps.get("status") if isinstance(caps, dict) else None,
+        "adapter_name": caps.get("adapter_name") if isinstance(caps, dict) else None,
+        "target": "cs_6_10",
+        "supports_sm_6_10": bool(caps.get("supports_sm_6_10")) if isinstance(caps, dict) else False,
+        "linear_algebra_query_ok": bool(caps.get("linear_algebra_query_ok")) if isinstance(caps, dict) else False,
+        "linear_algebra_tier_name": caps.get("linear_algebra_tier_name") if isinstance(caps, dict) else None,
+        "fp16_thread_vector_matrix_supported": _support_flags_supported(fp16_thread),
+        "fp32_thread_vector_matrix_supported": _support_flags_supported(fp32_thread),
+        "int8_thread_vector_matrix_supported": _support_flags_supported(int8_thread),
+        "fp16_wave_matrix_supported": _support_flags_supported(fp16_wave),
+        "int8_wave_matrix_supported": _support_flags_supported(int8_wave),
+        "fp16_thread_vector_matrix": fp16_thread,
+        "fp32_thread_vector_matrix": fp32_thread,
+        "int8_thread_vector_matrix": int8_thread,
+        "fp16_wave_matrix": fp16_wave,
+        "int8_wave_matrix": int8_wave,
+    }
+
+
+def supports_linalg_fp16_thread(caps: dict | None = None) -> bool:
+    summary = caps if isinstance(caps, dict) and "fp16_thread_vector_matrix_supported" in caps else linalg_caps_summary(caps)
+    return bool(
+        summary.get("supports_sm_6_10")
+        and summary.get("linear_algebra_query_ok")
+        and summary.get("linear_algebra_tier_name") == "1_0"
+        and summary.get("fp16_thread_vector_matrix_supported")
+    )
+
+
+def pad_raw_u32(data: bytes | bytearray | memoryview) -> tuple[bytes, int]:
+    raw = bytes(data)
+    original_size = len(raw)
+    padding = (-len(raw)) % 4
+    if padding:
+        raw += b"\x00" * padding
+    return raw, original_size
+
+
+def raw_tensor_bytes(tensor) -> tuple[bytes, int]:
+    contiguous = tensor.detach().cpu().contiguous()
+    return pad_raw_u32(contiguous.numpy().tobytes())
+
+
 def run_dxil(*args, **kwargs):
     with HlslProbe() as probe:
         return probe.run_dxil(*args, **kwargs)
