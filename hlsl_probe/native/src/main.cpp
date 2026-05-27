@@ -199,6 +199,59 @@ std::filesystem::path temp_file_path(const wchar_t* prefix, const wchar_t* exten
     return renamed;
 }
 
+std::filesystem::path executable_directory() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    while (true) {
+        DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            throw std::runtime_error("GetModuleFileNameW failed");
+        }
+        if (length < buffer.size() - 1) {
+            buffer.resize(length);
+            break;
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+    return std::filesystem::path(buffer).parent_path();
+}
+
+std::filesystem::path find_existing_repo_path(const std::filesystem::path& relative_path) {
+    std::vector<std::filesystem::path> roots;
+    roots.push_back(std::filesystem::current_path());
+
+    std::filesystem::path exe_dir = executable_directory();
+    for (std::filesystem::path cursor = exe_dir; !cursor.empty(); cursor = cursor.parent_path()) {
+        roots.push_back(cursor);
+        if (cursor == cursor.root_path()) {
+            break;
+        }
+    }
+
+    for (const auto& root : roots) {
+        std::filesystem::path candidate = root / relative_path;
+        if (std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+std::filesystem::path resolve_dxc_path() {
+    std::filesystem::path configured = HLSL_PROBE_DEFAULT_DXC_PATH;
+    if (std::filesystem::exists(configured)) {
+        return configured;
+    }
+    return find_existing_repo_path("thirdparty/dxc_preview_2026_04_22/bin/x64/dxc.exe");
+}
+
+std::filesystem::path resolve_hlsl_include_path() {
+    std::filesystem::path configured = HLSL_PROBE_DEFAULT_HLSL_INCLUDE;
+    if (std::filesystem::exists(configured)) {
+        return configured;
+    }
+    return find_existing_repo_path("thirdparty/dxc_preview_2026_04_22/inc/hlsl");
+}
+
 int run_command_capture(const std::string& command, std::string& output) {
     SECURITY_ATTRIBUTES security = {};
     security.nLength = sizeof(security);
@@ -276,13 +329,25 @@ std::vector<uint8_t> compile_hlsl(const std::string& hlsl, const std::string& ta
     const auto dxil_path = temp_file_path(L"hpr", L".dxil");
     write_text(hlsl_path, hlsl);
 
+    const auto dxc_path = resolve_dxc_path();
+    const auto include_path = resolve_hlsl_include_path();
+    if (dxc_path.empty() || include_path.empty()) {
+        std::filesystem::remove(hlsl_path);
+        std::filesystem::remove(dxil_path);
+        std::ostringstream oss;
+        oss << "DXC toolchain not found. Configured dxc path: " << HLSL_PROBE_DEFAULT_DXC_PATH
+            << "; configured HLSL include path: " << HLSL_PROBE_DEFAULT_HLSL_INCLUDE
+            << "; also searched from current directory and executable parents.";
+        throw std::runtime_error(oss.str());
+    }
+
     std::ostringstream cmd;
-    cmd << quote_arg(HLSL_PROBE_DEFAULT_DXC_PATH)
+    cmd << quote_arg(dxc_path.string())
         << " -T " << target
         << " -E main"
         << " -HV 2021"
         << " -enable-16bit-types"
-        << " -I " << quote_arg(HLSL_PROBE_DEFAULT_HLSL_INCLUDE)
+        << " -I " << quote_arg(include_path.string())
         << " -Fo " << quote_arg(dxil_path.string())
         << " " << quote_arg(hlsl_path.string());
 
