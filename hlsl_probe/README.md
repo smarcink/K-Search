@@ -19,9 +19,10 @@ The script enters the Visual Studio x64 developer environment internally, config
 .\hlsl_probe\build\bin\Debug\hlsl_probe.exe --probe --compact-json
 .\hlsl_probe\build\bin\Debug\hlsl_probe.exe --self-test
 .\hlsl_probe\build\bin\Debug\hlsl_probe.exe --linalg-test
+.\hlsl_probe\build\bin\Debug\hlsl_probe.exe --linalg-fp16-test
 ```
 
-`--probe` prints adapter, shader model, Agility SDK, WaveMMA, and modern D3D12 linear algebra capability JSON in an indented terminal-readable form. Use `--probe --compact-json` for the original single-line machine output. `--self-test` compiles a tiny SM 6.8 compute shader with the downloaded DXC, dispatches it, reads back a 32-bit value, and reports GPU timestamp timing. `--linalg-test` compiles a tiny `dx/linalg.h` matrix-vector shader for `cs_6_10` by default, then reports whether failure happened during compile, PSO creation, dispatch/readback, or output verification.
+`--probe` prints adapter, shader model, Agility SDK, WaveMMA, and modern D3D12 linear algebra capability JSON in an indented terminal-readable form. Use `--probe --compact-json` for the original single-line machine output. `--self-test` compiles a tiny SM 6.8 compute shader with the downloaded DXC, dispatches it, reads back a 32-bit value, and reports GPU timestamp timing. `--linalg-test` compiles a tiny U32 `dx/linalg.h` matrix-vector shader for `cs_6_10` by default, then reports whether failure happened during compile, PSO creation, dispatch/readback, or output verification. `--linalg-fp16-test` does the same for a tiny FP16 thread matrix-vector multiply and verifies FP16 output values.
 
 ## Run From Python
 
@@ -30,6 +31,7 @@ $env:PYTHONPATH = "$PWD\hlsl_probe\python"
 python -m hlsl_probe --probe
 python -m hlsl_probe --self-test
 python -m hlsl_probe --linalg-test
+python -m hlsl_probe --linalg-fp16-test
 ```
 
 The Python wrapper uses `ctypes` over `hlsl_probe_native.dll`. It stages buffers through CPU memory for the first POC; direct PyTorch GPU interop is intentionally deferred.
@@ -91,7 +93,7 @@ Agility SDK 720 does not expose the older blog-era `D3D12CooperativeVectorExperi
 - `linear_algebra_thread_vector_matrix_multiply`
 - `linear_algebra_wave_matrix_multiply`
 
-The thread-vector matrix multiply entries correspond to the current `dx/linalg.h` cooperative vector replacement API. A successful query with `linear_algebra_tier_name` set to `not_supported` means the runtime understands the Agility 720 query but the driver/device does not currently expose the feature.
+The thread-vector matrix multiply entries correspond to the current `dx/linalg.h` cooperative vector replacement API. A successful query with `linear_algebra_tier_name` set to `not_supported` means the runtime understands the Agility 720 query but the driver/device does not currently expose the feature. When FP16 thread-vector matrix multiply reports `supported: true`, run `--linalg-fp16-test --target cs_6_10` as the next proof that compile, PSO creation, dispatch, and readback all work for the actual FP16 path.
 
 ## Preview SDK Notes
 

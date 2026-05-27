@@ -1,4 +1,4 @@
-from .bindings import BufferArg, BufferSpec, HlslProbe, HlslProbeError, linalg_test, probe_caps, run_dxil, self_test
+from .bindings import BufferArg, BufferSpec, HlslProbe, HlslProbeError, linalg_fp16_test, linalg_test, probe_caps, run_dxil, self_test
 from .compiler import compile_hlsl_file, compile_hlsl_source
 
 __all__ = [
@@ -8,6 +8,7 @@ __all__ = [
     "BufferSpec",
     "compile_hlsl_file",
     "compile_hlsl_source",
+    "linalg_fp16_test",
     "linalg_test",
     "probe_caps",
     "run_dxil",

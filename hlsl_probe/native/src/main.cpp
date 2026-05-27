@@ -5,6 +5,7 @@
 #include <d3d12.h>
 
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -510,6 +511,85 @@ void main() {
     return passed ? 0 : 2;
 }
 
+int command_linalg_fp16_test(const std::string& target) {
+    static const char* shader = R"HLSL(
+#include <dx/linalg.h>
+
+ByteAddressBuffer MatrixData : register(t0);
+ByteAddressBuffer VectorData : register(t1);
+RWByteAddressBuffer Output : register(u0);
+
+[numthreads(1, 1, 1)]
+void main() {
+    dx::linalg::Matrix<dx::linalg::ComponentType::F16, 2, 4, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread> matrix =
+        dx::linalg::Matrix<dx::linalg::ComponentType::F16, 2, 4, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread>::Load<dx::linalg::MatrixLayout::RowMajor>(MatrixData, 0, 4 * sizeof(float16_t));
+    vector<float16_t, 4> input = VectorData.Load<vector<float16_t, 4> >(0);
+    vector<float16_t, 2> result = dx::linalg::Multiply<float16_t>(matrix, input);
+    Output.Store<vector<float16_t, 2> >(0, result);
+}
+)HLSL";
+
+    std::vector<uint8_t> dxil;
+    try {
+        dxil = compile_hlsl(shader, target);
+    } catch (const std::exception& ex) {
+        std::cout << error_json("compile", target, ex.what()) << std::endl;
+        return 1;
+    }
+
+    HlslProbeHandle handle = nullptr;
+    try {
+        handle = create_probe_or_throw();
+    } catch (const std::exception& ex) {
+        std::cout << error_json("device", target, ex.what()) << std::endl;
+        return 1;
+    }
+
+    uint16_t matrix_data[8] = {
+        0x3C00u, 0x4000u, 0x4200u, 0x4400u,
+        0x4500u, 0x4600u, 0x4700u, 0x4800u,
+    };
+    uint16_t vector_data[4] = { 0x3800u, 0xBC00u, 0x4000u, 0x3400u };
+    uint16_t output_values[2] = { 0u, 0u };
+    HlslProbeInputBuffer inputs[2] = {
+        { matrix_data, raw_u32_desc(sizeof(matrix_data)) },
+        { vector_data, raw_u32_desc(sizeof(vector_data)) },
+    };
+    HlslProbeOutputBuffer output = { output_values, raw_u32_desc(sizeof(output_values)) };
+    HlslProbeRunConfig config = {};
+    config.dispatch_x = 1;
+    config.dispatch_y = 1;
+    config.dispatch_z = 1;
+    config.inputs = inputs;
+    config.input_count = 2;
+    config.outputs = &output;
+    config.output_count = 1;
+
+    char* run_json = nullptr;
+    int ok = hlsl_probe_run_dxil(handle, dxil.data(), dxil.size(), &config, &run_json);
+    if (!ok) {
+        std::string error = hlsl_probe_get_last_error(handle);
+        hlsl_probe_destroy(handle);
+        std::cout << error_json(classify_run_error(error), target, error) << std::endl;
+        return 1;
+    }
+
+    constexpr uint16_t expected0 = 0x4580u;
+    constexpr uint16_t expected1 = 0x4A40u;
+    const bool passed = output_values[0] == expected0 && output_values[1] == expected1;
+    std::cout << "{\"status\":\"" << (passed ? "passed" : "failed")
+              << "\",\"stage\":\"" << (passed ? "dispatch" : "verify")
+              << "\",\"target\":\"" << json_escape(target)
+              << "\",\"dxil_size\":" << dxil.size()
+              << ",\"expected_values\":[5.5,12.5]"
+              << ",\"expected_half_bits\":[" << expected0 << "," << expected1 << "]"
+              << ",\"output_half_bits\":[" << output_values[0] << "," << output_values[1] << "]"
+              << ",\"run\":" << (run_json ? run_json : "null") << "}" << std::endl;
+    hlsl_probe_free_string(run_json);
+    hlsl_probe_destroy(handle);
+    return passed ? 0 : 2;
+}
+
 int command_compile_only(const std::string& shader_path, const std::string& out_path) {
     std::ifstream in(shader_path, std::ios::binary);
     if (!in) {
@@ -530,6 +610,7 @@ void usage() {
               << "  hlsl_probe --probe [--pretty-json|--compact-json]\n"
               << "  hlsl_probe --self-test\n"
               << "  hlsl_probe --linalg-test [--target cs_6_10]\n"
+              << "  hlsl_probe --linalg-fp16-test [--target cs_6_10]\n"
               << "  hlsl_probe --compile-only shader.hlsl [--out shader.dxil]\n";
 }
 
@@ -569,6 +650,16 @@ int main(int argc, char** argv) {
                 }
             }
             return command_linalg_test(target);
+        }
+        if (command == "--linalg-fp16-test") {
+            std::string target = "cs_6_10";
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--target" && i + 1 < argc) {
+                    target = argv[++i];
+                }
+            }
+            return command_linalg_fp16_test(target);
         }
         if (command == "--compile-only") {
             if (argc < 3) {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import struct
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
@@ -505,6 +506,56 @@ void main() {
             "expected_values": [17, 39],
             "output_values": values,
             "status": "passed" if values == [17, 39] else "failed",
+        }
+    )
+    return result
+
+
+def linalg_fp16_test(target: str = "cs_6_10") -> dict:
+    from .compiler import compile_hlsl_source
+
+    shader = """
+#include <dx/linalg.h>
+
+ByteAddressBuffer MatrixData : register(t0);
+ByteAddressBuffer VectorData : register(t1);
+RWByteAddressBuffer Output : register(u0);
+
+[numthreads(1, 1, 1)]
+void main() {
+    dx::linalg::Matrix<dx::linalg::ComponentType::F16, 2, 4, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread> matrix =
+        dx::linalg::Matrix<dx::linalg::ComponentType::F16, 2, 4, dx::linalg::MatrixUse::A, dx::linalg::MatrixScope::Thread>::Load<dx::linalg::MatrixLayout::RowMajor>(MatrixData, 0, 4 * sizeof(float16_t));
+    vector<float16_t, 4> input = VectorData.Load<vector<float16_t, 4> >(0);
+    vector<float16_t, 2> result = dx::linalg::Multiply<float16_t>(matrix, input);
+    Output.Store<vector<float16_t, 2> >(0, result);
+}
+"""
+    try:
+        dxil = compile_hlsl_source(shader, target=target)
+    except Exception as exc:
+        return {"status": "failed", "stage": "compile", "target": target, "error": str(exc)}
+
+    matrix = struct.pack("<8e", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+    vector = struct.pack("<4e", 0.5, -1.0, 2.0, 0.25)
+    expected = [5.5, 12.5]
+    try:
+        result, outputs = run_dxil(
+            dxil,
+            inputs=[BufferArg.raw_u32(matrix), BufferArg.raw_u32(vector)],
+            outputs=[BufferSpec.raw_u32(4)],
+        )
+    except HlslProbeError as exc:
+        error = str(exc)
+        return {"status": "failed", "stage": _classify_run_error(error), "target": target, "error": error}
+
+    values = list(struct.unpack("<2e", outputs[0]))
+    result.update(
+        {
+            "stage": "dispatch" if values == expected else "verify",
+            "target": target,
+            "expected_values": expected,
+            "output_values": values,
+            "status": "passed" if values == expected else "failed",
         }
     )
     return result
