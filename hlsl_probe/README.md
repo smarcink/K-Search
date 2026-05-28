@@ -32,9 +32,12 @@ python -m hlsl_probe --probe
 python -m hlsl_probe --self-test
 python -m hlsl_probe --linalg-test
 python -m hlsl_probe --linalg-fp16-test
+python -m hlsl_probe --linalg-fp16-shape-sweep --wave-sizes 0,16,32 --m-values 2,4,8,16 --k-values 4,8,16,32,64,128
 ```
 
 The Python wrapper uses `ctypes` over `hlsl_probe_native.dll`. It stages buffers through CPU memory for the first POC; direct PyTorch GPU interop is intentionally deferred.
+
+`--linalg-fp16-shape-sweep` empirically compiles, dispatches, verifies, and times candidate `Matrix<ComponentType::F16, M, K, MatrixUse::A, MatrixScope::Thread>` shapes. It reports per-shape compile/run/verify failures, GPU timestamp samples, `gfma_per_s_min_time`, `tfma_per_s_min_time`, `tflop_per_s_fma2_min_time`, `ns_per_matvec_min_time`, and fastest cases by raw time and throughput. Tiny sweeps are useful for shape ranking but are often launch/timestamp limited; use larger `--shape-reps` and `--shape-dispatch-groups` for roofline-style throughput checks. By default it uses `Multiply<float16_t>` with FP32 register accumulation outside LinAlg, matching the locally supported capability path. `--wave-sizes 0,16,32` compares omitted `[WaveSize]`, `[WaveSize(16)]`, and `[WaveSize(32)]`; `--shape-accumulators fp16,fp32 --shape-ops multiply,multiplyadd` can explicitly compare direct `MultiplyAdd` against the safer `Multiply` path.
 
 ## Buffer Metadata
 

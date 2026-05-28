@@ -1,0 +1,258 @@
+{
+  "computed_signals": {
+    "round_index": 0,
+    "trace": {
+      "latency_ms": null,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": null,
+      "speedup_factor": null,
+      "status": "not_evaluated_initial_world_model"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "linalg_thread_matvec_16x64",
+    "nodes": [
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "",
+          "score_0_to_1": 0.0,
+          "title": ""
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.62,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc B580, HLSL cs_6_10, SM 6.10 Direct3D Linear Algebra enabled; local guidance prefers WaveSize(32) and thread-scope FP16 Matrix<ComponentType::F16,16,64,...> matvec when dimensions permit.",
+            "notes": "Dense GEMM-like reduction with fixed dimensions B=32768, IN=2048, OUT=256; high arithmetic work and natural fixed K tiling.",
+            "rating_0_to_10": 8.0,
+            "risk": "Actual D3D linalg PSO support and codegen quality still need hlsl_probe/eval evidence."
+          },
+          "memory_bandwidth": {
+            "notes": "Input is 128 MiB, weights 1 MiB, bias 512 B, output 16 MiB. Logical computation rereads weights across many rows and rereads input across output-channel tiles unless tiling improves reuse.",
+            "rating_0_to_10": 6.0,
+            "risk": "Naive per-output or per-output-tile mappings can inflate input/weight traffic enough to bottleneck in L2/memory despite high FLOPs."
+          },
+          "register_pressure": {
+            "notes": "Likely best candidates keep FP32 accumulators in registers and stream K tiles; 16-output linalg tile requires 16 FP32 accumulators plus FP16 vectors/fragments.",
+            "rating_0_to_10": 7.0,
+            "risk": "Large accumulator tiles or excessive unrolling may reduce occupancy on the Arc B580 D3D path."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Classification: dense FP16 linear projection / GEMM-like contraction, output_0[BATCH=32768, OUT=256], reduction over IN=2048; all dimensions fixed compile-time constants; dense contiguous accesses, no sparse/indirect indexing.\n2) Canonical math: y[b,o] = bias[o] + sum_{k=0..2047} x[b,k] * weight[o,k]; each (b,o) independent except its private K reduction. Reordering over K and output-channel tiling is legal; stable approach is FP32 register accumulation with final FP16 store.\n3) Data layout: input_0 t0 raw ByteAddressBuffer half row-major [32768,2048]; state_0 t1 half row-major [256,2048]; state_1 t2 half [256]; output_0 u0 half row-major [32768,256]. Dominant reads are dense X and W; bias tiny/cache-resident; output write once. Private/register: accumulators, K-fragment values, output half pack. Shared memory is optional only for read-only reusable input slabs or reduction scratch; top linalg candidate uses no groupshared and no barriers.\n4) Bottleneck regimes: (a) linalg fragment compiles and maps to hardware: likely compute/weight-streaming limited; (b) scalar one-output-per-wave: wave reduction overhead and redundant input reads can dominate; (c) low occupancy from large register tiles: latency hiding fails; (d) shared-tiled scalar path: barrier/shared traffic can become limiter if reuse is too low.\n5) Knobs: ownership granularity over rows/output channels, K tile size 64/128/32, linalg vs scalar reduction, FP32 vs FP16 accumulation granularity, WaveSize(32), output packing strategy for raw UAV 4-byte alignment, launch geometry, optional read-only input tile reuse across output channels.\n6) Skeleton: single dispatch; each independent work unit computes one row/output-channel tile or one output element; stream K from SRVs; keep partial sums in registers; add bias; write final half. Use wave intrinsics for wave-local reductions when wave-owned; use GroupMemoryBarrierWithGroupSync only if a scalar shared input tile is actually consumed by multiple threads/waves.\n7) Candidate families: top candidate is a fully fused single-kernel per-row/output-tile Thread-linalg matvec: weights and input stream direct from SRVs, accumulators private registers, no intermediate global round-trip. Alternatives are wave-owned scalar dot products for correctness/diagnostic robustness, and scalar group tiles using a compact read-only input tile shared by multiple output-channel consumers. No multi-dispatch or temporary-buffer plan is viable under runner constraints.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single-dispatch cs_6_10 shader where each thread owns one batch row and a 16-output-channel tile, loops K in 64-wide chunks, uses a real dx::linalg::Matrix<ComponentType::F16,16,64,MatrixUse::A,MatrixScope::Thread> loaded from state_0 and Multiply<float16_t> with input_0 vector fragments, widens each delta16 element into FP32 register accumulators, adds bias, and writes FP16 output.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.55,
+          "rationale": "This is the most informative first experiment because the problem is a dense FP16 linear layer whose dimensions exactly fit the locally recommended 16x64 thread-scope linalg fragment; it directly tests the target feature while preserving FP32 accumulation across K fragments.",
+          "score_0_to_1": 0.86,
+          "title": "Prototype fully fused 16x64 SM6.10 thread-linalg output tile"
+        },
+        "choice": "Thread-scope linalg matvec per row/output-channel tile",
+        "confidence_0_to_1": 0.68,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Preferred local shape is [WaveSize(32)] Matrix F16 M=16,K=64, MatrixScope::Thread; IN=2048 gives exactly 32 K tiles and OUT=256 gives exactly 16 output tiles.",
+            "notes": "Best match to hardware-specific linalg guidance; uses real dense fragment multiply and keeps accumulation glue scalar/register-based.",
+            "rating_0_to_10": 9.0,
+            "risk": "Thread-scope linalg may internally accumulate only to FP16 per 64-wide fragment, and PSO/codegen behavior may differ from cookbook assumptions."
+          },
+          "memory_bandwidth": {
+            "notes": "Streams 64 input halves and 16x64 weight halves per K fragment per thread-owned output tile; no groupshared traffic or barriers; bias loaded once per output element.",
+            "rating_0_to_10": 7.0,
+            "risk": "Input is reread for each of 16 output-channel tiles per row, so input traffic is multiplied versus an ideal GEMM tile; weight traffic is also repeated for every row."
+          },
+          "register_pressure": {
+            "notes": "Requires 16 FP32 accumulators plus linalg fragment/vector temporaries; no shared scratch. Expected acceptable but could reduce occupancy.",
+            "rating_0_to_10": 7.0,
+            "risk": "DXC/IGC may allocate large hidden temporaries for Matrix load and vector result, lowering active waves."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "linalg_thread_matvec_16x64",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is mutually exclusive with scalar wave/group families for the first prototype because the core multiply is owned by one thread using SM6.10 MatrixScope::Thread linalg rather than distributing one dot product across lanes or staging shared tiles. Working set per work unit: private FP32 acc[16], input vector fragment, linalg weight fragment loaded direct from state_0, direct SRV streams, direct UAV store; no groupshared arrays and no group sync.",
+        "overall_rating_0_to_10": 9.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open_not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a robust scalar fallback where one WaveSize(32) wave owns one output element y[b,o], lanes stride through the K dimension, accumulate products in FP32 registers, reduce with WaveActiveSum, add bias on one lane, and write the FP16 result.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.1,
+          "rationale": "This provides a low-risk correctness and raw-buffer packing baseline without relying on SM6.10 linalg syntax or Matrix support, and it reveals whether wave reductions and scalar FP32 accumulation meet the tolerance.",
+          "score_0_to_1": 0.58,
+          "title": "Build wave-owned scalar FP32 dot-product baseline"
+        },
+        "choice": "One wave owns one output element with lane-parallel K reduction",
+        "confidence_0_to_1": 0.74,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Uses [WaveSize(32)] and standard wave reductions, which align with the target mapping constraints but do not use the SM6.10 linalg acceleration path.",
+            "notes": "Each output dot has 2048 products split across 32 lanes, giving 64 multiply-adds per lane plus one wave reduction.",
+            "rating_0_to_10": 6.0,
+            "risk": "Too many waves are launched logically for 8,388,608 outputs, and wave-reduction overhead may dominate versus linalg/GEMM-like tiling."
+          },
+          "memory_bandwidth": {
+            "notes": "Dense coalesced reads along K for both input row and weight row; however input row is reread independently for each output channel.",
+            "rating_0_to_10": 5.0,
+            "risk": "Rereading the same 2048 input values for all 256 output channels causes heavy redundant input traffic."
+          },
+          "register_pressure": {
+            "notes": "Very low register footprint: one or a few FP32 partial sums and address variables per lane.",
+            "rating_0_to_10": 9.0,
+            "risk": "Low register pressure does not compensate if instruction overhead and memory redundancy dominate."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "wave_scalar_one_output",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling cannot be combined with the linalg-thread prototype as the initial kernel because ownership is one wave per scalar output, with cross-lane reduction, not one thread per 16-output tile. Working set per independent output: private lane partial sum, direct input/weight SRV streams, wave-local reduction through intrinsics, no groupshared and no group sync.",
+        "overall_rating_0_to_10": 6.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open_not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a scalar tiled family where a threadgroup owns a small tile of batch rows and output channels, cooperatively loads a compact K-slab of input rows into groupshared read-only cache, then multiple output-channel owner threads consume that slab while streaming weights and accumulating FP32 registers before writing FP16 outputs.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.8,
+          "rationale": "This tests whether reducing redundant input-row traffic across output channels compensates for barriers and scalar math when linalg cannot exploit cross-thread input reuse directly.",
+          "score_0_to_1": 0.66,
+          "title": "Test scalar group tile with reusable input K-slab"
+        },
+        "choice": "Threadgroup computes a row/output tile with shared read-only input slab",
+        "confidence_0_to_1": 0.55,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Uses cs_6_10-compatible ordinary scalar/vector HLSL and groupshared memory under the 32 KiB D3D path limit; does not depend on MatrixScope support.",
+            "notes": "Aims to improve arithmetic intensity by reusing X tile values across several output-channel computations within a group.",
+            "rating_0_to_10": 7.0,
+            "risk": "Scalar ALU may not approach hardware FP16 throughput, especially if accumulation is FP32 and groupshared barriers reduce occupancy."
+          },
+          "memory_bandwidth": {
+            "notes": "Groupshared array classification: read-only reusable input K-slab; producers are cooperative group lanes loading input_0 for selected rows/K; consumers are output-channel owner threads/waves in the same group; expected reuse count equals number of output-channel owners per slab; one sync after slab load before consumers read.",
+            "rating_0_to_10": 8.0,
+            "risk": "If tile dimensions are too small or cache already handles reuse well, shared memory adds overhead without material traffic savings."
+          },
+          "register_pressure": {
+            "notes": "Register use depends on number of output channels per owner; can keep a small acc vector in registers while shared memory holds only the input slab.",
+            "rating_0_to_10": 6.0,
+            "risk": "Combining multiple output accumulators with shared indexing may increase live ranges and reduce occupancy."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "scalar_group_input_slab",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling is not the same first experiment as wave-owned scalar or thread-linalg because it deliberately introduces group-level cooperation and one required barrier for reusable input tiles. Working set per group: selective shared/read-only input slab below 32 KiB, private accumulators per owner, weights streamed directly, no shared exchange for wave-local values.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open_not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a minimal per-thread scalar tile where each thread computes a small contiguous output-channel vector for one batch row, loops over all K in FP32, adds bias, and writes packed FP16 outputs, avoiding wave reductions, groupshared memory, and linalg.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 1.3,
+          "rationale": "This is a simple diagnostic path for raw ByteAddressBuffer/RWByteAddressBuffer half addressing, output packing, launch geometry, and tolerance, but is likely slower than linalg or wave-cooperative designs.",
+          "score_0_to_1": 0.49,
+          "title": "Create simple per-thread scalar output-vector diagnostic"
+        },
+        "choice": "One thread owns a small output-channel vector for one row using scalar loops",
+        "confidence_0_to_1": 0.7,
+        "decision": "kernel_family",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Portable HLSL scalar path with no reliance on wave or linalg features beyond cs_6_10 raw buffers.",
+            "notes": "Easy to reason about and fully fused, but exposes little parallelism inside each dot product and may underutilize SIMD hardware.",
+            "rating_0_to_10": 4.0,
+            "risk": "Long per-thread loops can cause poor latency hiding and very high total repeated memory traffic."
+          },
+          "memory_bandwidth": {
+            "notes": "Streams input and weights directly for each thread-owned output vector; no shared cache and limited reuse.",
+            "rating_0_to_10": 4.0,
+            "risk": "Input rows are reread for many output-channel vectors and weight rows are reread for every batch row."
+          },
+          "register_pressure": {
+            "notes": "Small output vector keeps register pressure moderate; no hidden linalg matrices and no shared-memory indexing temporaries.",
+            "rating_0_to_10": 8.0,
+            "risk": "Increasing vector width to improve reuse can quickly raise accumulator register pressure."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "scalar_thread_output_vector",
+        "node_type": "decision",
+        "notes": "SELF_CHECK: This sibling cannot be combined with the first linalg or wave-reduction prototypes because it assigns the full K loop to one thread and uses no cross-lane communication. Working set: private FP32 accumulator vector, direct SRV streams, direct UAV store, no groupshared and no sync.",
+        "overall_rating_0_to_10": 5.0,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "open_not_evaluated"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This task is a fixed-size dense FP16 linear projection, equivalent to GEMM C[32768,256] = X[32768,2048] * W[256,2048]^T + bias, with one K=2048 reduction per output and a single raw-buffer cs_6_10 dispatch. The most promising initial path is a fully fused thread-owned output-channel tile using SM6.10 MatrixScope::Thread FP16 linalg in the locally recommended 16x64 shape, with FP32 register accumulation across K tiles and direct FP16 output stores; scalar wave or group-tiled paths are fallback/diagnostic alternatives. Main performance risks are repeated X/W streaming from limited cross-row/channel reuse, linalg PSO/codegen uncertainty, FP16-fragment numerical error, raw half packing, and register/occupancy balance.",
+  "open_questions": [
+    "Does the target driver accept the exact cs_6_10 dx::linalg MatrixScope::Thread 16x64 RowMajor Load plus Multiply<float16_t> pattern with raw ByteAddressBuffer resources in this runner?",
+    "Is FP16 linalg fragment accumulation followed by FP32 accumulation across 64-wide K tiles accurate enough for rtol=0.01 and atol=0.01 versus the PyTorch half Linear reference?",
+    "What raw RWByteAddressBuffer half-store form is accepted and fastest for 4-byte padded FP16 output, especially when writing adjacent half values?",
+    "What threadgroup size and dispatch mapping gives best occupancy for one-thread-per-row/output-tile linalg without exceeding register limits?",
+    "Does Arc B580 cache reuse of the 1 MiB weight matrix across batch rows make direct streaming sufficient, or is a scalar shared/input-tiled family needed to reduce traffic?",
+    "How large are hidden register allocations and spills for dx::linalg Matrix objects and vector<float16_t,64> loads after DXC/IGC compilation?",
+    "Is direct MultiplyAdd<float> accepted and faster on this stack, or should it remain diagnostic-only as specified by the current cookbook guidance?"
+  ]
+}

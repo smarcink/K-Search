@@ -5,7 +5,7 @@ from torch import nn
 
 
 BATCH = 32768
-IN_FEATURES = 256
+IN_FEATURES = 2048
 OUT_FEATURES = 256
 
 

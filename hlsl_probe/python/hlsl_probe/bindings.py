@@ -6,6 +6,7 @@ import os
 import struct
 from dataclasses import dataclass
 from math import prod
+from statistics import median
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -627,3 +628,255 @@ void main() {
         }
     )
     return result
+
+
+def _fp16_bytes(values: Sequence[float]) -> bytes:
+    return struct.pack("<" + "e" * len(values), *[float(value) for value in values])
+
+
+def _hlsl_vector_component(name: str, index: int, vector_length: int) -> str:
+    components = "xyzw"
+    if int(vector_length) <= len(components) and 0 <= int(index) < int(vector_length):
+        return f"{name}.{components[int(index)]}"
+    return f"{name}[{int(index)}]"
+
+
+def _render_linalg_fp16_shape_shader(
+    *, m: int, k: int, wave_size: int, reps: int, accumulator: str, operation: str
+) -> str:
+    if accumulator == "fp16":
+        acc_type = "float16_t"
+        cast_type = "float16_t"
+    elif accumulator == "fp32":
+        acc_type = "float"
+        cast_type = "float"
+    else:
+        raise ValueError(f"unsupported accumulator: {accumulator}")
+    if operation == "multiply":
+        multiply_lines = ["        vector<float16_t, {m}> delta = Multiply<float16_t>(matrix, input);".format(m=int(m))]
+        multiply_lines.extend(
+            f"        {_hlsl_vector_component('acc', index, m)} += ({cast_type}){_hlsl_vector_component('delta', index, m)};"
+            for index in range(m)
+        )
+        core_lines = "\n".join(multiply_lines)
+    elif operation == "multiplyadd":
+        core_lines = f"        acc = MultiplyAdd<{acc_type}>(matrix, input, acc);"
+    else:
+        raise ValueError(f"unsupported operation: {operation}")
+    numthreads_x = int(wave_size) if int(wave_size) > 0 else 1
+    wave_attribute = f"[WaveSize({int(wave_size)})]\n" if int(wave_size) > 0 else ""
+    init_lines = "\n".join(f"    {_hlsl_vector_component('acc', index, m)} = 0.0f;" for index in range(m))
+    store_lines = "\n".join(
+        f"    Output.Store(base + {index * 4}u, asuint((float){_hlsl_vector_component('acc', index, m)}));"
+        for index in range(m)
+    )
+    return f"""
+#include <dx/linalg.h>
+
+using namespace dx::linalg;
+
+ByteAddressBuffer MatrixData : register(t0);
+ByteAddressBuffer VectorData : register(t1);
+RWByteAddressBuffer Output : register(u0);
+
+static const uint REPS = {int(reps)}u;
+
+using MatrixTy = Matrix<ComponentType::F16, {int(m)}, {int(k)}, MatrixUse::A, MatrixScope::Thread>;
+
+{wave_attribute}
+[numthreads({numthreads_x}, 1, 1)]
+void main(uint3 dispatchThreadId : SV_DispatchThreadID)
+{{
+    vector<float16_t, {int(k)}> input = VectorData.Load<vector<float16_t, {int(k)}> >(0);
+    vector<{acc_type}, {int(m)}> acc;
+{init_lines}
+
+    [loop]
+    for (uint rep = 0; rep < REPS; ++rep)
+    {{
+        MatrixTy matrix = MatrixTy::Load<MatrixLayout::RowMajor>(MatrixData, 0, {int(k)}u * sizeof(float16_t));
+{core_lines}
+    }}
+
+    uint base = dispatchThreadId.x * {int(m * 4)}u;
+{store_lines}
+}}
+"""
+
+
+def linalg_fp16_shape_sweep(
+    *,
+    target: str = "cs_6_10",
+    m_values: Sequence[int] = (2, 4, 8, 16),
+    k_values: Sequence[int] = (4, 8, 16, 32, 64, 128),
+    wave_sizes: Sequence[int] = (0,),
+    accumulators: Sequence[str] = ("fp32",),
+    operations: Sequence[str] = ("multiply",),
+    reps: int = 64,
+    dispatch_groups: int = 64,
+    warmup: int = 1,
+    iterations: int = 3,
+) -> dict:
+    """Compile and benchmark candidate FP16 thread-scope LinAlg matvec shapes.
+
+    This is an empirical shape probe, not a replacement for D3D12 granular caps.
+    It answers which candidate MatrixScope::Thread MxK shapes compile, dispatch,
+    verify, and run fastest on the current DXC/driver stack.
+    """
+    from .compiler import compile_hlsl_source
+
+    m_values = tuple(int(value) for value in m_values)
+    k_values = tuple(int(value) for value in k_values)
+    wave_sizes = tuple(int(value) for value in wave_sizes)
+    accumulators = tuple(str(value).strip().lower() for value in accumulators)
+    operations = tuple(str(value).strip().lower() for value in operations)
+    reps = int(reps)
+    dispatch_groups = int(dispatch_groups)
+    warmup = int(warmup)
+    iterations = int(iterations)
+    if any(value <= 0 for value in (*m_values, *k_values)) or any(value < 0 for value in wave_sizes):
+        raise ValueError("m_values and k_values must be positive; wave_sizes must be nonnegative")
+    unsupported_accumulators = sorted(set(accumulators) - {"fp16", "fp32"})
+    if unsupported_accumulators:
+        raise ValueError(f"unsupported accumulators: {', '.join(unsupported_accumulators)}")
+    unsupported_operations = sorted(set(operations) - {"multiply", "multiplyadd"})
+    if unsupported_operations:
+        raise ValueError(f"unsupported operations: {', '.join(unsupported_operations)}")
+    if reps <= 0 or dispatch_groups <= 0 or iterations <= 0 or warmup < 0:
+        raise ValueError("reps, dispatch_groups, iterations must be positive and warmup must be nonnegative")
+
+    cases: list[dict] = []
+    for operation in operations:
+        for accumulator in accumulators:
+            for wave_size in wave_sizes:
+                for m in m_values:
+                    for k in k_values:
+                        numthreads_x = wave_size if wave_size > 0 else 1
+                        case: dict[str, object] = {
+                            "operation": operation,
+                            "accumulator": accumulator,
+                            "m": m,
+                            "k": k,
+                            "wave_size": wave_size,
+                            "reps": reps,
+                            "dispatch_groups": dispatch_groups,
+                            "threads": dispatch_groups * numthreads_x,
+                            "matvec_calls": dispatch_groups * numthreads_x * reps,
+                            "fma_count": dispatch_groups * numthreads_x * reps * m * k,
+                            "flop_count_fma2": 2 * dispatch_groups * numthreads_x * reps * m * k,
+                        }
+                        shader = _render_linalg_fp16_shape_shader(
+                            m=m,
+                            k=k,
+                            wave_size=wave_size,
+                            reps=reps,
+                            accumulator=accumulator,
+                            operation=operation,
+                        )
+                        try:
+                            dxil = compile_hlsl_source(shader, target=target)
+                        except Exception as exc:
+                            case.update({"status": "failed", "stage": "compile", "error": str(exc)[:2000]})
+                            cases.append(case)
+                            continue
+
+                        matrix = _fp16_bytes([1.0] * (m * k))
+                        vector = _fp16_bytes([1.0] * k)
+                        output_size = dispatch_groups * numthreads_x * m * 4
+                        inputs = [BufferArg.raw_u32(matrix), BufferArg.raw_u32(vector)]
+                        outputs = [BufferSpec.raw_u32(output_size)]
+                        dispatch = (dispatch_groups, 1, 1)
+
+                        timings: list[float] = []
+                        output_bytes = b""
+                        try:
+                            with HlslProbe() as probe:
+                                for _ in range(warmup):
+                                    probe.run_dxil(dxil, inputs=inputs, outputs=outputs, dispatch=dispatch)
+                                for _ in range(iterations):
+                                    run_result, run_outputs = probe.run_dxil(
+                                        dxil, inputs=inputs, outputs=outputs, dispatch=dispatch
+                                    )
+                                    gpu_ms = run_result.get("gpu_time_ms") if isinstance(run_result, dict) else None
+                                    if isinstance(gpu_ms, (int, float)):
+                                        timings.append(float(gpu_ms))
+                                    output_bytes = run_outputs[0] if run_outputs else b""
+                        except HlslProbeError as exc:
+                            case.update(
+                                {"status": "failed", "stage": _classify_run_error(str(exc)), "error": str(exc)[:2000]}
+                            )
+                            cases.append(case)
+                            continue
+
+                        expected = float(reps * k)
+                        values = (
+                            list(struct.unpack("<" + "f" * m, output_bytes[: 4 * m]))
+                            if len(output_bytes) >= 4 * m
+                            else []
+                        )
+                        max_abs_error = max((abs(value - expected) for value in values), default=float("inf"))
+                        if len(values) != m or max_abs_error > max(1e-3, abs(expected) * 1e-4):
+                            case.update(
+                                {
+                                    "status": "failed",
+                                    "stage": "verify",
+                                    "expected_first_thread_values": [expected] * m,
+                                    "output_first_thread_values": values,
+                                    "max_abs_error": max_abs_error,
+                                }
+                            )
+                            cases.append(case)
+                            continue
+
+                        if not timings:
+                            case.update(
+                                {"status": "failed", "stage": "timing", "error": "run result did not include gpu_time_ms"}
+                            )
+                            cases.append(case)
+                            continue
+
+                        min_ms = min(timings)
+                        median_ms = float(median(timings))
+                        fma_count = float(case["fma_count"])
+                        matvec_calls = float(case["matvec_calls"])
+                        gfma_per_s = fma_count / (min_ms * 1_000_000.0) if min_ms > 0 else None
+                        case.update(
+                            {
+                                "status": "passed",
+                                "stage": "dispatch",
+                                "dxil_size": len(dxil),
+                                "gpu_time_ms_min": min_ms,
+                                "gpu_time_ms_median": median_ms,
+                                "gpu_time_ms_samples": timings,
+                                "gfma_per_s_min_time": gfma_per_s,
+                                "tfma_per_s_min_time": (gfma_per_s / 1000.0) if gfma_per_s is not None else None,
+                                "tflop_per_s_fma2_min_time": (2.0 * gfma_per_s / 1000.0)
+                                if gfma_per_s is not None
+                                else None,
+                                "ns_per_matvec_min_time": (min_ms * 1_000_000.0) / matvec_calls if matvec_calls > 0 else None,
+                                "expected_first_thread_values": [expected] * m,
+                                "output_first_thread_values": values,
+                                "max_abs_error": max_abs_error,
+                            }
+                        )
+                        cases.append(case)
+
+    passed = [case for case in cases if case.get("status") == "passed"]
+    fastest_by_time = min(passed, key=lambda case: float(case.get("gpu_time_ms_min", float("inf"))), default=None)
+    fastest_by_throughput = max(passed, key=lambda case: float(case.get("gfma_per_s_min_time") or 0.0), default=None)
+    return {
+        "status": "passed" if passed else "failed",
+        "target": target,
+        "m_values": list(m_values),
+        "k_values": list(k_values),
+        "wave_sizes": list(wave_sizes),
+        "accumulators": list(accumulators),
+        "operations": list(operations),
+        "reps": reps,
+        "dispatch_groups": dispatch_groups,
+        "case_count": len(cases),
+        "passed_count": len(passed),
+        "fastest_by_time": fastest_by_time,
+        "fastest_by_throughput": fastest_by_throughput,
+        "cases": cases,
+    }

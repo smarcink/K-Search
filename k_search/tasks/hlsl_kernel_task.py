@@ -8,6 +8,7 @@ minimal ``hlsl_probe`` runner from Python.
 from __future__ import annotations
 
 import json
+import html
 import os
 import re
 import subprocess
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
+from k_search.hlsl_linalg_cookbook import HLSL_LINALG_COOKBOOK
 from k_search.tasks.task_base import (
     BuildSpec,
     EvalResult,
@@ -57,7 +59,9 @@ def _hlsl_code_format(target: str, *, linalg_enabled: bool) -> str:
         "- Use raw buffers for tensor data: ByteAddressBuffer for SRVs and RWByteAddressBuffer for UAVs.\n"
         "- Tensor byte layout is the contiguous PyTorch storage layout shown in the metadata. Compute byte offsets explicitly.\n"
         "- Buffer sizes are padded to 4-byte raw-u32 alignment by the evaluator; only write the valid output tensor byte range.\n"
-        "- You may include <dx/linalg.h> and use Direct3D 12 Linear Algebra thread-scope vector-matrix APIs when they naturally fit the tensor operation.\n"
+        "- Prefer a clean <dx/linalg.h> thread-scope vector-matrix fragment for dense FP16 inner K-tile multiplies when it naturally fits.\n"
+        "- Keep ordinary scalar/vector HLSL for raw-buffer addressing, packing/unpacking, accumulation glue, and fragments that do not map cleanly.\n"
+        "- Avoid artificial, unused, or no-op linalg calls.\n"
         "- Do not use typed Buffer/RWBuffer declarations in this raw-buffer mode."
         if linalg_enabled
         else
@@ -73,6 +77,7 @@ def _hlsl_code_format(target: str, *, linalg_enabled: bool) -> str:
 - Declare input SRVs as t0, t1, ... and output UAVs as u0, u1, ... exactly as specified.
 {buffer_contract}
 - Do not use CUDA, Triton, PyTorch, root constants, CBVs, descriptor spaces, or undeclared resources.
+- Put raw HLSL text directly inside this tag. Do not wrap it in CDATA and do not HTML/XML-escape HLSL tokens such as #include <dx/linalg.h>.
 </hlsl_file>
 
 <json_file name="launch.json">
@@ -107,8 +112,12 @@ _HLSL_GENERATION_GUIDELINES = """## HLSL/DX12 Optimization Guidelines
 
 _HLSL_LINALG_GUIDELINES = """## Direct3D 12 Linear Algebra Guidance
 - This task is running in raw-buffer mode for SM 6.10. Use ByteAddressBuffer/RWByteAddressBuffer and explicit byte offsets for all tensor accesses.
-- The available proven linalg feature is FP16 thread-scope vector-matrix multiply from <dx/linalg.h> with MatrixScope::Thread. FP32 linalg and wave-matrix linalg are not assumed available.
-- Keep linalg usage generic and correctness-first: use the API only when the tensor operation naturally maps to a small fixed vector-matrix operation, and fall back to ordinary scalar/vector HLSL for the rest.
+- The available proven linalg feature is FP16 thread-scope vector-matrix multiply from <dx/linalg.h> with MatrixScope::Thread. Prefer Multiply<float16_t> fragments widened into FP32 registers for K-tile accumulation; direct FP32-output MultiplyAdd is only a diagnostic path when hlsl_probe/eval evidence shows it creates a valid PSO on the target driver. FP32 matrix objects, wave-matrix linalg, and threadgroup linalg are not assumed available.
+- hlsl_probe shape sweep on the local Intel target measured [WaveSize(32)] M=16,K=64 as the strongest saturated FP16 thread matvec shape. Good fallback shapes are M=8,K=128, M=8,K=64, M=16,K=32, and M=4,K=128. Use these measured shapes before inventing tiny 2x4 fragments for performance experiments.
+- This run is intended to discover whether SM 6.10 FP16 thread-scope Direct3D Linear Algebra is useful for the task. Prefer a clean linalg-fragment implementation for the innermost dense K-tile multiply when it can be expressed with supported MatrixScope::Thread APIs.
+- For dense FP16 matrix/vector or GEMM-like reductions, first try to express the innermost K-tile computation as one or more thread-scope linalg vector-matrix fragments and keep the cross-tile accumulation in FP32 registers. Treat ordinary scalar/vector HLSL as the fallback for raw-buffer address calculation, packing/unpacking, accumulation glue, edge handling, and any parts that do not map cleanly.
+- For vector widths greater than 4, use bracket indexing instead of .xyzw swizzles.
+- Avoid artificial, unused, or no-op linalg calls. If linalg does not fit, explain that through the chosen implementation structure rather than inserting a token call.
 - Do not require root constants, CBVs, extra temporary buffers, descriptor spaces, multi-dispatch sequencing, or runtime shape metadata.
 """
 
@@ -357,10 +366,10 @@ Generate the implementation:"""
 
     def code_for_world_model_from_raw(self, *, raw: Any, language: str) -> str:
         if isinstance(raw, dict):
-            return str(raw.get("kernel.hlsl") or raw)
+            return self._clean_generated_file_content(raw.get("kernel.hlsl") or raw)
         text = str(raw or "")
         files = self._parse_xml_blocks(text)
-        return files.get("kernel.hlsl", text)
+        return self._clean_generated_file_content(files.get("kernel.hlsl", text))
 
     def seed_eval_for_base_solution(self, *, base_solution: Solution, config: Any = None) -> EvalResult:
         return self.run_benchmark(solution=base_solution, config=config, dump_traces=False, round_num=None)
@@ -547,7 +556,7 @@ Generate the implementation:"""
 
     def _guidelines_text(self) -> str:
         if self._linalg_enabled:
-            return _HLSL_GENERATION_GUIDELINES + "\n" + _HLSL_LINALG_GUIDELINES
+            return _HLSL_GENERATION_GUIDELINES + "\n" + _HLSL_LINALG_GUIDELINES + "\n" + HLSL_LINALG_COOKBOOK
         return _HLSL_GENERATION_GUIDELINES
 
     def _failed_eval(self, message: str, round_num: int | None) -> EvalResult:
@@ -576,9 +585,9 @@ Generate the implementation:"""
 
     def _parse_generated_files(self, *, cleaned_code: Any, raw_code: Any) -> dict[str, str]:
         if isinstance(cleaned_code, dict) and "kernel.hlsl" in cleaned_code:
-            launch = str(cleaned_code.get("launch.json") or self._default_launch_json())
+            launch = self._clean_generated_file_content(cleaned_code.get("launch.json") or self._default_launch_json())
             return {
-                "kernel.hlsl": str(cleaned_code.get("kernel.hlsl") or ""),
+                "kernel.hlsl": self._clean_generated_file_content(cleaned_code.get("kernel.hlsl") or ""),
                 "launch.json": self._normalize_launch_json(launch),
             }
 
@@ -588,11 +597,11 @@ Generate the implementation:"""
             if files.get("kernel.hlsl"):
                 launch = files.get("launch.json") or self._default_launch_json()
                 return {
-                    "kernel.hlsl": files["kernel.hlsl"],
+                    "kernel.hlsl": self._clean_generated_file_content(files["kernel.hlsl"]),
                     "launch.json": self._normalize_launch_json(launch),
                 }
 
-        kernel = self._strip_markdown_fence(str(cleaned_code or raw_code or ""))
+        kernel = self._clean_generated_file_content(self._strip_markdown_fence(str(cleaned_code or raw_code or "")))
         return {
             "kernel.hlsl": kernel,
             "launch.json": self._default_launch_json(),
@@ -615,11 +624,21 @@ Generate the implementation:"""
             for pattern in filename_patterns:
                 match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
                 if match:
-                    files[filename] = match.group(1).strip()
+                    files[filename] = self._clean_generated_file_content(match.group(1))
                     break
         return files
 
+    @staticmethod
+    def _clean_generated_file_content(text: Any) -> str:
+        value = str(text or "").strip()
+        value = html.unescape(value).strip()
+        if value.startswith("<![CDATA[") and value.endswith("]]>"):
+            value = value[len("<![CDATA[") : -len("]]>")].strip()
+            value = html.unescape(value).strip()
+        return value
+
     def _normalize_launch_json(self, text: str) -> str:
+        text = self._clean_generated_file_content(text)
         try:
             obj = json.loads(str(text or "{}"))
             if not isinstance(obj, dict):
