@@ -1,0 +1,304 @@
+{
+  "computed_signals": {
+    "round_index": 30,
+    "trace": {
+      "latency_ms": 36.178202999999996,
+      "mean_vs_baseline_factor": null,
+      "reference_latency_ms": 118.01200000081735,
+      "speedup_factor": 3.2619641169246956,
+      "status": "passed"
+    }
+  },
+  "decision_tree": {
+    "active_leaf_id": "refine_attention_logit_register_cache",
+    "nodes": [
+      {
+        "action": {
+          "description": "Dummy root containing the initial analysis; no shader implementation attached.",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": null,
+          "rationale": "Use this node to organize mutually exclusive first implementation paths for the fixed-shape Swin block.",
+          "score_0_to_1": 0.65,
+          "title": "Initial world model"
+        },
+        "choice": null,
+        "confidence_0_to_1": 0.72,
+        "decision": null,
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Intel Arc B580 D3D/HLSL path, cs_6_8, WaveSize(32) likely accepted; groupshared limited to 32 KiB/threadgroup regardless of hardware cache/shared figures.",
+            "notes": "The workload has small fixed reductions C=32 and N=16, which fit naturally in one wave with wave reductions/broadcasts. Total arithmetic is dominated by dense fp16 linear layers and small attention matrices.",
+            "rating_0_to_10": 8.0,
+            "risk": "Actual fp16 throughput, wave intrinsic lowering, and typed Buffer<float16_t> behavior on this runner are unmeasured."
+          },
+          "memory_bandwidth": {
+            "notes": "Input/output traffic is about 59 MB read plus 59 MB write, but naive materialization would add many global round trips. Weights are tiny, about 24 KiB fp16 plus biases/RPE, and should live in cache if streamed directly.",
+            "rating_0_to_10": 7.0,
+            "risk": "If each wave repeatedly streams weights without effective cache reuse, weight bandwidth and latency can become visible despite the small model."
+          },
+          "register_pressure": {
+            "notes": "Full fusion can keep per-lane q/k/v for 16 tokens, attention outputs, LN scalars, and MLP accumulators in registers; this avoids temporary UAVs but may reduce occupancy.",
+            "rating_0_to_10": 6.0,
+            "risk": "Storing q[16], k[16], v[16] and multiple accumulators per lane may spill in DXIL if written too aggressively."
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "root",
+        "node_type": "root",
+        "notes": "1) Problem classification: mixed dense small-shape transformer block: tokenwise reductions for LayerNorm, dense linear layers, 4x4-window attention/softmax, GELU, residuals, dense contiguous input/output; no sparse indexing except fixed window permutation and RPE lookup.\n2) Canonical math/dependencies: for each of 57,600 independent windows, process 16 tokens x 32 channels. LN1 reduces C=32 per token, qkv maps 32->96 per token, attention reduces C for each 16x16 score then softmax reduces N=16 per query, attn@v reduces N, proj maps 32->32, residual, LN2, fc1 32->128, GELU, fc2 128->32, residual. Windows are independent; MLP is token-independent after attention.\n3) Data/access: input_0/output_0 contiguous NHWC fp16, shape 1x720x1280x32. RPE is 256 fp16. Norm/bias vectors tiny. qkv/proj/fc weights are dense row-major PyTorch Linear weights [out,in]. Dominant reusable state is the small dense weights; dominant one-time data is input/output. Prefer private registers for LN values, q/k/v, attention rows, MLP activations; use groupshared only if it is a read-only reusable weight/RPE tile or true cross-wave exchange scratch, not for phase materialization.\n4) Bottleneck regimes: A) fully fused wave-owned windows likely compute/register limited with weight-cache sensitivity; B) output-element recomputation likely compute-explosive but simple and low-register; C) group-owned cooperative window likely sync/shared/register limited but may improve lane utilization for qkv/MLP; D) if fp16 operations scalarize to fp32 unexpectedly, compute throughput dominates.\n5) Knobs: work unit granularity window/token/output-element, waves per threadgroup, one wave vs multi-wave per window, weight streaming vs selective read-only shared tile, qkv lifetime in registers vs exchange scratch, exact GELU approximation, fp32 vs fp16 accumulation for LN/softmax/dots, softmax stabilization, output mapping to fixed launch counts.\n6) High-level skeleton: load one independent window, perform LN reductions with wave intrinsics, compute q/k/v by broadcasting lane-owned normalized channels, compute attention scores and softmax per query using wave reductions, apply v and proj, residual, LN2, fc1/GELU/fc2 streaming hidden blocks, write final fp16. Cross-thread communication should mostly be wave-local; group barriers are only justified after cooperative read-only shared tile loads or cross-wave scratch writes.\n7) Candidate families: top candidate is complete-window fused evaluator with per-wave ownership and register intermediates; alternative direct output evaluator prioritizes correctness by recomputation; alternative cooperative-window evaluator uses multiple waves and compact shared exchange/read-only tiles to trade barriers for more parallelism.",
+        "overall_rating_0_to_10": 7.0,
+        "parent_id": null,
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_run"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a single-dispatch fully fused shader where one independent 4x4 window computes the complete Swin block and writes the final 16x32 outputs without temporary buffers.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.3065,
+          "rationale": "The fixed N=16 and C=32 dimensions match WaveSize(32): reductions and broadcasts can be wave-local, and all intermediate tensors for a window can be kept as lane-owned registers plus direct SRV weight streams.",
+          "score_0_to_1": 0.94,
+          "title": "Implement complete-window fused evaluator"
+        },
+        "choice": "one complete 4x4 window is the independent work unit",
+        "confidence_0_to_1": 0.93,
+        "decision": "independent_work_unit_granularity",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "WaveSize(32) maps lanes to C=32 channels; each window has 16 tokens and one head, so attention reductions are small and regular.",
+            "notes": "C=32 aligns with WaveSize(32), making reductions and lane exchange natural. The architecture fit is now supported by two passed variants, with the remaining cost concentrated in dense matvec and GELU work.",
+            "rating_0_to_10": 8.7,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "The family avoids phase tensors and keeps final materialization to output only. The newest child evidence strengthens the belief that SRV/L2 streaming plus register ownership beats staging whole phase working sets.",
+            "rating_0_to_10": 8.0,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "The complete-window wave owns all 16 tokens, which is excellent for fusion but keeps several 16-entry arrays live per lane. Further gains are likely from live-range reduction rather than adding groupshared staging.",
+            "rating_0_to_10": 6.2,
+            "risk": "medium_high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "granularity_window_complete",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: This top-level family treats one complete 4x4 window as the independent work unit and evaluates the full block inside one wave. The attached refinement confirms that keeping attention logits in registers improves the fused evaluator.\n- bottleneck: compute/register pressure, not synchronization; no groupshared memory or group-wide barriers are needed.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes.\nUPDATE_BELIEF:\n- what changed after eval_result? The family is now the best-supported plan, reaching 36.18 ms and 3.26x speedup versus the CPU reference. The improvement over the prior 38.09 ms result increases confidence in incremental register-level refinements.\n- next bet: Continue with composable refinements under this family, especially reducing MLP live ranges and expensive GELU cost while preserving one-wave ownership.\nSELF_CHECK: This root child is mutually exclusive with output-direct and cooperative-window families because it assigns an entire window to a single wave rather than assigning individual output elements or splitting one window across multiple waves.",
+        "overall_rating_0_to_10": 9.5,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": 2.9837360885933633,
+            "score_name": "speedup_vs_reference",
+            "status": "passed"
+          },
+          "parent_solution_id": null,
+          "solution_id": "eb72cac0a37029e45e150699e852d90ac1fa5e68"
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a simple single-dispatch direct evaluator where each output token/channel computes the needed formulas by recomputing local window context rather than preserving full-window state.",
+          "difficulty_1_to_5": 4,
+          "expected_vs_baseline_factor": 0.55,
+          "rationale": "This path is a correctness-oriented fallback with simpler register lifetime and less complex wave coordination, useful to validate layout, bindings, LayerNorm, softmax, GELU, and Linear weight indexing.",
+          "score_0_to_1": 0.32,
+          "title": "Output-element or small token-channel direct evaluator"
+        },
+        "choice": "one final output element or small token-channel set is the independent work unit",
+        "confidence_0_to_1": 0.56,
+        "decision": "independent_work_unit_granularity",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Does not exploit the C=32 wave shape as strongly; reductions may be serial or partially wave-assisted depending on mapping.",
+            "notes": "This plan does not naturally exploit C=32 wave reductions for whole-token layernorm and attention. It risks repeating QK/softmax/MLP work per output element.",
+            "rating_0_to_10": 3.8,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "Assigning small output elements as work units would likely reload or recompute shared window quantities many times, losing the current fused window reuse.",
+            "rating_0_to_10": 3.5,
+            "risk": "high"
+          },
+          "register_pressure": {
+            "notes": "Per-thread live state could be smaller than the complete-window evaluator, but that benefit is likely dominated by duplicated computation and poorer window-level reuse.",
+            "rating_0_to_10": 7.2,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "granularity_output_direct",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: Open alternative where one final output element or a small token-channel set is the independent work unit. It remains unimplemented.\n- bottleneck: expected duplicated compute and memory traffic, not synchronization.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes for an unexplored alternative, but it is now less attractive after the complete-window family improved again.\nUPDATE_BELIEF:\n- what changed after eval_result? The 36.18 ms complete-window result raises the bar for any output-direct plan and makes recomputation-heavy ownership less credible. Downscore but do not delete because it may still be useful if register pressure becomes prohibitive.\n- next bet: Only revisit if token-block live-range reduction fails or if profiling shows occupancy collapse from registers.\nSELF_CHECK: This root child is mutually exclusive with complete-window and cooperative-window families because ownership is by final output element/small channel set, not by a whole window.",
+        "overall_rating_0_to_10": 4.1,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_run"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "Implement a full-window shader where several waves cooperate on one or more windows and use limited groupshared memory only for justified read-only or exchange data.",
+          "difficulty_1_to_5": 5,
+          "expected_vs_baseline_factor": 0.42,
+          "rationale": "More parallelism per window may reduce per-wave serial loop cost for qkv/MLP and can amortize tiny state loads, but it introduces barriers and shared-memory exchange that may outweigh gains for N=16,C=32.",
+          "score_0_to_1": 0.43,
+          "title": "Cooperative multi-wave complete-window evaluator"
+        },
+        "choice": "one window is shared by multiple cooperating waves",
+        "confidence_0_to_1": 0.52,
+        "decision": "independent_work_unit_granularity",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "Threadgroups must remain below 32 KiB groupshared. Multiple waves per window may use more of the SIMD lanes on dense linear layers but needs inter-wave handoff.",
+            "notes": "The current wave-local C=32 mapping is a strong fit. Cooperative splitting is harder to justify unless it clearly improves occupancy or parallelizes the 128-wide MLP enough to overcome barriers/exchange.",
+            "rating_0_to_10": 5.2,
+            "risk": "high"
+          },
+          "memory_bandwidth": {
+            "notes": "A cooperative plan might reuse compact read-only tiles, but any groupshared use must be justified as a reusable tile or exchange buffer. Staging whole phase tensors would violate the preferred fusion model and likely add traffic.",
+            "rating_0_to_10": 5.0,
+            "risk": "medium"
+          },
+          "register_pressure": {
+            "notes": "Splitting a window across waves could reduce per-wave live state, but the inter-wave handoff required for attention/MLP reductions may offset the benefit.",
+            "rating_0_to_10": 7.5,
+            "risk": "medium"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "granularity_window_cooperative",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: Open alternative where one 4x4 window is split across multiple cooperating waves. It is not yet implemented.\n- bottleneck: expected synchronization/exchange overhead versus possible register-pressure relief.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes for an unexplored alternative, but it is now secondary to refining the proven one-wave mapping.\nUPDATE_BELIEF:\n- what changed after eval_result? The improved no-groupshared, wave-local solution reduces the need for a more complex cooperative design. Keep as a fallback for register/occupancy issues, but downscore due to high implementation risk.\n- next bet: Defer until after register-lifetime reductions are tested; only pursue if profiling or compiler output suggests the one-wave plan is occupancy-limited.\nSELF_CHECK: This root child is mutually exclusive with complete-window and output-direct families because it splits a single window across multiple waves rather than assigning a complete window to one wave or assigning work by output element.",
+        "overall_rating_0_to_10": 5.2,
+        "parent_id": "root",
+        "solution_ref": {
+          "eval": {
+            "score": null,
+            "score_name": null,
+            "status": "not_run"
+          },
+          "parent_solution_id": null,
+          "solution_id": null
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.3065,
+          "rationale": "",
+          "score_0_to_1": 0.95,
+          "title": "Register-cache attention logits inside complete-window evaluator"
+        },
+        "choice": "cache per-query attention logits in registers to avoid recomputing QK dot products during softmax",
+        "confidence_0_to_1": 0.91,
+        "decision": "chain_refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "One 32-lane wave owns one complete 4x4 window, matching the C=32 channel reductions well. WaveActiveSum/WaveReadLaneAt are used for layernorm, matvecs, and QK reductions; no unnecessary group barriers are introduced.",
+            "rating_0_to_10": 8.6,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Fusion keeps the 4x4-window path mostly register resident and writes only final output. No groupshared memory is used; state/input loads stream through SRV/L2 and wave shuffles avoid intermediate materialization.",
+            "rating_0_to_10": 8.2,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Caching q/k/v, attention results, residuals, and per-query logits improves compute reuse but creates many live per-lane arrays. The passed result indicates the pressure is still acceptable on Arc B580, but it is now the most plausible limiter.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium_high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "refine_attention_logit_register_cache",
+        "node_type": "decision",
+        "notes": "CURRENT:\n- does: The current solution maps each complete 4x4 window to one wave, with four independent windows per 128-thread group. It fuses norm1, QKV, window attention, projection, norm2, MLP, residuals, and final output; per-query attention logits are cached in registers during softmax so QK dot products are not recomputed.\n- bottleneck: compute and register-pressure dominated, especially the 16-token live arrays and the 128-wide MLP/GELU loop; bandwidth and synchronization overhead are relatively low.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes.\nUPDATE_BELIEF:\n- what changed after eval_result? The passed run improved from 38.09 ms to 36.18 ms and from about 2.98x to 3.26x versus reference, confirming that register-caching logits is a real but moderate win. The observed factor of about 0.3065x reference is close to the predicted 0.30x, so no material prediction gap is indicated.\n- next bet: Try shortening live ranges in the post-attention norm2/MLP path by token-blocking the MLP accumulators while preserving the one-wave-per-window mapping. This targets the remaining likely limiter without changing bindings, dispatch shape, or requiring groupshared memory.",
+        "overall_rating_0_to_10": 9.4,
+        "parent_id": "granularity_window_complete",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 36.178202999999996,
+            "reference_latency_ms": 118.01200000081735,
+            "score": 3.2619641169246956,
+            "score_name": "speedup_vs_reference",
+            "status": "passed"
+          },
+          "parent_solution_id": "eb72cac0a37029e45e150699e852d90ac1fa5e68",
+          "solution_id": "cfd036971ead51dc9f03bab1f168f130f4c40171"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.91,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "One 32-lane wave owns one complete 4x4 window, matching the C=32 channel reductions well. WaveActiveSum/WaveReadLaneAt are used for layernorm, matvecs, and QK reductions; no unnecessary group barriers are introduced.",
+            "rating_0_to_10": 8.6,
+            "risk": "medium"
+          },
+          "memory_bandwidth": {
+            "notes": "Fusion keeps the 4x4-window path mostly register resident and writes only final output. No groupshared memory is used; state/input loads stream through SRV/L2 and wave shuffles avoid intermediate materialization.",
+            "rating_0_to_10": 8.2,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Caching q/k/v, attention results, residuals, and per-query logits improves compute reuse but creates many live per-lane arrays. The passed result indicates the pressure is still acceptable on Arc B580, but it is now the most plausible limiter.",
+            "rating_0_to_10": 6.0,
+            "risk": "medium_high"
+          }
+        },
+        "last_updated_round": 30,
+        "node_id": "node_swin_block_fp16_simplified_r30_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 9.4,
+        "parent_id": "refine_attention_logit_register_cache",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "cfd036971ead51dc9f03bab1f168f130f4c40171",
+          "solution_id": null
+        }
+      }
+    ],
+    "root_id": "root"
+  },
+  "kernel_summary": "This is a fixed-shape fp16 simplified Swin block over 57,600 independent 4x4 windows, each with N=16 tokens and C=32 channels: two LayerNorm reductions over channels, qkv/proj/fc dense linear layers, one-head 16x16 attention/softmax with RPE, GELU MLP, and residuals. The dominant opportunity is a single fused HLSL cs_6_8 dispatch that avoids global intermediate tensors and maps C=32 to WaveSize(32), keeping q/k/v, attention, residual, and MLP accumulators mostly in registers with wave intrinsics for reductions/broadcasts. The likely bottlenecks are fp16 dense compute throughput and register pressure in the fully fused path, cache/weight-stream behavior for small dense weights, and synchronization overhead if attempting multi-wave cooperative shared-memory designs under the 32 KiB groupshared limit.",
+  "open_questions": [
+    "Does the evaluator/compiler accept [WaveSize(32)] with cs_6_8 on Intel Arc B580, and are wave intrinsics lowered efficiently for typed Buffer<float16_t> data?",
+    "What exact numerical behavior is required for LayerNorm and softmax accumulation: fp32 accumulation matching PyTorch tolerance, or can selected fp16/approximate accumulation pass rtol=0.01, atol=0.01?",
+    "Which GELU formula does the reference use in this environment for fp16: exact erf-based GELU or tanh approximation, and what approximation error is acceptable?",
+    "Do HLSL row-major flattened Linear weights match PyTorch indexing as weight[out, in] for every state buffer, and are Buffer<float16_t> descriptors exposing the expected element indexing?",
+    "How severe is register spilling for a wave-owned full-window implementation with q/k/v arrays of length 16 per lane on the DXIL compiler used by hlsl_probe?",
+    "Are small model-state SRVs effectively cached across many threadgroups, or is explicit groupshared read-only tiling of weights/RPE beneficial despite barrier overhead?",
+    "What launch grid and threadgroup sizing constraints does the runner impose beyond fixed dispatch counts, especially for covering exactly 57,600 windows without root constants?"
+  ]
+}

@@ -238,6 +238,7 @@ def benchmark_hlsl_kernel(
     iters: int,
     atol: float,
     hlsl_target: str,
+    hlsl_buffer_view: str,
     reference_device: str,
     hlsl_agility_sdk_path: str | None,
 ) -> dict[str, Any]:
@@ -255,6 +256,7 @@ def benchmark_hlsl_kernel(
         launch_path.write_text(launch_json or "{}", encoding="utf-8")
 
         launch = hlsl_eval._load_launch_config(launch_path, hlsl_target)
+        buffer_view = hlsl_eval._normalize_buffer_view(hlsl_buffer_view)
         dxil = compile_hlsl_source(kernel_hlsl, target=launch["target"], entry=launch["entry"])
         model, get_inputs_fn, _dtype, selected_reference_device = hlsl_eval._load_reference(
             str(ref_path),
@@ -270,8 +272,8 @@ def benchmark_hlsl_kernel(
 
             metadata, output_bytes = probe.run_dxil(
                 dxil,
-                inputs=hlsl_eval._make_probe_inputs(inputs, state_tensors),
-                outputs=hlsl_eval._make_output_specs(expected_outputs),
+                inputs=hlsl_eval._make_probe_inputs(inputs, state_tensors, buffer_view),
+                outputs=hlsl_eval._make_output_specs(expected_outputs, buffer_view),
                 dispatch=tuple(launch["dispatch"]),
             )
             actual_outputs = [
@@ -285,8 +287,8 @@ def benchmark_hlsl_kernel(
             perf_inputs = get_inputs_fn()
             perf_expected_outputs = hlsl_eval._run_reference(model, perf_inputs)
             hlsl_eval._synchronize(selected_reference_device)
-            perf_probe_inputs = hlsl_eval._make_probe_inputs(perf_inputs, state_tensors)
-            perf_output_specs = hlsl_eval._make_output_specs(perf_expected_outputs)
+            perf_probe_inputs = hlsl_eval._make_probe_inputs(perf_inputs, state_tensors, buffer_view)
+            perf_output_specs = hlsl_eval._make_output_specs(perf_expected_outputs, buffer_view)
 
             for _ in range(max(0, int(warmup))):
                 probe.run_dxil(
@@ -343,6 +345,16 @@ def _flatten_outputs(outputs: list[torch.Tensor]) -> torch.Tensor:
     if len(outputs) == 1:
         return outputs[0].detach().cpu().contiguous()
     return torch.cat([value.detach().cpu().contiguous().flatten() for value in outputs])
+
+
+def _infer_hlsl_buffer_view(kernel_hlsl: str, requested: str) -> str:
+    requested = str(requested or "auto").lower()
+    if requested != "auto":
+        return requested
+    lowered = kernel_hlsl.lower()
+    if "byteaddressbuffer" in lowered or "rwbyteaddressbuffer" in lowered:
+        return "raw"
+    return "typed"
 
 
 @torch.inference_mode()
@@ -456,6 +468,8 @@ Examples:
                         help="PyTorch device for reference/CUDA/Triton timing (e.g. cpu, cuda:0, xpu:0). Auto-detected if omitted. HLSL dispatch still uses hlsl_probe/D3D12.")
     parser.add_argument("--hlsl-target", default="cs_6_8",
                         help="Shader model target used when an HLSL launch.json omits target")
+    parser.add_argument("--hlsl-buffer-view", default="auto", choices=["auto", "typed", "raw"],
+                        help="Descriptor view for HLSL tensor buffers. Auto uses raw for ByteAddressBuffer kernels and typed otherwise.")
     parser.add_argument("--hlsl-agility-sdk-path", default=None,
                         help="Optional Direct3D 12 Agility SDK path for hlsl_probe")
     args = parser.parse_args()
@@ -570,6 +584,7 @@ Examples:
                 except TypeError:
                     ms, out = benchmark_cuda_module(module, inputs + model_params, args.warmup, args.iters, device=device)
             elif ktype == "hlsl":
+                hlsl_buffer_view = _infer_hlsl_buffer_view(kernel["kernel_hlsl"], args.hlsl_buffer_view)
                 result = benchmark_hlsl_kernel(
                     kernel["kernel_hlsl"],
                     kernel.get("launch_json", "{}"),
@@ -579,6 +594,7 @@ Examples:
                     iters=args.iters,
                     atol=args.atol,
                     hlsl_target=args.hlsl_target,
+                    hlsl_buffer_view=hlsl_buffer_view,
                     reference_device=hlsl_reference_device,
                     hlsl_agility_sdk_path=args.hlsl_agility_sdk_path,
                 )

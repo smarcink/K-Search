@@ -1,16 +1,16 @@
 {
   "computed_signals": {
-    "round_index": 0,
+    "round_index": 25,
     "trace": {
-      "latency_ms": null,
+      "latency_ms": 17.9826565,
       "mean_vs_baseline_factor": null,
-      "reference_latency_ms": null,
-      "speedup_factor": null,
-      "status": "not_evaluated"
+      "reference_latency_ms": 78.19440000002942,
+      "speedup_factor": 4.348323063393298,
+      "status": "passed"
     }
   },
   "decision_tree": {
-    "active_leaf_id": "pooled_output_direct",
+    "active_leaf_id": "fp16_shared_input_tile_refinement_r15",
     "nodes": [
       {
         "action": {
@@ -18,35 +18,35 @@
           "difficulty_1_to_5": 3,
           "expected_vs_baseline_factor": null,
           "rationale": "",
-          "score_0_to_1": 0.5,
-          "title": ""
+          "score_0_to_1": 0.62,
+          "title": "Select end-to-end ownership family"
         },
         "choice": null,
-        "confidence_0_to_1": 0.62,
+        "confidence_0_to_1": 0.7,
         "decision": null,
         "impacts": {
           "compute_intensity_and_hw_fit": {
-            "hw_notes": "Intel Arc B580 via DX12 cs_6_8, typed half buffers, no SM 6.10 linalg, 32 KiB groupshared limit, fixed shape constants only.",
-            "notes": "Kernel is overwhelmingly dense FP16 convolution reduction: 7.37M pooled outputs, each requiring four 3x3x128 convolutions before ReLU+average pool, about 34B multiply-adds if done directly.",
+            "hw_notes": "Intel Arc B580 via D3D12 HLSL cs_6_8, fp16 buffers, no HLSL linalg, single dispatch, 32 KiB groupshared cap, wave size should be explicitly 32 if wave-owned mapping is used.",
+            "notes": "This is a dense high-arithmetic 3x3 convolution with ReLU and 2x2 average-pool fusion. Main work is approximately 128*180*320*4*128*9 MACs, so compute dominates once memory reuse is reasonable.",
             "rating_0_to_10": 8.0,
-            "risk": "Scalar HLSL may not reach tensor-core-like convolution throughput; compiler half/float behavior and occupancy will matter."
+            "risk": "Without matrix/linalg intrinsics, scalar/vector FMA throughput and compiler lowering of float16_t or float accumulations are major unknowns."
           },
           "memory_bandwidth": {
-            "notes": "Input is 1x128x360x640 half, weights are 128x128x3x3 half, bias 128 half, output 1x128x180x320 half. Weights are small enough for cache, but naive per-output re-reading can stress L2; input overlap across the four pooled conv sites is significant.",
-            "rating_0_to_10": 6.0,
-            "risk": "If weight cache locality or input coalescing is poor, memory traffic can dominate despite high arithmetic count."
+            "notes": "Input tensor is 1x128x360x640 fp16, weights are 128x128x3x3 fp16, bias is 128 fp16, output is 1x128x180x320 fp16. Dense contiguous row-major accesses; naive direct output computation rereads overlapping input and weights heavily. Full fusion avoids materializing the intermediate 1x128x360x640 conv/ReLU tensor.",
+            "rating_0_to_10": 7.0,
+            "risk": "A no-cache/no-tile mapping may repeatedly stream tens of GB of input/weight traffic and underuse spatial and output-channel reuse."
           },
           "register_pressure": {
-            "notes": "A fused pooled-output formulation needs at least four FP32 accumulators plus loop temporaries; output-channel vectorization or cooperative variants can multiply accumulator count.",
-            "rating_0_to_10": 5.0,
-            "risk": "Aggressive unrolling/vector-channel ownership may reduce occupancy or spill."
+            "notes": "A fused pooled output needs four independent convolution accumulators because ReLU precedes average pooling. Per-thread variants therefore carry at least 4 accumulators plus loop/index state; output-channel-vector variants multiply this pressure.",
+            "rating_0_to_10": 6.0,
+            "risk": "Trying to compute too many output channels or spatial cells per thread can reduce occupancy and spill, while overusing groupshared would exceed the 32 KiB D3D limit."
           }
         },
         "last_updated_round": 0,
         "node_id": "root",
         "node_type": "root",
-        "notes": "- 1) Problem classification: mixed dense stencil + reduction + elementwise fusion. Primary output is output_0[1,128,180,320] half. Each output depends on four neighboring stride-1 padded conv sites, each conv reduces over fixed C=128,KY=3,KX=3. Dense row-major indexing, no sparse/indirect accesses. Fixed dimensions: N=1, IC=128, OC=128, H=360,W=640, OH=180,OW=320.\n- 2) Canonical math: for output oc,oh,ow, compute conv(py,px)=bias[oc]+sum_ic,ky,kx input[ic,2oh+py+ky-1,2ow+px+kx-1]*weight[oc,ic,ky,kx] with zero padding, apply ReLU to each of the four py/px in {0,1}, then output=0.25*sum ReLU(conv). Outputs are independent after reductions. Reordering can fuse conv+ReLU+pool and stream weights/input while keeping four conv accumulators in registers.\n- 3) Data/access: input_0 t0 half contiguous NCHW flattened; state_0 t1 half scalar likely unused because quantize_act=false; state_1 t2 half OIHW contiguous; state_2 t3 half bias; output_0 u0 half NCHW flattened. Dominant reads are input and weights; output writes are one half each. Private/register: accumulators and current input/weight values. Shared memory is optional only for read-only reusable input/weight tiles or true cross-thread exchange; do not materialize conv or activation tensors.\n- 4) Bottleneck regimes: interior spatial pixels with full 3x3 are compute/weight-cache dominated; image borders have branch/padding overhead and less compute; low-occupancy/vectorized variants may become register/latency dominated; spatial-tile variants may become barrier/shared-memory dominated if staging is too fine-grained.\n- 5) Knobs: work ownership over pooled output vs conv site vs output-channel group; OC/spatial tiling; unroll IC/K loops; FP32 vs FP16 accumulation; boundary special-casing; whether to reuse one loaded weight across four pooled conv accumulators; optional wave intrinsics for cooperative pooled-site reduction; optional selective groupshared read-only tiles.\n- 6) Skeleton: single dispatch, fixed constants, typed Buffer<float16_t>/RWBuffer<float16_t>, no CBV/root constants/temp buffers. Preferred fused skeleton loads bias to four FP32 registers, streams weights and input, computes four conv sites, applies ReLU, averages, stores half. No cross-thread sync needed unless using a cooperative or shared-tile family; wave-local communication should use wave intrinsics, not groupshared.\n- 7) Candidate families: top family is maximally fused pooled-output ownership with private registers and direct SRV streaming, avoiding all global intermediate round-trips. Alternative families split a pooled cell across lanes for more parallelism, own multiple output channels to reuse input across OC, or own spatial neighborhoods with selective read-only tile reuse. SM 6.10 linalg is disabled, so no linalg prototype should be proposed.",
-        "overall_rating_0_to_10": 6.0,
+        "notes": "Root remains a dummy family-selection node. New evidence shows fused group-owned spatial/channel tiling is the current strongest demonstrated family, but wave-owned and thread-owned alternatives remain useful exploration branches.",
+        "overall_rating_0_to_10": 7.4,
         "parent_id": null,
         "solution_ref": {
           "eval": {
@@ -60,45 +60,45 @@
       },
       {
         "action": {
-          "description": "Implement a single fused shader where one invocation owns one output element, keeps the four pre-pool convolution accumulators in registers, applies ReLU, averages, and writes output_0 directly.",
+          "description": "Implement a fused shader where each worker computes complete pooled outputs for one output channel and one or a small number of spatial positions, keeping the four pre-pool convolution accumulators in registers and streaming input/weights directly from SRVs.",
           "difficulty_1_to_5": 2,
-          "expected_vs_baseline_factor": 0.85,
-          "rationale": "This is the simplest full-fusion correctness baseline and avoids materializing the full conv or activation tensors. It can reuse each loaded weight across the four pooled conv sites in registers and needs no groupshared memory or barriers.",
-          "score_0_to_1": 0.82,
-          "title": "Fused pooled-output ownership baseline"
+          "expected_vs_baseline_factor": 0.75,
+          "rationale": "This is the fastest correctness-oriented first implementation: it fuses convolution, ReLU, and average pooling, avoids the large intermediate tensor, requires no groupshared memory or barriers, and gives a reliable baseline for later tiling.",
+          "score_0_to_1": 0.22,
+          "title": "Thread-owned direct fused pooled cell"
         },
-        "choice": "one_invocation_owns_one_pooled_output_channel_pixel",
-        "confidence_0_to_1": 0.74,
-        "decision": "work_decomposition_family",
+        "choice": "thread_owned_pooled_cell",
+        "confidence_0_to_1": 0.62,
+        "decision": "work_ownership_family",
         "impacts": {
           "compute_intensity_and_hw_fit": {
-            "hw_notes": "Fits cs_6_8 typed buffers and fixed-shape single dispatch. No linalg. Can use [WaveSize(32)] only if mapping benefits, but does not require wave cooperation.",
-            "notes": "Per output does 4 independent conv accumulations over IC*3*3, but can order loops so one weight contributes to four accumulators. This maps cleanly to scalar/vector HLSL and maximizes fusion.",
-            "rating_0_to_10": 8.0,
-            "risk": "One thread performing 4608 FMAs may expose instruction latency and may underutilize SIMD lanes if occupancy is not high enough."
+            "hw_notes": "Uses ordinary HLSL loops and typed Buffer<float16_t>/RWBuffer<float16_t>; no dependence on unsupported matrix/linalg features.",
+            "notes": "Each thread would perform large 1152-term reductions for a pooled cell with limited intra-wave parallelism. This likely underuses SIMD lanes compared with the observed tiled mapping.",
+            "rating_0_to_10": 4.1,
+            "risk": "high"
           },
           "memory_bandwidth": {
-            "notes": "Directly streams input and weights; no intermediate global traffic. Weight tensor is only 288 KiB and should be cache-resident. Input overlap inside the pooled 2x2 cell can be partially exploited by load ordering.",
-            "rating_0_to_10": 7.0,
-            "risk": "Naive loop order could load the same border/interior input values repeatedly and lose much of the 2x2/3x3 overlap benefit."
+            "notes": "A direct per-thread pooled cell would reread overlapping input neighborhoods and weights from SRVs with little cross-thread reuse, which is now clearly dominated by the successful shared-tile approach for this shape.",
+            "rating_0_to_10": 2.7,
+            "risk": "high"
           },
           "register_pressure": {
-            "notes": "Requires four FP32 accumulators, bias, index arithmetic, and a few half/float temporaries; likely moderate and stable.",
-            "rating_0_to_10": 8.0,
-            "risk": "Over-unrolling all IC/K loops could inflate registers; keep first version controlled."
+            "notes": "Register use would be simpler than the group-tiled implementation, but the lower coordination cost likely does not compensate for serial reductions and redundant memory traffic.",
+            "rating_0_to_10": 7.0,
+            "risk": "low_medium"
           }
         },
         "last_updated_round": 0,
-        "node_id": "pooled_output_direct",
+        "node_id": "thread_owned_direct_fused",
         "node_type": "decision",
-        "notes": "SELF_CHECK: This sibling uses private ownership of a complete pooled output and cannot be combined in the same initial prototype with siblings that split the same output across lanes or make one invocation own multiple output channels; those require different indexing, write ownership, and occupancy assumptions. Working set per independent unit: four FP32 accumulators private/register; streamed input and weights from SRVs; no shared memory; no barriers.",
-        "overall_rating_0_to_10": 8.0,
+        "notes": "CURRENT:\n- does: Open family only; no attached implementation. It would have each thread compute a pooled output cell directly from SRVs without cooperative input or weight tiling.\n- bottleneck: expected global-memory bandwidth and per-thread reduction latency, with poor reuse of overlapping convolution windows.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes as an open alternative, but no new evidence supports it.\nUPDATE_BELIEF:\n- what changed after eval_result: The fast shared-tile result makes the direct thread-owned plan less attractive because the problem benefits strongly from spatial/input reuse and wave-level organization. This open leaf should be de-prioritized, not expanded next.\n- next bet: Only revisit if shared-memory barriers prove worse than expected in profiling; otherwise continue refining the tiled design.\nSELF_CHECK: As a root child, this excludes wave-owned and group-owned families because a single thread, not a wave or cooperative threadgroup, owns each direct pooled-cell computation.",
+        "overall_rating_0_to_10": 3.2,
         "parent_id": "root",
         "solution_ref": {
           "eval": {
             "score": null,
             "score_name": null,
-            "status": "open"
+            "status": "not_evaluated"
           },
           "parent_solution_id": null,
           "solution_id": null
@@ -106,153 +106,262 @@
       },
       {
         "action": {
-          "description": "Prototype a fused shader where one invocation owns a small group of output channels for the same pooled spatial cell, sharing the same input samples across several output-channel accumulators before writing multiple contiguous-channel outputs.",
+          "description": "Implement a fused shader where one fixed-size 32-lane wave owns one pooled output element for one output channel; lanes partition the input-channel/kernel reduction and use wave reductions to produce the four conv sums before ReLU and averaging.",
           "difficulty_1_to_5": 4,
-          "expected_vs_baseline_factor": 0.72,
-          "rationale": "The same four 3x3 input neighborhoods are reused for every output channel at a spatial cell. Owning several channels can reduce input read traffic per MAC and improve arithmetic intensity if register pressure remains acceptable.",
-          "score_0_to_1": 0.76,
-          "title": "Fused pooled-cell multi-channel ownership"
+          "expected_vs_baseline_factor": 0.55,
+          "rationale": "This exposes parallelism within the 1152-term reductions, keeps intermediates wave-local in registers, avoids groupshared memory, and should reduce per-output latency compared with a serial thread-owned reduction.",
+          "score_0_to_1": 0.38,
+          "title": "Wave-owned pooled cell using wave intrinsics"
         },
-        "choice": "one_invocation_owns_multiple_output_channels_for_one_pooled_cell",
-        "confidence_0_to_1": 0.56,
-        "decision": "work_decomposition_family",
+        "choice": "wave_owned_pooled_cell",
+        "confidence_0_to_1": 0.42,
+        "decision": "work_ownership_family",
         "impacts": {
           "compute_intensity_and_hw_fit": {
-            "hw_notes": "Still compatible with cs_6_8 and typed Buffer<float16_t>. Best vector width is uncertain on Arc B580 due to register pressure and DXIL codegen for half/float conversions.",
-            "notes": "Increases compute per invocation and can amortize input index/load work across multiple OCs. Weight loads scale with channel group size, while input loads can be shared in registers.",
-            "rating_0_to_10": 8.0,
-            "risk": "If vector width is too large, occupancy collapse or spills may offset input reuse."
+            "hw_notes": "Assumes [WaveSize(32)] is accepted by cs_6_8 on the target path and uses WaveActiveSum/WaveGetLaneIndex; no groupshared handoff.",
+            "notes": "The measured 4.35x speedup shows good GPU fit, but performance evidence belongs mostly to a group-owned input-reuse implementation rather than the node's intended lane-partitioned reduction.",
+            "rating_0_to_10": 7.7,
+            "risk": "medium"
           },
           "memory_bandwidth": {
-            "notes": "Potentially reduces input bandwidth by reusing each input sample across multiple output-channel accumulators. Weight bandwidth remains dominant per channel but should benefit from cache locality.",
-            "rating_0_to_10": 8.0,
-            "risk": "Stores become strided by output channel in NCHW layout, so contiguous writes are not across OC for a fixed spatial cell; indexing may reduce coalescing benefits."
+            "notes": "Observed code gets substantial input reuse through a cooperative groupshared spatial/input-channel tile, but this is not the stated wave-owned reduction design. Bandwidth is improved versus direct SRV rereads, though shared-memory traffic remains high.",
+            "rating_0_to_10": 7.4,
+            "risk": "medium"
           },
           "register_pressure": {
-            "notes": "Needs four accumulators per owned output channel plus weight/input temporaries. Even two channels means eight FP32 accumulators; four channels means sixteen.",
-            "rating_0_to_10": 4.0,
-            "risk": "High likelihood of reduced occupancy; must keep the first channel-group small."
+            "notes": "Each lane keeps eight FP32 accumulators plus address/index state; acceptable, but the implemented spatial-tile mapping is more register-heavy than the originally intended one pooled-cell wave reduction.",
+            "rating_0_to_10": 5.8,
+            "risk": "medium"
           }
         },
         "last_updated_round": 0,
-        "node_id": "pooled_cell_multi_channel",
+        "node_id": "wave_owned_reduction_fused",
         "node_type": "decision",
-        "notes": "SELF_CHECK: This sibling changes ownership to multiple OCs per invocation, so it is an alternative to scalar pooled-output ownership rather than an additive tweak; the launch geometry, register budget, and output write pattern differ. Working set per independent unit: private/register four accumulators per OC; direct SRV stream for weights and input; no shared memory initially.",
-        "overall_rating_0_to_10": 7.0,
+        "notes": "CURRENT:\n- does: The attached solution uses a 512-thread group with 16 waves, where each wave/output-channel lane computes spatial pooled cells while all threads cooperatively stage a 16-channel 10x34 input tile in groupshared memory. It broadcasts weights within each wave and accumulates FP32 values for two pooled output columns per lane.\n- bottleneck: mixed compute/shared-memory bandwidth/sync; the solution performs many FMAs but also pays repeated shared reads and about two group barriers per input-channel block.\nFOLLOW_THROUGH:\n- aligned_with_intent: no.\n- if_no: Expected intent was one 32-lane wave owning one pooled output element and partitioning the 1152-term reduction with WaveActive reductions. Actual implementation is a group-owned spatial/channel tile with shared input reuse and no wave reduction over the convolution terms.\nUPDATE_BELIEF:\n- what changed after eval_result: The passed 17.98 ms / 4.35x result confirms the fused tiled shader is strong, but it weakens confidence that the originally described wave-owned reduction family is the reason for the gain. This node should not be treated as clean evidence for the stated ownership plan.\n- next bet: Continue from the attached code with local refinements that reduce shared traffic or synchronization, while separately favoring the group-owned spatial/channel-tile family as the better explanation.\nSELF_CHECK: As a root child, this excludes group-owned and thread-owned families by assigning ownership to wave-local pooled-cell reductions rather than cooperative group tiles or serial per-thread cells.",
+        "overall_rating_0_to_10": 5.2,
         "parent_id": "root",
         "solution_ref": {
           "eval": {
-            "score": null,
-            "score_name": null,
-            "status": "open"
+            "latency_ms": 17.9826565,
+            "mean_vs_baseline_factor": null,
+            "metrics": {
+              "buffer_view": "typed",
+              "dispatch": [
+                20,
+                45,
+                8
+              ],
+              "hlsl_gpu_time_ms": 17.9826565,
+              "hlsl_host_wall_ms": 208.2518499996695,
+              "reference_device": "cpu",
+              "score": 4.348323063393298,
+              "score_name": "speedup_vs_reference",
+              "target": "cs_6_8"
+            },
+            "profiler_metrics": {},
+            "reference_latency_ms": 78.19440000002942,
+            "speedup_factor": 4.348323063393298,
+            "status": "passed"
           },
           "parent_solution_id": null,
-          "solution_id": null
+          "solution_id": "07cc41f296cf744988d6024f2679cb9e31173fc9"
         }
       },
       {
         "action": {
-          "description": "Prototype a wave-owned pooled output where lanes cooperate on the four pre-pool convolution sites for the same output channel and spatial cell, then combine the four ReLU results with wave intrinsics and write once.",
+          "description": "Implement a fused shader where a threadgroup owns a spatial tile for one or a small number of output channels, accumulates four conv positions per output in registers, and cooperatively stages only reusable input-channel blocks and/or compact weight blocks as read-only groupshared tiles.",
           "difficulty_1_to_5": 4,
-          "expected_vs_baseline_factor": 0.78,
-          "rationale": "Splitting the four conv sites across lanes reduces serial work per lane while preserving full conv+ReLU+pool fusion. Wave intrinsics avoid groupshared handoff and group barriers.",
-          "score_0_to_1": 0.71,
-          "title": "Cooperative pooled-cell ownership"
+          "expected_vs_baseline_factor": 0.24,
+          "rationale": "This is the highest-upside family because it attacks both major reuse sources: overlapping input neighborhoods across nearby pooled cells and repeated use of the same output-channel weights across many spatial outputs, while still avoiding intermediate global tensors.",
+          "score_0_to_1": 0.94,
+          "title": "Group-owned spatial/channel tile with selective shared read-only tiles"
         },
-        "choice": "one_wave_or_wave_subgroup_cooperates_on_one_or_more_pooled_outputs",
-        "confidence_0_to_1": 0.51,
-        "decision": "work_decomposition_family",
+        "choice": "threadgroup_owned_spatial_channel_tile",
+        "confidence_0_to_1": 0.94,
+        "decision": "work_ownership_family",
         "impacts": {
           "compute_intensity_and_hw_fit": {
-            "hw_notes": "Use WaveSize(32) only if accepted by the cs_6_8 target. Wave lanes can map to pool-site and possibly multiple independent outputs within one wave.",
-            "notes": "Reduces per-lane instruction count by distributing the four conv reductions, but introduces lane coordination and lower arithmetic per write-owner.",
-            "rating_0_to_10": 7.0,
-            "risk": "Only four pool sites exist, so naive mapping may waste lanes unless multiple outputs are packed per wave."
+            "hw_notes": "Must keep total groupshared below 32 KiB in cs_6_8. Best suited to fixed H/W/C constants and single-dispatch static indexing.",
+            "notes": "The mapping exposes many independent output-channel/spatial lanes, uses FP32 accumulators, and keeps the 21.25 KiB groupshared allocation below the 32 KiB DXIL limit. Barriers are the main remaining structural cost.",
+            "rating_0_to_10": 8.9,
+            "risk": "low_medium"
           },
           "memory_bandwidth": {
-            "notes": "Can preserve weight reuse poorly if each lane reloads the same weights for different pool sites. Needs careful loop ordering or lane broadcasts to avoid extra weight traffic.",
-            "rating_0_to_10": 5.0,
-            "risk": "Cooperative split may multiply weight reads versus the direct four-accumulator approach."
+            "notes": "The current best code behavior matches this family: a compact read-only reusable input tile is cooperatively loaded once per IC block and consumed by 16 output-channel waves across many spatial cells, saving substantial SRV traffic.",
+            "rating_0_to_10": 8.7,
+            "risk": "low_medium"
           },
           "register_pressure": {
-            "notes": "Each active lane needs fewer accumulators, typically one conv accumulator plus temporaries, so register pressure per lane is low.",
-            "rating_0_to_10": 8.0,
-            "risk": "Packing multiple outputs per wave to avoid idle lanes raises indexing complexity and may reintroduce several accumulators."
+            "notes": "Eight accumulators per lane plus tile indexing is moderate. Further unrolling or more pooled outputs per lane may risk occupancy loss, but current pressure appears acceptable on Arc B580.",
+            "rating_0_to_10": 6.2,
+            "risk": "medium"
           }
         },
         "last_updated_round": 0,
-        "node_id": "cooperative_pooled_cell",
+        "node_id": "group_owned_spatial_channel_tile",
         "node_type": "decision",
-        "notes": "SELF_CHECK: This sibling splits a single pooled output across lanes, which conflicts with siblings where one invocation privately owns all four pool-site reductions or several output channels. It requires a different correctness path for the final average and write ownership. Working set: per-lane private accumulator; wave-local exchange via wave intrinsics; no groupshared memory and no group barriers.",
-        "overall_rating_0_to_10": 7.0,
+        "notes": "CURRENT:\n- does: The newly observed fast shader is effectively a group-owned spatial/channel tile: the group cooperatively loads a reusable 16-channel input tile into groupshared memory, then 16 output-channel waves consume it for a 16x4 pooled-output region. Groupshared classification: read-only reusable tile; producers are all 512 threads during the load loop, consumers are all 16 output-channel waves, reuse is across 16 output channels and multiple neighboring spatial/kernel reads, and a GroupMemoryBarrierWithGroupSync is required after each cooperative load before reads.\n- bottleneck: compute plus shared-memory bandwidth and synchronization; it is no longer dominated by global input bandwidth.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes for this family, even though the solution was attached under a different node.\nUPDATE_BELIEF:\n- what changed after eval_result: The 17.98 ms result increases belief that group-owned spatial/channel tiling with selective shared input reuse is the leading family. The observed code provides stronger evidence for this node than for the active wave-reduction label.\n- next bet: Refine the shared input tile representation and barrier structure rather than switching ownership families.\nSELF_CHECK: As a root child, this excludes wave-owned pooled-cell and thread-owned direct families because a whole threadgroup cooperatively owns a spatial/channel tile and shares a reusable input tile.",
+        "overall_rating_0_to_10": 9.4,
         "parent_id": "root",
         "solution_ref": {
           "eval": {
-            "score": null,
-            "score_name": null,
-            "status": "open"
+            "score": 2.4059407395198726,
+            "score_name": "speedup_vs_reference",
+            "status": "passed"
           },
           "parent_solution_id": null,
+          "solution_id": "66ab095b31367a1176ef04833da8021ed0e2015a"
+        }
+      },
+      {
+        "action": {
+          "description": "",
+          "difficulty_1_to_5": 3,
+          "expected_vs_baseline_factor": 0.244,
+          "rationale": "",
+          "score_0_to_1": 0.97,
+          "title": "Amortize input tile over eight output channels per group"
+        },
+        "choice": "increase_output_channels_per_group_to_8",
+        "confidence_0_to_1": 0.94,
+        "decision": "chain_refinement",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "The kernel is FMA-heavy, uses [WaveSize(32)], keeps per-thread intermediates in registers, and keeps groupshared allocation near 22 KiB, comfortably under the 32 KiB cs_6_8 path limit.",
+            "rating_0_to_10": 8.9,
+            "risk": "medium_low"
+          },
+          "memory_bandwidth": {
+            "notes": "gs_in is a read-only reusable input tile produced cooperatively by all 128 group threads, consumed by all tile-owner threads for 16 input channels x 9 taps x 4 pooled samples x 8 output channels; it replaces many redundant SRV reads and needs one GroupMemoryBarrierWithGroupSync after loading. gs_w is a compact read-only reusable weight tile produced cooperatively by all 128 group threads, consumed by all spatial threads for 128 output pixels and four pooled samples; reuse is high enough to justify the one post-load synchronization per channel block.",
+            "rating_0_to_10": 9.1,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Each thread owns eight output channels and four pre-pool accumulators per channel, so 32 fp32 accumulators plus temporary input/weight scalars stress registers. This is the main risk for any further OCPG increase.",
+            "rating_0_to_10": 5.8,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 0,
+        "node_id": "ocpg8_input_reuse_refinement",
+        "node_type": "decision",
+        "notes": "CURRENT: The current solution uses a 16x8 threadgroup over output spatial cells and computes 8 output channels per group; it stages a 16-channel expanded input tile and an 8-output-channel weight tile in groupshared, then keeps all convolution/ReLU/pool intermediates in registers. Bottleneck: mainly register pressure and compute throughput, with secondary cost from two group barriers per 16-channel block.\nFOLLOW_THROUGH: aligned_with_intent: yes. The implementation directly matches the intended OCPG=8 input-reuse refinement and passes validation.\nUPDATE_BELIEF: The measured 18.9055 ms / 4.1008x speedup is better than the prior predicted 0.36x baseline factor, giving observed factor about 0.244x. This confirms the extra output-channel reuse more than offsets the added accumulator pressure at OCPG=8.\nPERF_GAP: expected_vs_baseline_factor=0.36, observed_vs_reference_factor\u22480.244; likely reason is that the reference path and prior model underestimated the bandwidth saved by reusing the loaded input tile across eight output channels.\nNEXT_BET: Probe whether OCPG=16 can further reduce input tile traffic per output channel without collapsing occupancy from 64 accumulators per thread. If that is too register-heavy, keep OCPG=8 as the stable best and instead tune tile shape or weight-load scheduling.",
+        "overall_rating_0_to_10": 9.35,
+        "parent_id": "group_owned_spatial_channel_tile",
+        "solution_ref": {
+          "eval": {
+            "latency_ms": 18.9055205,
+            "reference_latency_ms": 77.52804999972795,
+            "score": 4.100815420539623,
+            "score_name": "speedup_vs_reference",
+            "status": "passed"
+          },
+          "parent_solution_id": "66ab095b31367a1176ef04833da8021ed0e2015a",
+          "solution_id": "06a6bc306d882ecbaae1991f6fa9138a1a56e282"
+        }
+      },
+      {
+        "action": {
+          "description": "Propose one small change that targets the primary bottleneck operation indicated by the latest eval (e.g., reduce sync, reduce redundant loads, or improve locality), without changing the overall mapping plan.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": null,
+          "rationale": "The parent design is working; this creates a clear single-iteration follow-up to improve it.",
+          "score_0_to_1": 0.35,
+          "title": "Next-step refinement: target the top bottleneck operation"
+        },
+        "choice": "Next-step refinement",
+        "confidence_0_to_1": 0.94,
+        "decision": "Continue",
+        "impacts": {
+          "compute_intensity_and_hw_fit": {
+            "hw_notes": "",
+            "notes": "The kernel is FMA-heavy, uses [WaveSize(32)], keeps per-thread intermediates in registers, and keeps groupshared allocation near 22 KiB, comfortably under the 32 KiB cs_6_8 path limit.",
+            "rating_0_to_10": 8.9,
+            "risk": "medium_low"
+          },
+          "memory_bandwidth": {
+            "notes": "gs_in is a read-only reusable input tile produced cooperatively by all 128 group threads, consumed by all tile-owner threads for 16 input channels x 9 taps x 4 pooled samples x 8 output channels; it replaces many redundant SRV reads and needs one GroupMemoryBarrierWithGroupSync after loading. gs_w is a compact read-only reusable weight tile produced cooperatively by all 128 group threads, consumed by all spatial threads for 128 output pixels and four pooled samples; reuse is high enough to justify the one post-load synchronization per channel block.",
+            "rating_0_to_10": 9.1,
+            "risk": "low"
+          },
+          "register_pressure": {
+            "notes": "Each thread owns eight output channels and four pre-pool accumulators per channel, so 32 fp32 accumulators plus temporary input/weight scalars stress registers. This is the main risk for any further OCPG increase.",
+            "rating_0_to_10": 5.8,
+            "risk": "high"
+          }
+        },
+        "last_updated_round": 14,
+        "node_id": "node_conv_block_fp16_r14_cont_1",
+        "node_type": "decision",
+        "notes": "AUTO_CONTINUATION: add a concrete next-step action under a solved node to keep the search moving.\nFocus on one operation or one tensor axis; refine based on the latest eval bottleneck signal.",
+        "overall_rating_0_to_10": 9.35,
+        "parent_id": "ocpg8_input_reuse_refinement",
+        "solution_ref": {
+          "eval": {
+            "status": ""
+          },
+          "parent_solution_id": "06a6bc306d882ecbaae1991f6fa9138a1a56e282",
           "solution_id": null
         }
       },
       {
         "action": {
-          "description": "Prototype a fused spatial-neighborhood output family where a threadgroup owns a small tile of adjacent pooled pixels for one or more output channels and selectively reuses compact read-only input or weight tiles within the group.",
-          "difficulty_1_to_5": 5,
-          "expected_vs_baseline_factor": 0.7,
-          "rationale": "Adjacent pooled outputs overlap in their required input neighborhoods, and all spatial outputs for an output channel reuse the same 3x3x128 weights. A spatial tile can trade synchronization for less repeated SRV traffic.",
-          "score_0_to_1": 0.64,
-          "title": "Fused spatial-neighborhood output tile"
+          "description": "Modify the attached tiled shader so the groupshared input tile is stored as float16_t/min16float instead of FP32, while preserving FP32 accumulators. The read-only reusable tile is still produced cooperatively by all 512 threads once per input-channel block, consumed by all output-channel waves many times, and synchronized with one barrier after load.",
+          "difficulty_1_to_5": 2,
+          "expected_vs_baseline_factor": 0.22,
+          "rationale": "",
+          "score_0_to_1": 0.66,
+          "title": "Use fp16 groupshared storage for the reusable input tile"
         },
-        "choice": "threadgroup_owns_adjacent_pooled_spatial_outputs",
-        "confidence_0_to_1": 0.43,
-        "decision": "work_decomposition_family",
+        "choice": "store_reusable_input_tile_as_fp16",
+        "confidence_0_to_1": 0.55,
+        "decision": "chain_refinement",
         "impacts": {
           "compute_intensity_and_hw_fit": {
-            "hw_notes": "cs_6_8 groupshared allocation must stay well below 32 KiB. Any shared tile must be explicit read-only cache or exchange scratch with justified barriers.",
-            "notes": "Can improve data reuse for neighboring outputs but adds group coordination. The best tile shape is uncertain because IC=128 makes full input-tile staging too large unless chunked.",
-            "rating_0_to_10": 7.0,
-            "risk": "Chunked staging over input channels may require many barriers and lose to L2 streaming."
+            "hw_notes": "",
+            "notes": "This preserves the successful group/wave work mapping and tests whether shared bandwidth is a limiter. Risk is that fp16 groupshared layout or conversion cost on DXIL/Arc offsets the reduced shared traffic.",
+            "rating_0_to_10": 8.2,
+            "risk": "medium"
           },
           "memory_bandwidth": {
-            "notes": "Potential savings from input overlap across adjacent pooled pixels and optional read-only weight tile reuse. Weight tile for one OC is about 2.25 KiB half and reusable across spatial tile outputs.",
+            "notes": "Halving the shared tile footprint from about 21.25 KiB to about 10.6 KiB may reduce shared-memory traffic/cache pressure and improve occupancy headroom. Global input bandwidth is unchanged because source data is already fp16.",
             "rating_0_to_10": 8.0,
-            "risk": "L2 may already cache the small weight tensor well, making explicit staging unnecessary overhead."
+            "risk": "medium"
           },
           "register_pressure": {
-            "notes": "Per-thread registers can remain similar to direct ownership if each thread still owns one output; shared memory carries reusable data, not intermediates.",
-            "rating_0_to_10": 6.0,
-            "risk": "Loop unrolling plus tile addressing may increase live indices and temporaries; shared staging can also reduce occupancy if too large."
+            "notes": "Accumulator registers remain FP32. Extra conversion on shared reads may add minor instruction pressure but should not materially increase live accumulator count.",
+            "rating_0_to_10": 5.8,
+            "risk": "medium"
           }
         },
         "last_updated_round": 0,
-        "node_id": "spatial_neighborhood_tile",
+        "node_id": "fp16_shared_input_tile_refinement_r15",
         "node_type": "decision",
-        "notes": "SELF_CHECK: This sibling is a threadgroup spatial-tile family with explicit shared read-only cache choices, incompatible as a first prototype with private per-output or wave-cooperative ownership because it requires different group-level synchronization and tiling. Shared-memory classification if used: read-only reusable weight tile produced cooperatively by group and consumed by all tile-output threads, reuse count equals spatial tile size; optional input tile produced cooperatively per IC chunk and consumed by neighboring spatial-output threads, reuse from convolution overlap; one barrier after tile load before reads, no shared intermediate tensors.",
-        "overall_rating_0_to_10": 6.0,
-        "parent_id": "root",
+        "notes": "CURRENT:\n- does: Proposed continuation of the attached fast tiled shader: keep the same output ownership and FP32 accumulation, but store the cooperatively loaded reusable input tile in 16-bit shared storage and widen on consumption.\n- bottleneck: targets shared-memory bandwidth/footprint and possibly occupancy headroom; does not address global launch or CPU staging.\nFOLLOW_THROUGH:\n- aligned_with_intent: yes as a composable refinement of the attached implementation, even though the parent label is partially misclassified.\nUPDATE_BELIEF:\n- what changed after eval_result: Since the current code spends repeated inner-loop reads from gsIn and uses 21.25 KiB of groupshared memory, reducing shared storage is a small, testable next step. Expected gain is modest but low implementation complexity.\n- next bet: If fp16 shared storage wins, combine it later with barrier/load-loop cleanup; if it loses, revert and focus on reducing the number of IC-block barriers.\nSELF_CHECK: This is a child refinement, not a sibling family; it preserves the same ownership plan and only changes the shared input tile representation.",
+        "overall_rating_0_to_10": 6.8,
+        "parent_id": "wave_owned_reduction_fused",
         "solution_ref": {
           "eval": {
             "score": null,
-            "score_name": null,
-            "status": "open"
+            "score_name": "speedup_vs_reference",
+            "status": "not_evaluated"
           },
-          "parent_solution_id": null,
+          "parent_solution_id": "07cc41f296cf744988d6024f2679cb9e31173fc9",
           "solution_id": null
         }
       }
     ],
     "root_id": "root"
   },
-  "kernel_summary": "This task is a fixed-shape dense FP16 NCHW 3x3 convolution block with bias, ReLU, disabled activation quantization, and 2x2 average pooling, producing output_0 shape 1x128x180x320 from input_0 shape 1x128x360x640. The best initial model is a single-dispatch fully fused shader: compute the four stride-1 padded conv sites needed by each pooled output in registers, apply ReLU per site, average, and store half, using typed HLSL buffers under cs_6_8 with no linalg, no CBVs/root constants, no temporaries, and no multi-dispatch. The main bottleneck is the 3x3x128 reduction repeated for 7.37M outputs; weights are small enough for cache but loop ordering must exploit reuse across the four pooled conv sites, while groupshared memory should only be considered later for compact read-only input/weight tiles with clear reuse and synchronization benefits.",
+  "kernel_summary": "The target kernel is a fixed-shape dense fp16 Conv2D(128->128, 3x3, stride1, zero padding) followed by ReLU, identity/non-quantized activation quantizer, and AvgPool2d(2), producing 1x128x180x320. The best high-level approach is full fusion in one HLSL cs_6_8 dispatch: compute each pooled output from the four corresponding conv positions, apply ReLU before averaging, and write fp16 once, avoiding the enormous intermediate conv/ReLU tensor. The workload is compute-heavy but naive streaming still rereads weights and overlapping input heavily; candidate mappings trade simplicity, wave-level reduction parallelism, and threadgroup tile reuse. Groupshared memory should only be used for compact read-only reusable input/weight tiles with explicit producer/consumer reuse and barriers, never for materializing whole phase tensors, and must stay well below the 32 KiB D3D/DXIL limit.",
   "open_questions": [
-    "Does the evaluator's disabled activation_quantizer behave as exact identity despite state_0 being bound, or is there any hidden clamp/quantize behavior needed for correctness?",
-    "Does PyTorch half Conv2d baseline accumulate in FP32 or FP16 on the reference path, and what accumulation precision is required to stay within rtol=0.01, atol=0.01?",
-    "What HLSL compiler and Intel driver codegen quality is obtained for float16_t typed Buffer loads with FP32 accumulation under cs_6_8?",
-    "Will [WaveSize(32)] be accepted and beneficial on Arc B580 for this shader, or should the initial shader avoid assuming a wave size?",
-    "How large is the performance penalty of zero-padding boundary branches relative to using a separate interior fast path inside the same single dispatch?",
-    "Are typed Buffer<float16_t> descriptors exposed with natural half indexing and conversion costs low enough, or is manual packing unavailable/needed?",
-    "Does explicit groupshared staging of the small weight tensor or input spatial tile outperform relying on L2/cache for this fixed 288 KiB weight set?"
+    "Does the evaluator compare against PyTorch half Conv2D accumulation semantics using fp32 accumulation, fp16 accumulation, or backend-dependent behavior, and what accumulation type best meets rtol/atol=0.01?",
+    "Is state_0 act_quantizer.max_log truly unused because quantize_act=false, or does the created quantizer perform any clamp/scale even when quantize is disabled?",
+    "Does the HLSL cs_6_8 toolchain for this runner accept float16_t typed buffers and [WaveSize(32)] reliably on Intel Arc B580?",
+    "What threadgroup sizes and dispatch dimensions are accepted by hlsl_probe without root constants, and is there any hidden limit on typed RWBuffer<float16_t> writes?",
+    "How effective is Arc B580 L2/cache reuse for repeated OIHW weight reads under direct streaming mappings versus explicit groupshared tiling?",
+    "Are boundary outputs checked with exact PyTorch zero-padding behavior, and is it worth separating interior and boundary paths despite single-dispatch constraints?",
+    "What is the relative throughput of scalar fp16, packed half/vector operations, and float accumulation in this HLSL path on Arc B580?"
   ]
 }
