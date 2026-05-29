@@ -55,6 +55,9 @@ def _shader_model_tuple(target: str) -> tuple[int, int]:
 
 
 def _hlsl_code_format(target: str, *, linalg_enabled: bool) -> str:
+    xml_content_note = "- Put raw HLSL text directly inside this tag. Do not wrap it in CDATA."
+    if linalg_enabled:
+        xml_content_note += "\n- Do not HTML/XML-escape HLSL tokens such as #include <dx/linalg.h>."
     buffer_contract = (
         "- Use raw buffers for tensor data: ByteAddressBuffer for SRVs and RWByteAddressBuffer for UAVs.\n"
         "- Tensor byte layout is the contiguous PyTorch storage layout shown in the metadata. Compute byte offsets explicitly.\n"
@@ -77,7 +80,7 @@ def _hlsl_code_format(target: str, *, linalg_enabled: bool) -> str:
 - Declare input SRVs as t0, t1, ... and output UAVs as u0, u1, ... exactly as specified.
 {buffer_contract}
 - Do not use CUDA, Triton, PyTorch, root constants, CBVs, descriptor spaces, or undeclared resources.
-- Put raw HLSL text directly inside this tag. Do not wrap it in CDATA and do not HTML/XML-escape HLSL tokens such as #include <dx/linalg.h>.
+{xml_content_note}
 </hlsl_file>
 
 <json_file name="launch.json">

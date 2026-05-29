@@ -42,16 +42,41 @@ def get_dimensions_for_target(target_gpu: str = "H100") -> tuple[str, ...]:
     return BASE_DIMENSIONS
 
 
-def _language_constraints_block(language: str) -> str:
+def _hlsl_linalg_enabled_for_definition(language: str, definition_text: str) -> bool:
+    if str(language or "").strip().lower() != "hlsl":
+        return False
+    from k_search.kernel_generators.world_model_prompts import hlsl_linalg_enabled_for_prompt_context
+
+    return hlsl_linalg_enabled_for_prompt_context(definition_text=str(definition_text or ""))
+
+
+def _language_constraints_block(language: str, *, definition_text: str = "") -> str:
     """Return language-specific WM constraints that should override generic hardware facts."""
     if str(language or "").strip().lower() == "hlsl":
-        from k_search.kernel_generators.world_model_prompts import HLSL_OPTIMIZATION_HINTS
+        from k_search.kernel_generators.world_model_prompts import get_hlsl_optimization_hints
 
         return (
             "Language-specific constraints that override generic hardware facts when they conflict:\n"
-            f"{HLSL_OPTIMIZATION_HINTS.strip()}\n\n"
+            f"{get_hlsl_optimization_hints(definition_text=definition_text).strip()}\n\n"
         )
     return ""
+
+
+def _hlsl_linalg_exploration_block(language: str, definition_text: str, *, refine: bool = False) -> str:
+    if not _hlsl_linalg_enabled_for_definition(language, definition_text):
+        return ""
+    if refine:
+        return (
+            "- SM 6.10 Direct3D Linear Algebra exploration: if no real linalg-based candidate has been evaluated yet, keep or insert one OPEN action that prototypes a clean FP16 MatrixScope::Thread linalg fragment for a real dense inner K-tile multiply. Prefer the hlsl_probe-measured [WaveSize(32)] M=16,K=64 shape when dimensions permit; fallback shapes are M=8,K=128, M=8,K=64, M=16,K=32, and M=4,K=128. Use Multiply<float16_t> with FP32 register accumulation unless hlsl_probe evidence says direct MultiplyAdd<float> is accepted. Require bracket indexing for vector widths above 4. When this is still untested, score it high enough to be selected once as the preferred information-gathering experiment, unless the task has no dense FP16 matrix/vector-style inner reduction. Do not down-rank it solely because API/codegen details are uncertain; that uncertainty is the reason to evaluate one honest prototype early. Avoid artificial, unused, or no-op linalg calls.\n\n"
+        )
+    return (
+        "- SM 6.10 Direct3D Linear Algebra exploration:\n"
+        "  If no linalg-based candidate has been evaluated yet, include one early OPEN action that prototypes a clean FP16 MatrixScope::Thread linalg fragment. Prefer the hlsl_probe-measured [WaveSize(32)] M=16,K=64 shape for dense FP16 Linear/GEMM-like reductions when dimensions permit; fallback shapes are M=8,K=128, M=8,K=64, M=16,K=32, and M=4,K=128. Use Multiply<float16_t> with FP32 register accumulation unless hlsl_probe evidence says direct MultiplyAdd<float> is accepted.\n"
+        "  For the initial action set, make this linalg prototype the preferred first experiment by giving it the highest action.score_0_to_1 among root-child OPEN actions when the task has a dense FP16 matrix/vector or GEMM-like inner reduction.\n"
+        "  Score this action for information value as well as expected speed; do not down-rank it solely because API syntax or codegen details are uncertain, because that uncertainty is the reason to evaluate one honest prototype early.\n"
+        "  The linalg action should use the API for a real dense inner K-tile multiply fragment, while ordinary HLSL handles raw-buffer addressing, packing/unpacking, FP32 accumulation glue across K tiles, and unsuitable fragments. For vector widths above 4, require bracket indexing rather than .xyzw swizzles.\n"
+        "  Avoid artificial, unused, or no-op linalg calls; the goal is an honest linalg prototype, not a string-presence hack.\n\n"
+    )
 
 DIMENSION_ENTRY_DEFAULT: dict[str, Any] = {
     "hypothesis": "",
@@ -885,7 +910,7 @@ def build_world_model_prompts(
     if hw_spec_text and hw_spec_text.strip():
         hw_block = f"\n{hw_spec_text.strip()}\n\n"
 
-    language_constraints_block = _language_constraints_block(language)
+    language_constraints_block = _language_constraints_block(language, definition_text=definition_text)
 
     init_prompt = (
         "You are a GPU kernel performance engineer.\n"
@@ -937,12 +962,7 @@ def build_world_model_prompts(
         "  Prefer one-wave-per-independent-work-unit mappings when they avoid inter-wave handoff; multiple waves per work unit must justify each group-wide barrier.\n"
         "  Do NOT split into incremental partial fusions when full fusion is register-feasible — partial fusion leaves global memory\n"
         "  round-trips between sub-kernels that dominate latency. Small dimensions make cross-operation fusion straightforward, not hard.\n\n"
-        "- SM 6.10 Direct3D Linear Algebra exploration:\n"
-        "  If the specification says HLSL Linear Algebra is enabled and no linalg-based candidate has been evaluated yet, include one early OPEN action that prototypes a clean FP16 MatrixScope::Thread linalg fragment. Prefer the hlsl_probe-measured [WaveSize(32)] M=16,K=64 shape for dense FP16 Linear/GEMM-like reductions when dimensions permit; fallback shapes are M=8,K=128, M=8,K=64, M=16,K=32, and M=4,K=128. Use Multiply<float16_t> with FP32 register accumulation unless hlsl_probe evidence says direct MultiplyAdd<float> is accepted.\n"
-        "  For the initial action set, make this linalg prototype the preferred first experiment by giving it the highest action.score_0_to_1 among root-child OPEN actions when the task has a dense FP16 matrix/vector or GEMM-like inner reduction.\n"
-        "  Score this action for information value as well as expected speed; do not down-rank it solely because API syntax or codegen details are uncertain, because that uncertainty is the reason to evaluate one honest prototype early.\n"
-        "  The linalg action should use the API for a real dense inner K-tile multiply fragment, while ordinary HLSL handles raw-buffer addressing, packing/unpacking, FP32 accumulation glue across K tiles, and unsuitable fragments. For vector widths above 4, require bracket indexing rather than .xyzw swizzles.\n"
-        "  Avoid artificial, unused, or no-op linalg calls; the goal is an honest linalg prototype, not a string-presence hack.\n\n"
+        f"{_hlsl_linalg_exploration_block(language, definition_text)}"
 
         "- FORBIDDEN: implementation tactics as families (CRITICAL):\n"
         "  - Level-1 Family nodes MUST NOT be named after implementation techniques or optimizations techniques.\n"
@@ -1069,7 +1089,7 @@ def build_decision_tree_edit_prompt(
         "Output ONLY a JSON edit script (no markdown, no extra text).\n\n"
         f"Target GPU: {target_gpu}\nLanguage: {language}\n"
         f"{('\n' + str(hw_spec_text or '').strip() + '\n\n') if str(hw_spec_text or '').strip() else '\n'}"
-        f"{_language_constraints_block(language)}"
+        f"{_language_constraints_block(language, definition_text=definition_text)}"
         "Kernel specification (reference):\n"
         f"{def_s}\n\n"
         "Current world model (compact):\n"
@@ -1112,7 +1132,7 @@ def build_decision_tree_edit_prompt(
         "Task:\n"
         "- Propose a SMALL set of edits (update, insert, delete) to improve the tree given the new evidence.\n"
         "- Inserts are capped by the system; keep new nodes <=3 and prefer update_node when possible.\n\n"
-        "- SM 6.10 Direct3D Linear Algebra exploration: if the specification says HLSL Linear Algebra is enabled and no real linalg-based candidate has been evaluated yet, keep or insert one OPEN action that prototypes a clean FP16 MatrixScope::Thread linalg fragment for a real dense inner K-tile multiply. Prefer the hlsl_probe-measured [WaveSize(32)] M=16,K=64 shape when dimensions permit; fallback shapes are M=8,K=128, M=8,K=64, M=16,K=32, and M=4,K=128. Use Multiply<float16_t> with FP32 register accumulation unless hlsl_probe evidence says direct MultiplyAdd<float> is accepted. Require bracket indexing for vector widths above 4. When this is still untested, score it high enough to be selected once as the preferred information-gathering experiment, unless the task has no dense FP16 matrix/vector-style inner reduction. Do not down-rank it solely because API/codegen details are uncertain; that uncertainty is the reason to evaluate one honest prototype early. Avoid artificial, unused, or no-op linalg calls.\n\n"
+        f"{_hlsl_linalg_exploration_block(language, definition_text, refine=True)}"
 
         "- Continuation rule (IMPORTANT): if eval_result indicates a PASSED solution was attached to the chosen/active node,\n"
         "  and that node currently has NO child nodes representing a next-step action, then insert AT LEAST ONE child node under it.\n"
