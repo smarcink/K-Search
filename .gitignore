@@ -3,6 +3,8 @@ __pycache__/
 .env
 intel-certs/
 logs/
+.generated-artifacts/
+.ksearch/
 .ksearch-output*/
 wandb/
 openevolve_output/
@@ -16,6 +18,7 @@ openevolve_output/
 **/build/
 
 # K-Search experiment outputs
+**/k-search/
 **/ksearch/
 **/ksearch-*/
 **/k_search_out*/
